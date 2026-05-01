@@ -349,27 +349,14 @@ def run_enrichment_pipeline(
         logger.warning("No records remaining after filtering")
         return notices
 
-    # ── Step 3c: Probate Property Lookup ────────────────────────────
-    # For probate records without a property address, search Knox Tax API
-    # by the decedent's name to find their property.
-    probate_no_addr = [
-        n for n in notices
-        if n.notice_type == "probate"
-        and not n.address.strip()
-        and n.decedent_name.strip()
-        and n.county.lower() == "knox"
-    ]
-    if probate_no_addr:
-        logger.info("── Step 3c: Probate Property Lookup (%d candidates) ──", len(probate_no_addr))
-        try:
-            from tax_enricher import _probate_property_lookup
-            _probate_property_lookup(probate_no_addr)
-            found = sum(1 for n in probate_no_addr if n.address.strip())
-            logger.info("  Property address found: %d/%d", found, len(probate_no_addr))
-        except ImportError:
-            logger.warning("  _probate_property_lookup not available — skipping")
-        except Exception as e:
-            logger.warning("  Probate property lookup failed: %s", e)
+    # NOTE: Probate property-address lookup runs UPSTREAM of this pipeline,
+    # not as a step inside it. Each entry point (CLI / Apify Actor / PDF
+    # import) is responsible for calling property_lookup.lookup_decedent_properties()
+    # before invoking run_enrichment_pipeline. The Knox/Blount path uses
+    # KGIS / TPAD; the Jefferson/Madison path delegates to
+    # probate_property_locator.enrich_notice_with_property(). A previous
+    # Step 3c here did this Knox-only inside the pipeline; it was removed
+    # so future county additions don't trip on a half-canonical pattern.
 
     # ── Step 4: Parcel Address Lookup ────────────────────────────────
     if not opts.skip_parcel_lookup and not opts.skip_tax:
