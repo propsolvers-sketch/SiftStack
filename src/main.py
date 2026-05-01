@@ -186,16 +186,11 @@ async def actor_main() -> None:
         include_commercial = actor_input.get("include_commercial", False)
         include_entities = actor_input.get("include_entities", False)
 
-        # Validate
-        if not config.TNPN_EMAIL or not config.TNPN_PASSWORD:
-            Actor.log.error("tn_username and tn_password are required")
-            try:
-                from slack_notifier import notify_preflight_failure
-                notify_preflight_failure(["TNPN credentials missing"])
-            except Exception:
-                pass
-            await Actor.fail(status_message="Missing SiftStack credentials")
-            return
+        # Validate. The AL site (alabamapublicnotices.com) is loginless, so
+        # only CAPTCHA credentials are required for the scrape itself. The
+        # legacy TNPN_EMAIL / TNPN_PASSWORD validator that lived here used to
+        # crash on cold-start with AttributeError after config.py removed
+        # those constants in the AL migration.
         if not config.CAPTCHA_API_KEY:
             Actor.log.warning("captcha_api_key not set — CAPTCHA solving will fail")
 
