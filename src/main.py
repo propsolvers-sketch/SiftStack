@@ -16,12 +16,10 @@ from pathlib import Path
 import config
 from config import (
     LOG_DIR,
-    NOTICE_TYPES,
-    OUTPUT_DIR,
     SAVED_SEARCHES,
     SavedSearch,
 )
-from data_formatter import deduplicate, write_csv, write_csv_by_type
+from data_formatter import write_csv, write_csv_by_type
 from scraper import scrape_all
 
 logger = logging.getLogger(__name__)
@@ -64,8 +62,6 @@ def _preflight_check(mode: str) -> list[str]:
     datasift_modes = {"manage-presets", "manage-sold", "phone-validate"}
 
     if mode in scrape_modes:
-        if not config.TNPN_EMAIL or not config.TNPN_PASSWORD:
-            failures.append("TNPN_EMAIL / TNPN_PASSWORD not set (required for scraping)")
         if not config.CAPTCHA_API_KEY:
             failures.append("CAPTCHA_API_KEY not set (CAPTCHA solving will fail)")
 
@@ -96,9 +92,9 @@ def _preflight_check(mode: str) -> list[str]:
         try:
             resp = _requests.head(config.BASE_URL, timeout=10, allow_redirects=True)
             if resp.status_code >= 500:
-                failures.append(f"tnpublicnotice.com returned {resp.status_code} — site may be down")
+                failures.append(f"alabamapublicnotices.com returned {resp.status_code} — site may be down")
         except Exception as e:
-            failures.append(f"Cannot reach tnpublicnotice.com: {e}")
+            failures.append(f"Cannot reach alabamapublicnotices.com: {e}")
 
     # ── 2Captcha balance check ──────────────────────────────────────
     if mode in scrape_modes and config.CAPTCHA_API_KEY:
@@ -149,8 +145,6 @@ async def actor_main() -> None:
         # Set both config.* AND os.environ so downstream modules that read
         # from either source (e.g., datasift_uploader uses os.environ) pick them up.
         _cred_map = {
-            "TNPN_EMAIL": actor_input.get("tn_username", ""),
-            "TNPN_PASSWORD": actor_input.get("tn_password", ""),
             "CAPTCHA_API_KEY": actor_input.get("captcha_api_key", ""),
             "ANTHROPIC_API_KEY": actor_input.get("anthropic_api_key", ""),
             "SMARTY_AUTH_ID": actor_input.get("smarty_auth_id", ""),
@@ -204,7 +198,7 @@ async def actor_main() -> None:
         Actor.log.info(
             "Running %d saved searches: %s",
             len(searches),
-            ", ".join(s.saved_search_name for s in searches),
+            ", ".join(f"{s.county} {s.notice_type}" for s in searches),
         )
 
         # Set up residential proxy if requested
@@ -1645,7 +1639,7 @@ def cli_main() -> None:
     logging.info(
         "Running %d saved searches: %s",
         len(searches),
-        ", ".join(s.saved_search_name for s in searches),
+        ", ".join(f"{s.county} {s.notice_type}" for s in searches),
     )
 
     try:

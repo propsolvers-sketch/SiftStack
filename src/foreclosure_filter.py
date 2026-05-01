@@ -1,4 +1,13 @@
-"""Classify foreclosure notices — keep only first-to-market trustee sales.
+"""Classify foreclosure notices — keep only first-to-market mortgage foreclosure sales.
+
+Title variations observed on alabamapublicnotices.com (Apr 2026):
+  - MORTGAGE FORECLOSURE SALE
+  - PUBLIC NOTICE MORTGAGE FORECLOSURE SALE
+  - NOTICE OF FORECLOSURE SALE
+  - NOTICE OF FORECLOSURE
+  - FORECLOSURE NOTICE
+  - POSTPONEMENT OF NOTICE OF FORECLOSURE SALE  (reschedule — still valid)
+  - NOTICE OF MORTGAGE RESCHEDULE
 
 Title variations observed on tnpublicnotice.com (Feb 2026):
   - SUBSTITUTE TRUSTEE'S NOTICE OF SALE
@@ -22,8 +31,14 @@ logger = logging.getLogger(__name__)
 # These phrases identify real first-to-market foreclosure / trustee sale notices.
 # Matched case-insensitively against the full notice text.
 INCLUDE_PHRASES = [
+    # Alabama mortgage foreclosure variants
+    "mortgage foreclosure sale",
+    "notice of foreclosure sale",
+    "notice of foreclosure",
+    "foreclosure notice",
+    "postponement of notice of foreclosure sale",
+    "notice of mortgage reschedule",
     # Substitute trustee variants
-    "substitute trustee's notice of sale",
     "substitute trustee's sale",
     "substitute trustee's notice of foreclosure sale",
     "substitute trustee sale",
