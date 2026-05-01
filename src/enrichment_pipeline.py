@@ -194,8 +194,12 @@ def _generate_run_id() -> str:
 
 # ── Data Validation ──────────────────────────────────────────────────
 
-# Regex for garbage OCR: mostly non-alphanumeric characters
-_GARBAGE_RE = re.compile(r"^[^a-zA-Z0-9]*$")
+# Regex for garbage addresses: must contain at least one letter, otherwise
+# OCR noise like "12345" (a parcel number leaked into the address slot) or
+# "---" passes validation. The previous regex `^[^a-zA-Z0-9]*$` only matched
+# strings that were ENTIRELY non-alphanumeric, which let numeric-only
+# garbage through.
+_GARBAGE_RE = re.compile(r"^[^a-zA-Z]*$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
