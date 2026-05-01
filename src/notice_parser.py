@@ -459,6 +459,39 @@ PR_ADDRESS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# AL signature-block PR mailing address: name comes BEFORE title, address
+# follows title with only a newline separator (typically). PR_ADDRESS_RE
+# above requires {3,80} non-digit chars between the title and the address,
+# which fits the TN inline format ("Personal Representative: NAME, ADDR")
+# but never matches the AL vertical signature block:
+#
+#     JOHN SMITH
+#     Personal Representative
+#     123 Main St
+#     Birmingham, AL 35203
+#
+# Here, between "Representative" and "123" there is only a single newline
+# (1 char) — well under the 3-char minimum. This variant uses {0,80}?
+# (non-greedy zero minimum) so the address can follow the title with
+# minimal whitespace, and accepts both AL and TN state-name suffixes so
+# either format flows through this single fallback.
+PR_ADDRESS_NAME_FIRST_RE = re.compile(
+    r"(?:Personal\s+Representative(?:\(S\))?|Executor|Executrix|Administrator|Administratrix)"
+    r"[^0-9]{0,80}?"                  # AL: zero+ chars (often just a newline)
+    r"(\d{1,5}\s+"
+    r"[\w\s.,'#-]+?"
+    + _SUFFIX +
+    r"\.?"
+    r"(?:\s*[,.]?\s*(?:Suite|Ste\.?|Apt\.?|Unit|#)\s*\.?\s*[\w.]+)?)"
+    r"\s*[,.\s]+\s*"
+    r"([A-Za-z][\w\s]*?)"
+    r"\s*[,.]\s*"
+    r"(?:Alabama|Ala\.?|AL|Tennessee|Tenn\.?|TN)"
+    r"\s*[,.\s]*"
+    r"(\d{5})",
+    re.IGNORECASE,
+)
+
 # Names that are clearly not real person names
 _INVALID_NAMES = {
     "said property", "the grantor", "the grantors", "the creditor",
@@ -1075,12 +1108,17 @@ def _parse_pr_address(notice: NoticeData) -> None:
     Probate notices contain the PR/Executor's mailing address (where creditors
     send claims), but NOT the decedent's property address. This extracts the
     PR's street, city, state, and zip into the owner_* fields.
+
+    Tries the inline TN format first (PR_ADDRESS_RE — anchored on title with
+    name+colon between), then falls back to the AL signature-block format
+    (PR_ADDRESS_NAME_FIRST_RE — name on prior line, address right after
+    title with minimal separator). Either match populates the owner_* slots.
     """
     if notice.notice_type != "probate":
         return
 
     text = notice.raw_text.replace("\xa0", " ")
-    match = PR_ADDRESS_RE.search(text)
+    match = PR_ADDRESS_RE.search(text) or PR_ADDRESS_NAME_FIRST_RE.search(text)
     if match:
         street = _clean_address(match.group(1))
         # Title-case — PR addresses in notices are usually ALL CAPS
