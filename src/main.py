@@ -338,17 +338,24 @@ async def actor_main() -> None:
                 except Exception as e:
                     Actor.log.warning("Property lookup failed: %s -- continuing without lookups", e)
 
-            # ── Enrichment ────────────────────────────────────────────
-            from enrichment_pipeline import PipelineOptions, run_enrichment_pipeline
+            # ── Shared post-scrape pipeline ───────────────────────────
+            # full_pipeline.run_full_pipeline runs enrichment + Tracerfy +
+            # Trestle + PDF gen + DataSift CSV gen identically to the CLI
+            # path. Apify-specific bits (KVS upload, Drive upload, Slack
+            # cost breakdown) stay below since their semantics differ.
+            from full_pipeline import PostScrapeOptions, run_full_pipeline
 
-            opts = PipelineOptions(
-                skip_parcel_lookup=True,  # web scrape notices don't have parcel IDs
+            opts = PostScrapeOptions(
                 skip_vacant_filter=include_vacant,
                 skip_commercial_filter=include_commercial,
                 skip_entity_filter=include_entities,
+                skip_tracerfy=not do_tracerfy,
+                tracerfy_dp_only=True,    # Apify: cost control — DP candidates only
                 source_label="Apify Actor",
             )
-            notices = run_enrichment_pipeline(notices, opts)
+            result = run_full_pipeline(notices, opts)
+            notices = result.notices
+            tracerfy_stats = result.tracerfy_stats or None  # for cost breakdown
 
             if not notices:
                 Actor.log.warning("No notices found")
@@ -356,82 +363,23 @@ async def actor_main() -> None:
 
             total = len(notices)
 
-            # ── Tracerfy Skip Trace (DP candidates only) ────────────
-            # Only run Tracerfy on records that need deep prospecting
-            # (deceased owners, heir maps, decision makers). Basic records
-            # get skip traced for free inside DataSift's unlimited plan.
-            tracerfy_stats = None
-            if do_tracerfy and config.TRACERFY_API_KEY:
-                dp_for_tracerfy = [
-                    n for n in notices
-                    if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
-                ]
-                if dp_for_tracerfy:
-                    Actor.log.info("Running Tracerfy on %d DP candidates (%d basic records skipped)...",
-                                   len(dp_for_tracerfy), total - len(dp_for_tracerfy))
-                    try:
-                        from tracerfy_skip_tracer import batch_skip_trace
-                        tracerfy_stats = batch_skip_trace(dp_for_tracerfy)
-                        Actor.log.info(
-                            "Tracerfy: %d/%d matched, %d phones, %d emails, $%.2f",
-                            tracerfy_stats["matched"], tracerfy_stats["submitted"],
-                            tracerfy_stats["phones_found"], tracerfy_stats["emails_found"],
-                            tracerfy_stats["cost"],
-                        )
-                    except Exception as e:
-                        Actor.log.warning("Tracerfy skip trace failed: %s — continuing", e)
-                else:
-                    Actor.log.info("No DP candidates — Tracerfy skipped (0 deceased/DM records)")
-            elif do_tracerfy:
-                Actor.log.info("Tracerfy skipped — no API key configured")
-
-            # ── Generate Deep Prospecting PDFs ────────────────────────
-            # Only generate PDFs for records that have deep prospecting data:
-            # deceased owners with heir/DM info, or records with signing chains.
-            # Basic records (just address + owner) don't need a PDF.
+            # ── Upload deep-prospecting PDFs to KVS, build URL list ───
             pdf_urls = []
-            dp_candidates = [
-                n for n in notices
-                if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
-            ]
-
-            # Score every phone (DM #1 + all heirs) with Trestle before rendering,
-            # so signing-chain phones get tier badges — not just DM #1's.
-            phone_tiers: dict = {}
-            if dp_candidates and config.TRESTLE_API_KEY:
+            if result.pdf_paths:
                 try:
-                    from phone_validator import score_record_phones
-                    phone_tiers = score_record_phones(dp_candidates, config.TRESTLE_API_KEY)
-                    Actor.log.info("Trestle scored %d unique phones across DP candidates",
-                                   len(phone_tiers))
-                except Exception as e:
-                    Actor.log.warning("Per-record Trestle scoring failed: %s — continuing", e)
-
-            if dp_candidates:
-                try:
-                    from report_generator import generate_record_pdf
                     kvs = await Actor.open_key_value_store()
                     kvs_id = kvs._id if hasattr(kvs, '_id') else ''
-                    report_dir = Path("output/reports")
-
-                    for n in dp_candidates:
-                        pdf_path = generate_record_pdf(
-                            n, output_dir=report_dir, phone_tiers=phone_tiers,
-                        )
+                    for n, pdf_path in result.pdf_paths:
                         key = pdf_path.name
                         with open(pdf_path, "rb") as f:
                             await kvs.set_value(key, f.read(), content_type="application/pdf")
                         url = f"https://api.apify.com/v2/key-value-stores/{kvs_id}/records/{key}"
                         pdf_urls.append({"address": n.address, "url": url})
-
-                    Actor.log.info("Generated %d deep prospecting PDFs (%d records skipped — no DP data)",
-                                   len(pdf_urls), total - len(dp_candidates))
+                    Actor.log.info("Uploaded %d deep prospecting PDFs to KVS", len(pdf_urls))
                 except Exception as e:
-                    Actor.log.warning("PDF generation failed: %s — continuing", e)
-            else:
-                Actor.log.info("No records need deep prospecting PDFs")
+                    Actor.log.warning("PDF KVS upload failed: %s — continuing", e)
 
-            # ── Write CSV ─────────────────────────────────────────────
+            # ── Write master CSV + upload to KVS ──────────────────────
             csv_path = write_csv(notices)
             if not kvs:
                 kvs = await Actor.open_key_value_store()
@@ -460,27 +408,29 @@ async def actor_main() -> None:
             elif drive_folder_id:
                 Actor.log.warning("google_drive_folder_id set but google_service_account_key missing — skipping Drive upload")
 
-            # ── DataSift CSVs → KVS (manual upload) ─────────────────
-            # Generate DataSift-formatted CSVs and save to Apify KVS
-            # for manual download + upload to DataSift (more reliable than
-            # automated Playwright upload in headless cloud containers).
+            # ── Upload DataSift CSVs to KVS, build URL list ───────────
+            # KVS-only delivery is more reliable than Playwright in headless
+            # cloud containers — operator downloads from KVS and uploads
+            # manually via DataSift web UI.
             datasift_csv_urls = []
-            try:
-                from datasift_formatter import write_datasift_split_csvs
-
-                csv_infos = write_datasift_split_csvs(notices)
-                kvs = await Actor.open_key_value_store()
-                for info in csv_infos:
-                    key = f"datasift_{info['label'].lower().replace(' ', '_')}.csv"
-                    with open(info["path"], "rb") as f:
-                        await kvs.set_value(key, f.read(), content_type="text/csv")
-                    # Build public download URL
+            if result.datasift_csv_infos:
+                try:
+                    if not kvs:
+                        kvs = await Actor.open_key_value_store()
                     kvs_id = kvs._id if hasattr(kvs, '_id') else ''
-                    url = f"https://api.apify.com/v2/key-value-stores/{kvs_id}/records/{key}"
-                    datasift_csv_urls.append({"label": info["label"], "url": url, "records": info.get("count", "?")})
-                    Actor.log.info("DataSift CSV (%s) saved to KVS: %s", info["label"], key)
-            except Exception as e:
-                Actor.log.error("DataSift CSV generation failed: %s", e)
+                    for info in result.datasift_csv_infos:
+                        key = f"datasift_{info['label'].lower().replace(' ', '_')}.csv"
+                        with open(info["path"], "rb") as f:
+                            await kvs.set_value(key, f.read(), content_type="text/csv")
+                        url = f"https://api.apify.com/v2/key-value-stores/{kvs_id}/records/{key}"
+                        datasift_csv_urls.append({
+                            "label": info["label"],
+                            "url": url,
+                            "records": info.get("count", "?"),
+                        })
+                        Actor.log.info("DataSift CSV (%s) saved to KVS: %s", info["label"], key)
+                except Exception as e:
+                    Actor.log.error("DataSift CSV KVS upload failed: %s", e)
 
             # ── Slack Notification ────────────────────────────────────
             elapsed_min = (_time() - pipeline_start) / 60
