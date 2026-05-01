@@ -1711,16 +1711,30 @@ def cli_main() -> None:
 
 
 def _run_scrape_pipeline(args, searches) -> None:
-    """Run the daily/historical scrape → enrich → export → upload pipeline."""
-    # Scrape
+    """Run the daily/historical scrape → enrich → export → upload pipeline.
+
+    Post-scrape orchestration (enrichment, Tracerfy, Trestle, PDF gen,
+    DataSift CSV gen) lives in full_pipeline.run_full_pipeline so the
+    Apify Actor entry point can share it. This function handles the
+    CLI-specific bits: argparse-driven options, local file output,
+    Playwright-based DataSift upload, sys.exit on empty, and the
+    Slack notification format.
+    """
+    from full_pipeline import PostScrapeOptions, run_full_pipeline
+
+    # ── Scrape ────────────────────────────────────────────────────
     notices = asyncio.run(scrape_all(
         mode=args.mode, searches=searches,
         llm_api_key=config.ANTHROPIC_API_KEY or None,
         since_date_override=args.since,
         max_notices=args.max_notices,
     ))
-    # Handle async probate lookup before pipeline (requires asyncio.run)
-    probate_notices = [n for n in notices if n.notice_type == "probate" and n.decedent_name and not n.address]
+
+    # ── Probate property lookup (async; CLI uses asyncio.run) ─────
+    probate_notices = [
+        n for n in notices
+        if n.notice_type == "probate" and n.decedent_name and not n.address
+    ]
     if probate_notices:
         try:
             from property_lookup import lookup_decedent_properties
@@ -1731,11 +1745,8 @@ def _run_scrape_pipeline(args, searches) -> None:
         except Exception as e:
             logging.warning("Property lookup failed: %s -- continuing without lookups", e)
 
-    # Run unified enrichment pipeline
-    from enrichment_pipeline import PipelineOptions, run_enrichment_pipeline
-
-    opts = PipelineOptions(
-        skip_parcel_lookup=True,  # web scrape notices don't have parcel IDs
+    # ── Shared post-scrape pipeline ───────────────────────────────
+    opts = PostScrapeOptions(
         skip_vacant_filter=getattr(args, "include_vacant", False),
         skip_commercial_filter=getattr(args, "include_commercial", False),
         skip_entity_filter=getattr(args, "include_entities", False),
@@ -1749,16 +1760,18 @@ def _run_scrape_pipeline(args, searches) -> None:
         skip_heir_verification=args.skip_heir_verification,
         max_heir_depth=args.max_heir_depth,
         skip_dm_address=args.skip_dm_address,
+        skip_tracerfy=getattr(args, "skip_tracerfy", False),
+        tracerfy_dp_only=False,    # CLI: trace ALL records (not just DP candidates)
         tracerfy_tier1=getattr(args, "tracerfy_tier1", False),
         source_label=f"CLI {args.mode}",
     )
-    notices = run_enrichment_pipeline(notices, opts)
+    result = run_full_pipeline(notices, opts)
+    notices = result.notices
 
     if not notices:
         logging.warning("No notices found")
         # Send Slack ping even on empty runs so operators know the job
-        # ran successfully (vs silently dying). Previously sys.exit(0)
-        # fired before the Slack block at the bottom of this function.
+        # ran successfully (vs silently dying).
         if getattr(args, "notify_slack", False):
             try:
                 from slack_notifier import send_slack_notification
@@ -1767,107 +1780,30 @@ def _run_scrape_pipeline(args, searches) -> None:
                 logging.exception("Slack notification for empty run failed")
         sys.exit(0)
 
-    # Tracerfy batch skip trace (phones + emails for all records)
-    tiers_map: dict = {}
-    tracerfy_stats: dict = {}
-    if not getattr(args, "skip_tracerfy", False):
-        import config as cfg
-        if cfg.TRACERFY_API_KEY:
-            from tracerfy_skip_tracer import batch_skip_trace
-            tracerfy_stats = batch_skip_trace(notices)
-            if tracerfy_stats.get("credits_exhausted"):
-                logging.error(
-                    "TRACERFY OUT OF CREDITS — skip trace disabled for this run. "
-                    "Add credits at https://tracerfy.com/billing to resume phone/email lookups."
-                )
-            logging.info(
-                "Tracerfy: %d/%d matched, %d phones, %d emails, $%.2f",
-                tracerfy_stats.get("matched", 0), tracerfy_stats.get("submitted", 0),
-                tracerfy_stats.get("phones_found", 0), tracerfy_stats.get("emails_found", 0),
-                tracerfy_stats.get("cost", 0.0),
-            )
-            # Score every phone (DM #1 + all heirs) — writes per-heir phone_scores
-            # into heir_map_json so DataSift Notes and PDFs can surface tier badges.
-            if cfg.TRESTLE_API_KEY:
-                from phone_validator import score_record_phones
-                dp_cands = [
-                    n for n in notices
-                    if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
-                ]
-                if dp_cands:
-                    try:
-                        tiers_map = score_record_phones(dp_cands, cfg.TRESTLE_API_KEY)
-                        logging.info("Trestle scored %d unique phones across %d DP records",
-                                     len(tiers_map), len(dp_cands))
-                    except Exception as e:
-                        logging.warning("Per-record Trestle scoring failed: %s", e)
-
-    # Write output
+    # ── Master CSV (CLI-only: split-by-type or unified) ───────────
     if args.split:
-        paths = write_csv_by_type(notices)
-        for p in paths:
+        for p in write_csv_by_type(notices):
             logging.info("Output: %s", p)
     else:
-        path = write_csv(notices)
-        logging.info("Output: %s", path)
+        logging.info("Output: %s", write_csv(notices))
 
-    # Generate deep-prospecting PDFs for deceased/DM/heir records.
-    # Matches the Apify branch behavior so CLI runs get the same reports —
-    # includes the Case Summary section added for deceased-owner records.
-    dp_candidates = [
-        n for n in notices
-        if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
-    ]
-    if dp_candidates:
-        try:
-            from report_generator import generate_record_pdf
-            report_dir = Path("output/reports")
-            generated = 0
-            for n in dp_candidates:
-                try:
-                    pdf_path = generate_record_pdf(
-                        n, output_dir=report_dir, phone_tiers=tiers_map,
-                    )
-                    logging.info("Report generated: %s", pdf_path)
-                    generated += 1
-                except Exception:
-                    logging.exception("PDF generation failed for %s", n.address)
-            logging.info(
-                "Generated %d/%d deep-prospecting PDFs in %s",
-                generated, len(dp_candidates), report_dir,
-            )
-        except Exception:
-            logging.exception("Report generator import failed")
-
-    # DataSift upload
+    # ── DataSift Playwright upload (CLI-only) ─────────────────────
     upload_result = None
-    if getattr(args, "upload_datasift", False):
-        from datasift_formatter import write_datasift_csv, write_datasift_split_csvs
+    if getattr(args, "upload_datasift", False) and result.datasift_csv_infos:
         from datasift_uploader import upload_to_datasift, upload_datasift_split
 
         do_enrich = not getattr(args, "no_enrich", False)
         do_skip_trace = not getattr(args, "no_skip_trace", False)
 
-        # Use split flow (separate DM + Heir Map Message Board entries)
-        csv_infos = write_datasift_split_csvs(notices)
-        for info in csv_infos:
-            logging.info("DataSift CSV (%s): %s", info["label"], info["path"])
-
+        csv_infos = result.datasift_csv_infos
         if len(csv_infos) > 1:
             upload_result = asyncio.run(
-                upload_datasift_split(
-                    csv_infos,
-                    enrich=do_enrich,
-                    skip_trace=do_skip_trace,
-                )
+                upload_datasift_split(csv_infos, enrich=do_enrich, skip_trace=do_skip_trace)
             )
         else:
-            # No deceased-with-heirs — single CSV upload
             upload_result = asyncio.run(
                 upload_to_datasift(
-                    csv_infos[0]["path"],
-                    enrich=do_enrich,
-                    skip_trace=do_skip_trace,
+                    csv_infos[0]["path"], enrich=do_enrich, skip_trace=do_skip_trace,
                 )
             )
 
@@ -1880,16 +1816,17 @@ def _run_scrape_pipeline(args, searches) -> None:
         else:
             logging.error("DataSift upload failed: %s", upload_result.get("message"))
 
-    # Slack/Discord notification
+    # ── Slack/Discord notification ────────────────────────────────
     if getattr(args, "notify_slack", False):
         from slack_notifier import send_slack_notification
-
         send_slack_notification(notices, upload_result=upload_result)
 
     # Audit DataSift for incomplete records (future daily check)
     if getattr(args, "audit_records", False):
-        logging.info("--audit-records: Not yet implemented. "
-                      "Will check DataSift Incomplete tab via Playwright in a future build.")
+        logging.info(
+            "--audit-records: Not yet implemented. "
+            "Will check DataSift Incomplete tab via Playwright in a future build."
+        )
 
     logging.info("Done — %d notices exported", len(notices))
 
