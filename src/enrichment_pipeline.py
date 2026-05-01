@@ -92,12 +92,25 @@ def detect_existing_enrichment(
 
 # ── Filters ──────────────────────────────────────────────────────────
 
+# Notice types whose contact value is the PR / petitioner mailing address
+# rather than the property address. The vacant-land filter and the data
+# validator both branch on this set to keep mailable-via-PR records flowing
+# even when the property locator can't match the decedent on the tax roll.
+_NO_PROPERTY_ADDRESS_TYPES = {"probate", "divorce"}
+
 
 def _filter_vacant_land(notices: list[NoticeData]) -> list[NoticeData]:
     """Remove records where the property address has no real house number.
 
     Vacant land parcels (e.g., "0 Andersonville Pike", "0000 Old Rd",
     or just "Andersonville Pike") are not actionable for marketing.
+
+    Probate and divorce notices are exempt: their contact value is the PR /
+    petitioner mailing address (``owner_street`` / ``decision_maker_*``),
+    not the property address. The property locator fills ``address`` when
+    the decedent's parcel is on the county tax roll, but real-world miss
+    rates run 30-60% (out-of-county property, trusts, recently transferred
+    deeds), and these records are still mailable via the PR address.
     """
 
     def _has_house_number(addr: str) -> bool:
@@ -110,7 +123,10 @@ def _filter_vacant_land(notices: list[NoticeData]) -> list[NoticeData]:
         return int(m.group(1)) > 0
 
     before = len(notices)
-    result = [n for n in notices if _has_house_number(n.address)]
+    result = [
+        n for n in notices
+        if n.notice_type in _NO_PROPERTY_ADDRESS_TYPES or _has_house_number(n.address)
+    ]
     removed = before - len(result)
     if removed:
         logger.info("  Removed %d vacant land records (no house number)", removed)
@@ -125,6 +141,14 @@ def _filter_entity_owners(notices: list[NoticeData]) -> list[NoticeData]:
     """
 
     def _is_entity(n: NoticeData) -> bool:
+        # Probate / divorce: owner_name is the PR / petitioner (a person by
+        # definition). Even if the property locator wrote a corporate trustee
+        # back into tax_owner_name (e.g. "FIRST AMERICAN TITLE TRUST"), the
+        # PR is the contact path and the record is mailable. Skip the entity
+        # filter entirely for these types — symmetric with the vacant-land
+        # and data-validator exemptions.
+        if n.notice_type in _NO_PROPERTY_ADDRESS_TYPES:
+            return False
         # Check both tax_owner_name (preferred) and owner_name
         name = (n.tax_owner_name or n.owner_name or "").strip()
         if not name:
@@ -164,9 +188,18 @@ def _filter_commercial(notices: list[NoticeData]) -> list[NoticeData]:
 
     Only filters when rdi is explicitly 'Commercial' — empty rdi
     (no Smarty data) passes through.
+
+    Probate / divorce notices are exempt: the property may be a mixed-use
+    building or the tax-roll lookup may have written the PR's law-office
+    address (rare but observed). The PR mailing address is still a
+    workable contact path. Symmetric with the vacant-land, data-validator,
+    and entity-filter exemptions.
     """
     before = len(notices)
-    result = [n for n in notices if n.rdi.lower() != "commercial"]
+    result = [
+        n for n in notices
+        if n.notice_type in _NO_PROPERTY_ADDRESS_TYPES or n.rdi.lower() != "commercial"
+    ]
     removed = before - len(result)
     if removed:
         logger.info("  Removed %d commercial properties", removed)
@@ -207,7 +240,10 @@ def _validate_records(notices: list[NoticeData]) -> list[NoticeData]:
     """Validate records before export. Removes invalid records and logs issues.
 
     Checks:
-      - address, city, zip must be non-empty
+      - address, city, zip must be non-empty (foreclosure / tax / code-violation)
+      - probate / divorce: either property address (when locator matched) OR
+        PR mailing address (always extracted from notice text); records with
+        neither are dropped (catches bad-parse garbage like "In The Matter")
       - address must contain at least one letter (not pure garbage OCR)
       - date fields must be valid YYYY-MM-DD format if present
     """
@@ -217,19 +253,37 @@ def _validate_records(notices: list[NoticeData]) -> list[NoticeData]:
     for n in notices:
         issues = []
 
-        # Required fields
-        if not n.address.strip():
-            issues.append("missing address")
-        elif _GARBAGE_RE.match(n.address):
-            issues.append(f"garbage address: {n.address!r}")
+        if n.notice_type in _NO_PROPERTY_ADDRESS_TYPES:
+            # Probate / divorce: contact value comes from the PR / petitioner
+            # mailing address when the property locator can't match. Validate
+            # that we have ONE workable contact path — either the property
+            # address (locator hit) or the PR mailing address — plus an
+            # owner_name. Without any of those, the record is unmailable.
+            has_property = bool(
+                n.address.strip() and n.city.strip() and n.zip.strip()
+                and not _GARBAGE_RE.match(n.address)
+            )
+            has_pr_mailing = bool(
+                n.owner_street.strip() and n.owner_zip.strip()
+            )
+            if not (has_property or has_pr_mailing):
+                issues.append("missing both property address and PR mailing address")
+            if not n.owner_name.strip():
+                issues.append("missing owner_name")
+        else:
+            # Foreclosure / tax / code_violation: property address is required
+            if not n.address.strip():
+                issues.append("missing address")
+            elif _GARBAGE_RE.match(n.address):
+                issues.append(f"garbage address: {n.address!r}")
 
-        if not n.city.strip():
-            issues.append("missing city")
+            if not n.city.strip():
+                issues.append("missing city")
 
-        if not n.zip.strip():
-            issues.append("missing zip")
+            if not n.zip.strip():
+                issues.append("missing zip")
 
-        # Date format validation (only if populated)
+        # Date format validation (only if populated) — applies to all types
         for date_field in ("date_added", "auction_date"):
             val = getattr(n, date_field, "")
             if val and not _DATE_RE.match(val):
