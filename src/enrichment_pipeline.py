@@ -437,6 +437,30 @@ def run_enrichment_pipeline(
     elif opts.skip_parcel_lookup:
         logger.info("── Step 4: Parcel Address Lookup (skipped) ──")
 
+    # ── Step 4b: AL County Property Enrichment ───────────────────────
+    # Routes Jefferson + Madison notices through their respective assessor APIs
+    # to fill parcel_id, assessed_value, property_use, municipality, is_homestead,
+    # and tax_delinquent_amount/years. Knox/Blount notices skip this entirely
+    # (handled by Step 4 above via tax_enricher).
+    al_candidates = [
+        n for n in notices
+        if n.county.lower().strip() in ("jefferson", "madison") and n.address.strip()
+    ]
+    if al_candidates:
+        logger.info(
+            "── Step 4b: AL Property Enrichment (%d candidates) ──",
+            len(al_candidates),
+        )
+        try:
+            from al_property_enricher import enrich_al_properties
+
+            enriched = enrich_al_properties(notices)
+            logger.info("  AL property-enriched: %d/%d", enriched, len(al_candidates))
+        except ImportError:
+            logger.warning("  al_property_enricher not available — skipping")
+        except Exception as e:
+            logger.warning("  AL property enrichment failed: %s", e)
+
     # ── Step 5: Tax Delinquency ──────────────────────────────────────
     if not opts.skip_tax and not opts.has_tax:
         logger.info("── Step 5: Tax Delinquency Enrichment ──")
