@@ -769,14 +769,43 @@ AUCTION_DATE_PATTERNS = [
         r"notice\s+is\s+hereby\s+given\s+that\s+on\s+" + _DATE_FRAGMENT,
         re.IGNORECASE,
     ),
+    # AL convention: "will sell at public outcry [...] on DATE"
+    # ".{0,250}" because AL notices interpose the trustee, courthouse,
+    # county, and city between "will sell" and "on DATE".
+    re.compile(
+        r"will\s+sell\s+at\s+public\s+(?:outcry|auction)\b.{0,250}?\bon\s+" + _DATE_FRAGMENT,
+        re.IGNORECASE | re.DOTALL,
+    ),
+    # AL continuation: "It will be held on DATE" or "sale will be held on DATE"
+    # Anchored on "it"/"sale" to avoid matching unrelated "will be held on" prose.
+    re.compile(
+        r"(?:\bit|\bsale)\s+will\s+be\s+held\s+on\s+" + _DATE_FRAGMENT,
+        re.IGNORECASE,
+    ),
+    # AL trailing anchor: ", on DATE, during the legal hours of sale"
+    # AL equivalent of the time-based pattern above — uses statutory phrase
+    # "legal hours of sale" instead of a specific time like "at 11:00".
+    re.compile(
+        r",\s+on\s+" + _DATE_FRAGMENT + r"\s*,?\s+during\s+the\s+legal\s+hours",
+        re.IGNORECASE,
+    ),
 ]
 
-# Postponement-chain pattern: "postponed from DATE1 until DATE2" — captures DATE2.
-# Alabama foreclosure notices append every postponement to the original notice
+# Postponement-chain pattern: captures the LATEST scheduled sale date when a
+# notice has been continued/postponed. Two AL conventions covered:
+#   1. "postponed from <OLD> until <NEW>"  — historic phrasing
+#   2. "sale has been continued. [...] will be held on <NEW>"  — current AL
+#      newspaper convention. The "originally set for <OLD>" sentence that
+#      typically follows is intentionally NOT matched (we want NEW, not OLD).
+# Alabama foreclosure notices append every continuation to the original notice
 # text rather than re-publishing, so the LAST match in the document is the
 # currently-scheduled sale date.
 POSTPONEMENT_RE = re.compile(
-    r"postponed\s+from\s+[\w\s,]+?\s+until\s+" + _DATE_FRAGMENT,
+    r"(?:"
+    r"postponed\s+from\s+[\w\s,]+?\s+until"
+    r"|"
+    r"sale\s+has\s+been\s+continued[\s\S]{0,100}?will\s+be\s+held\s+on"
+    r")\s+" + _DATE_FRAGMENT,
     re.IGNORECASE,
 )
 
