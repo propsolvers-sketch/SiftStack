@@ -165,14 +165,15 @@ def _split_name(full_name: str) -> tuple[str, str]:
 def _notice_id_from_url(url: str) -> str:
     """Extract the numeric notice ID from a source URL.
 
-    Alabama: DetailsPrint.aspx?SID={numeric_id}
-    Tennessee: Details.aspx?SID={session_guid}&ID={numeric_id}
-    Returns the ID value, or empty string if not found.
+    Both Alabama (DetailsPrint.aspx?SID={session}&ID={notice_id}) and
+    Tennessee (Details.aspx?SID={session}&ID={notice_id}) put the numeric
+    notice ID in the &ID= parameter. SID is an alphanumeric session token —
+    NOT the notice ID. The earlier "SID=(\\d+)" path silently collided
+    notices whenever session GUIDs happened to share a leading digit (one
+    real run had all 4 records collapsed to nid="0" because they shared
+    SID="0irs1fi0...").
     """
     import re
-    if "DetailsPrint.aspx" in url:
-        m = re.search(r"[?&]SID=(\d+)", url)
-        return m.group(1) if m else ""
     m = re.search(r"[?&]ID=(\d+)", url)
     return m.group(1) if m else ""
 
