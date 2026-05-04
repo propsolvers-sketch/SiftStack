@@ -35,8 +35,9 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
 # ── Credentials ────────────────────────────────────────────────────────
-TNPN_EMAIL = os.getenv("TNPN_EMAIL", "")
-TNPN_PASSWORD = os.getenv("TNPN_PASSWORD", "")
+# Alabama Public Notices — no login required for search; CAPTCHA on detail pages only
+APNA_EMAIL = os.getenv("APNA_EMAIL", "")    # Reserved for future Smart Search login
+APNA_PASSWORD = os.getenv("APNA_PASSWORD", "")
 CAPTCHA_API_KEY = os.getenv("CAPTCHA_API_KEY", "")  # 2Captcha API key
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")  # Claude Haiku for LLM parsing
 SMARTY_AUTH_ID = os.getenv("SMARTY_AUTH_ID", "")        # Smarty address standardization
@@ -65,30 +66,28 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen-2.5-72b-instruct")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
 # ── Site URLs ──────────────────────────────────────────────────────────
-BASE_URL = "https://www.tnpublicnotice.com"
-LOGIN_URL = f"{BASE_URL}/authenticate.aspx"
-SMART_SEARCH_URL = f"{BASE_URL}/Smartsearch/Default.aspx"
+BASE_URL = "https://www.alabamapublicnotices.com"
+SEARCH_URL = f"{BASE_URL}/Search.aspx"
 
 # ── ASP.NET Selectors ─────────────────────────────────────────────────
-# Login form
-SEL_LOGIN_EMAIL = "#ctl00_ContentPlaceHolder1_AuthenticateIPA1_txtEmailAddress"
-SEL_LOGIN_PASSWORD = "#ctl00_ContentPlaceHolder1_AuthenticateIPA1_txtPassword"
-SEL_LOGIN_SUBMIT = "#ctl00_ContentPlaceHolder1_AuthenticateIPA1_btnAuth"
+# Search form (Alabama Public Notices — no login required)
+SEL_SEARCH_TEXT = "#ctl00_ContentPlaceHolder1_as1_txtSearch"
+SEL_SEARCH_TYPE_AND = "#ctl00_ContentPlaceHolder1_as1_rdoType_0"  # All Words
+SEL_SEARCH_TYPE_OR = "#ctl00_ContentPlaceHolder1_as1_rdoType_1"   # Any Words
+SEL_SEARCH_EXCLUDE = "#ctl00_ContentPlaceHolder1_as1_txtExclude"
+SEL_SEARCH_DAYS = "#ctl00_ContentPlaceHolder1_as1_txtLastNumDays"
+SEL_SEARCH_SUBMIT = "#ctl00_ContentPlaceHolder1_as1_btnGo"
 
-# Smart Search dashboard
-SEL_SAVED_SEARCHES_DROPDOWN = "#ctl00_ContentPlaceHolder1_as1_ddlSavedSearches"
+# Search results grid
+SEL_RESULTS_GRID = "#ctl00_ContentPlaceHolder1_WSExtendedGridNP1_GridView1"
 SEL_PER_PAGE_DROPDOWN = 'select[name$="ddlPerPage"]'
-
-# Search results (authenticated grid)
-SEL_RESULTS_GRID = "#ctl00_ContentPlaceHolder1_WSExtendedGrid1_GridView1"
-SEL_VIEW_BUTTON_PATTERN = "input[name$='btnView']"
+SEL_VIEW_BUTTON_PATTERN = "input.viewButton"
 SEL_NEXT_PAGE_BUTTON = "input[title='Next page']"
-SEL_PAGE_INFO = "td:has-text('Page ')"
+SEL_PAGE_INFO = "span[id$='lblTotalPages']"
 
-# Notice detail page
-SEL_CAPTCHA_IFRAME = "iframe[src*='recaptcha']"
+# Notice detail page (DetailsPrint.aspx — reCAPTCHA + Terms gated)
 SEL_VIEW_NOTICE_BUTTON = "#ctl00_ContentPlaceHolder1_PublicNoticeDetailsBody1_btnViewNotice"
-RECAPTCHA_SITEKEY = "6LdtSg8sAAAAADTdRyZxJ2R2sS82pKALNMvMqSyL"
+RECAPTCHA_SITEKEY = "6LccnQ8sAAAAAMNFrb4ZLDtPAqk50k_r-CCwimHJ"
 
 # ── Rate Limiting ──────────────────────────────────────────────────────
 REQUEST_DELAY_MIN = 2.0  # seconds between requests
@@ -102,23 +101,30 @@ TESSERACT_PSM_PDF = 3    # fully automatic — best for PDF tax sale tables
 TESSERACT_PSM_PHOTO = 4  # assume single column of variable-size text — best for terminal screen photos
 
 # ── Notice Types ───────────────────────────────────────────────────────
-NOTICE_TYPES = ["foreclosure", "probate"]
+NOTICE_TYPES = ["foreclosure"]
 
 
 @dataclass
-class SavedSearch:
-    """Represents a saved search on tnpublicnotice.com."""
+class SearchConfig:
+    """Represents a keyword search on alabamapublicnotices.com."""
     county: str
-    notice_type: str  # One of NOTICE_TYPES
-    saved_search_name: str  # Exact name in the Saved Searches dropdown
+    notice_type: str    # One of NOTICE_TYPES
+    search_terms: str   # Keywords for the search box
+    search_type: str    # "AND" (all words) or "OR" (any words)
+    exclude_terms: str  # Keywords to exclude
+    days_back: int      # "Last N days" date range
+    # Optional pre-classification — when set, every notice from this search
+    # gets `notice.notice_subtype = <value>`. Used today for code-violation
+    # searches to flag CONDEMNATION/DEMOLITION as "unsafe_building" so the
+    # DataSift formatter fires the `demolish` tag automatically.
+    notice_subtype: str = ""
 
 
-# ── Saved Searches ─────────────────────────────────────────────────────
-# These names must match exactly what appears in the dropdown on the site.
-SAVED_SEARCHES: list[SavedSearch] = [
-    SavedSearch("Knox", "foreclosure", "Foreclosure V2 Knox"),
-    SavedSearch("Blount", "foreclosure", "Foreclosure V2 Blount"),
-]
+# Keep SavedSearch as alias so non-scraper imports don't break
+SavedSearch = SearchConfig
+
+# ── Searches ───────────────────────────────────────────────────────────
+SAVED_SEARCHES: list[SearchConfig] = []
 
 # ── Entity Detection ──────────────────────────────────────────────────
 # Business entity patterns — shared across obituary_enricher, tax_enricher,
