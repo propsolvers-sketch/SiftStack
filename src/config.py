@@ -282,6 +282,80 @@ SAVED_SEARCHES: list[SearchConfig] = [
     # notice_parser.py:1015-1048) so any future eviction-source adapter
     # plugs into the existing NoticeData → DataSift pipeline cleanly.
     # Just need a different upstream feed than APN.
+    #
+    # ─────────────────────────────────────────────────────────────────
+    # Tax sale (delinquent-property auction) publications.
+    #
+    # NOT WIRED — recon not performed. Distinct from tax_delinquent
+    # (already covered for Jefferson + Madison via the dedicated
+    # tax-collector adapters in tax_distress_pipeline.py): tax_sale
+    # is the actual auction event, tax_delinquent is the upstream
+    # signal. They overlap in prospecting value — most properties
+    # that hit a tax_sale were tax_delinquent for years first, so
+    # the existing pipeline catches them earlier. The marginal
+    # value-add of wiring tax_sale is the firm auction date for
+    # bidders, not new lead discovery.
+    #
+    # Statutory basis for publication exists: AL Code § 40-10-184
+    # requires the tax collector to publish the sale list once a
+    # week for two consecutive weeks before the sale. Whether that
+    # publication surfaces on APN vs. only in print/county sites
+    # is unverified — needs empirical recon.
+    #
+    # Coverage paths to investigate (in priority order):
+    #   1. APN keyword search — try "TAX SALE JEFFERSON" /
+    #      "TAX SALE MADISON" / "DELINQUENT TAX SALE" with
+    #      days_back=30 (annual sales are typically May/June, so
+    #      a daily run will see them only in season). Wire
+    #      SearchConfigs the same way as the foreclosure entries
+    #      if results materialize.
+    #   2. County tax-collector publication endpoints directly
+    #      (Jefferson Co Revenue Commission / Madison Co Tax
+    #      Collector) — both publish annual tax-sale lists on
+    #      their own sites. More reliable than APN since the
+    #      publication duty is on the county, not a private seller.
+    #
+    # notice_parser.py + llm_parser.py already handle tax_sale as a
+    # distinct notice_type (legacy from the TN scraper era). Wiring
+    # an AL source means SearchConfig entries OR a county-tax-collector
+    # adapter in the shape of madison_tax_delinquent_api.py — no
+    # parser/formatter changes needed.
+    #
+    # ─────────────────────────────────────────────────────────────────
+    # Divorce / dissolution-of-marriage publications.
+    #
+    # NOT WIRED — recon not performed, AND not currently parsed.
+    # Two-layer gap: no upstream feed AND notice_parser.py does not
+    # handle divorce as a notice_type today (only photo_importer.py
+    # does, for courthouse-terminal photo imports).
+    #
+    # Like eviction, AL divorce procedure (§ 30-2-1 et seq.) requires
+    # personal service in most cases. ARCP Rule 4.3 allows service
+    # by publication when the respondent can't be located (typically:
+    # spouse who left and can't be tracked down). Volume is likely
+    # LOW — most divorces are uncontested and personally served.
+    #
+    # Strategic priority is also low: divorce-as-distress signal
+    # works best when the property is ALSO in foreclosure (which the
+    # foreclosure pipeline catches independently) or when the court
+    # has ordered a sale (which would surface as a probate_sale-style
+    # notice). A divorce alone, without financial distress, is a
+    # weak motivated-seller signal.
+    #
+    # Coverage paths if revisited:
+    #   1. APN keyword search — "DIVORCE NOTICE PUBLICATION" /
+    #      "DISSOLUTION OF MARRIAGE BY PUBLICATION".
+    #   2. AlaCourt domestic-relations docket subscription (same
+    #      source proposed for evictions above).
+    #   3. Photo-import pipeline (already handles divorce — see
+    #      photo_importer.py — for courthouse terminal scans).
+    #
+    # Wiring end-to-end requires more work than tax_sale: NoticeData
+    # fields for petitioner/respondent (currently in photo_importer.py
+    # only), an LLM prompt branch in llm_parser.py, and a regex parser
+    # in notice_parser.py. Estimate 1-2 days to bring divorce parity
+    # with the other notice types. Defer until APN recon shows
+    # non-trivial volume to justify the investment.
 ]
 
 # ── Entity Detection ──────────────────────────────────────────────────
