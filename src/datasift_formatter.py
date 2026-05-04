@@ -104,6 +104,15 @@ DATASIFT_COLUMNS = [
     "Entity Type",
     "Entity Contact",
     "Entity Contact Role",
+    # ── AL probate enrichment (added 2026-04) ──
+    # All become custom fields in the SiftStack group on first upload.
+    "Probate Case Number",
+    "Judge of Probate",
+    "Probate Subtype",          # probate_creditors | probate_sale | probate_heirs_notice
+    "Petition Filed Date",      # probate_sale only — when PR petitioned the court
+    "Hearing Date",             # probate_sale only — court approval date
+    "Creditor Claim Deadline",  # granted_date + 6 months (AL § 43-2-350)
+    "Total Estate Value",       # Sum of all parcels owned by the decedent
 ]
 
 
@@ -271,13 +280,32 @@ def _build_tags(notice: NoticeData) -> str:
         except ValueError:
             pass
 
-    # Tax delinquent flag
+    # Tax delinquent flag + dollar-exposure ladder. Phase 1 focuses on dollar
+    # amount as the primary distress signal; timeline-based tags are intentionally
+    # absent because Madison's feed surfaces only current-year delinquencies
+    # (older years are pruned after the May auction or redemption).
     if notice.tax_delinquent_amount:
         try:
             amt = float(notice.tax_delinquent_amount)
             if amt > 0:
                 tags.append("tax_delinquent")
+            if amt >= 5000:
+                tags.append("tax_high_exposure")
+            if amt >= 10000:
+                tags.append("tax_high_exposure_10k")
         except (ValueError, TypeError):
+            pass
+
+    # Individual-vs-entity flag for tax records — reuse existing BUSINESS_RE
+    # check so DataSift filter presets can target individuals only.
+    if notice.notice_type in ("tax_sale", "tax_delinquent") and notice.owner_name:
+        try:
+            from config import BUSINESS_RE
+            if not BUSINESS_RE.search(notice.owner_name):
+                tags.append("individual_owner")
+            else:
+                tags.append("entity_owned")
+        except ImportError:
             pass
 
     # Deep prospecting tags
@@ -330,6 +358,65 @@ def _build_tags(notice: NoticeData) -> str:
     # Photo import tag (source_url starts with "photo:")
     if notice.source_url and notice.source_url.startswith("photo:"):
         tags.append("photo_import")
+
+    # ── AL probate enrichment tags (filter-preset friendly) ─────────
+    # Municipality (Jefferson DispCode or Madison gap) — lowercased, spaces → underscores.
+    # Birmingham metro core: birmingham, hoover, vestavia_hills, mountain_brook, homewood,
+    # trussville. "county" flags unincorporated Jefferson (Dora-edge cases, etc.).
+    if notice.municipality:
+        muni_tag = notice.municipality.lower().replace(" ", "_")
+        tags.append(f"municipality_{muni_tag}")
+
+    # Homestead = primary residence (vs investment / vacant land)
+    if notice.is_homestead == "Y":
+        tags.append("homestead")
+
+    # Notice subtype — the descriptive category (probate_sale, probate_creditors,
+    # probate_heirs_notice, unsafe_building, etc.). Filter presets target this.
+    if notice.notice_subtype:
+        tags.append(notice.notice_subtype)
+
+    # Tear-down signal — every parcel on a city's Unsafe-Building / Condemned
+    # list is, by definition, a demolition candidate. Tag explicitly so the
+    # outreach sequence frames the conversation around tear-down economics
+    # (lot value, demo cost, build-back ARV) rather than rehab.
+    if notice.notice_subtype == "unsafe_building":
+        tags.append("demolish")
+
+    # Early-distress signal — Birmingham Accela code-enforcement subtypes that
+    # indicate soft maintenance failures (tall grass, junk vehicles, IPMC
+    # violations). Owner is still in the property but slipping; outreach
+    # framing is "rehab/clean-up offer" not "tear-down".
+    if notice.notice_subtype in (
+        "housing_enforcement",
+        "inoperable_vehicle",
+        "environmental_enforcement",
+        "zoning_enforcement",
+    ):
+        tags.append("early_distress")
+
+    # Multi-parcel estate — owner has 2+ parcels (rentals + family land)
+    if notice.secondary_addresses:
+        tags.append("multi_parcel")
+
+    # Upcoming hearing (probate_sale) — make offer before court approval closes
+    if notice.hearing_date:
+        try:
+            hd = datetime.strptime(notice.hearing_date, "%Y-%m-%d")
+            days = (hd - datetime.now()).days
+            if 0 <= days <= 30:
+                tags.append("hearing_upcoming")
+        except ValueError:
+            pass
+
+    # Creditor window still open (probate_creditors) — claims period not yet closed
+    if notice.creditor_deadline:
+        try:
+            cd = datetime.strptime(notice.creditor_deadline, "%Y-%m-%d")
+            if cd >= datetime.now():
+                tags.append("creditor_window_open")
+        except ValueError:
+            pass
 
     return ",".join(tags)
 
@@ -531,6 +618,44 @@ def _build_property_section(notice: NoticeData) -> str:
             tax_str += f" ({notice.tax_delinquent_years} yrs)"
         parts.append(tax_str)
 
+    # ── Probate-specific extras ──
+    if notice.case_number:
+        parts.append(f"Case#: {notice.case_number}")
+    if notice.judge_name:
+        parts.append(f"Judge: {notice.judge_name}")
+    if notice.granted_date and notice.notice_type == "probate":
+        parts.append(f"Letters Granted: {_format_date(notice.granted_date)}")
+    if notice.creditor_deadline:
+        parts.append(f"Creditor Deadline: {_format_date(notice.creditor_deadline)}")
+    if notice.notice_subtype == "probate_sale":
+        if notice.petition_filed_date:
+            parts.append(f"Petition Filed: {_format_date(notice.petition_filed_date)}")
+        if notice.hearing_date:
+            parts.append(f"Hearing: {_format_date(notice.hearing_date)}")
+        if notice.sale_type:
+            parts.append(f"Sale Type: {notice.sale_type}")
+    if notice.co_pr_names:
+        parts.append(f"Co-PRs: {notice.co_pr_names}")
+    if notice.heirs_named_in_notice and notice.notice_subtype == "probate_heirs_notice":
+        parts.append(f"Named Heirs: {notice.heirs_named_in_notice}")
+    if notice.secondary_addresses:
+        parts.append(f"Additional Parcels: {notice.secondary_addresses}")
+    if notice.total_estate_value:
+        parts.append(f"Total Estate Value: ${notice.total_estate_value}")
+    if notice.municipality:
+        parts.append(f"Municipality: {notice.municipality}")
+
+    # ── Foreclosure-specific extras ──
+    if notice.notice_type == "foreclosure":
+        if notice.mortgage_company:
+            parts.append(f"Mortgagee: {notice.mortgage_company}")
+        if notice.original_lender:
+            parts.append(f"Original Lender: {notice.original_lender}")
+        if notice.trustee:
+            parts.append(f"Trustee: {notice.trustee}")
+        if notice.trustee_file_number:
+            parts.append(f"File#: {notice.trustee_file_number}")
+
     if notice.source_url:
         parts.append(f"Source: {notice.source_url}")
 
@@ -693,12 +818,20 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
     elif notice.notice_type == "foreclosure":
         foreclosure_date = _format_date(notice.auction_date)
     elif notice.notice_type == "probate":
-        probate_open = _format_date(notice.date_added)
+        # Prefer granted_date (when Letters issued) over publication date — more accurate
+        probate_open = _format_date(notice.granted_date or notice.date_added)
 
-    # Personal Representative only for probate notices
+    # Personal Representative for probate — prefer the parsed PR (owner_name)
+    # over the obituary-derived decision_maker_name. owner_name is the verified
+    # PR named in the Letters Testamentary; decision_maker_name may be a
+    # surviving heir derived from the obituary.
     personal_rep = ""
-    if notice.notice_type == "probate" and notice.decision_maker_name:
-        personal_rep = notice.decision_maker_name
+    if notice.notice_type == "probate":
+        personal_rep = notice.owner_name or notice.decision_maker_name
+
+    # Fallbacks — assessor data when Zillow enrichment hasn't run
+    estimated_value = notice.estimated_value or notice.assessed_value
+    structure_type = notice.property_type or notice.property_use
 
     return {
         # ── Core auto-mapped ──
@@ -731,7 +864,7 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
         "Lists": list_name,
         "Notes": notes,
         # ── Built-in fields ──
-        "Estimated Value": notice.estimated_value,
+        "Estimated Value": estimated_value,
         "MSL Status": notice.mls_status,
         "Last Sale Date": _format_date(notice.mls_last_sold_date),
         "Last Sale Price": notice.mls_last_sold_price,
@@ -743,7 +876,7 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
         "Probate Open Date": probate_open,
         "Personal Representative": personal_rep,
         "Parcel ID": notice.parcel_id,
-        "Structure Type": notice.property_type,
+        "Structure Type": structure_type,
         "Year Built": notice.year_built,
         "Living SqFt": notice.sqft,
         "Bedrooms": notice.bedrooms,
@@ -780,6 +913,14 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
         "Entity Type": notice.entity_type,
         "Entity Contact": notice.entity_person_name,
         "Entity Contact Role": notice.entity_person_role,
+        # ── AL probate enrichment ──
+        "Probate Case Number": notice.case_number,
+        "Judge of Probate": notice.judge_name,
+        "Probate Subtype": notice.notice_subtype,
+        "Petition Filed Date": _format_date(notice.petition_filed_date),
+        "Hearing Date": _format_date(notice.hearing_date),
+        "Creditor Claim Deadline": _format_date(notice.creditor_deadline),
+        "Total Estate Value": notice.total_estate_value,
     }
 
 
