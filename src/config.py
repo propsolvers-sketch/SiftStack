@@ -178,6 +178,110 @@ SAVED_SEARCHES: list[SearchConfig] = [
         exclude_terms="foreclosure mortgage",
         days_back=7,
     ),
+    # Code-violation / unsafe-building publications.
+    #
+    # Empirical recon (April 2026) showed naive keywords have severe
+    # false-positive rates:
+    #   CONDEMNATION    → catches drug/firearm forfeitures + ALDOT eminent
+    #                     domain (NOT property teardowns)
+    #   DEMOLITION      → catches construction bid solicitations
+    #   PUBLIC NUISANCE → mixed; catches overgrown-grass soft violations
+    #
+    # The AL Code § 11-53A-20 boilerplate that real condemnation orders use
+    # is the cleanest discriminator: every actual teardown notice cites it
+    # verbatim ("pursuant to Sections 11-53A-20"). We use that as the AND
+    # anchor + the action keyword, which drops the false-positive rate to
+    # near zero. Madison/Jefferson hits will be rare regardless (Birmingham
+    # uses 311; Huntsville publishes its own list — already covered in
+    # Phase 1) but the filter is at least clean when something does land.
+    SearchConfig(
+        county="Jefferson",
+        notice_type="code_violation",
+        notice_subtype="unsafe_building",
+        search_terms="DEMOLITION UNSAFE STRUCTURE",
+        search_type="AND",
+        exclude_terms="bid contractor sealed",
+        days_back=14,
+    ),
+    SearchConfig(
+        county="Jefferson",
+        notice_type="code_violation",
+        notice_subtype="unsafe_building",
+        search_terms="CONDEMNED STRUCTURE DEMOLITION",
+        search_type="AND",
+        exclude_terms="bid contractor sealed",
+        days_back=14,
+    ),
+    SearchConfig(
+        county="Jefferson",
+        notice_type="code_violation",
+        notice_subtype="unsafe_building",
+        search_terms="NUISANCE ABATEMENT DEMOLISHED",
+        search_type="AND",
+        exclude_terms="bid contractor sealed",
+        days_back=14,
+    ),
+    SearchConfig(
+        county="Madison",
+        notice_type="code_violation",
+        notice_subtype="unsafe_building",
+        search_terms="DEMOLITION UNSAFE STRUCTURE",
+        search_type="AND",
+        exclude_terms="bid contractor sealed",
+        days_back=14,
+    ),
+    SearchConfig(
+        county="Madison",
+        notice_type="code_violation",
+        notice_subtype="unsafe_building",
+        search_terms="CONDEMNED STRUCTURE DEMOLITION",
+        search_type="AND",
+        exclude_terms="bid contractor sealed",
+        days_back=14,
+    ),
+    SearchConfig(
+        county="Madison",
+        notice_type="code_violation",
+        notice_subtype="unsafe_building",
+        search_terms="NUISANCE ABATEMENT DEMOLISHED",
+        search_type="AND",
+        exclude_terms="bid contractor sealed",
+        days_back=14,
+    ),
+    # Eviction / unlawful-detainer publications.
+    #
+    # NOT WIRED — empirical recon (April 2026) confirmed APN does NOT
+    # carry Alabama eviction publications in any meaningful volume. Four
+    # independent keyword probes statewide over a full 12-month window
+    # all returned ZERO results:
+    #   "UNLAWFUL DETAINER JEFFERSON"  → 0 hits
+    #   "UNLAWFUL DETAINER" (statewide) → 0 hits
+    #   "DETAINER WARRANT" (statewide)  → 0 hits
+    #   "EVICTION TENANT" (statewide)   → 0 hits
+    #   "LANDLORD TENANT NOTICE"        → 0 hits
+    #
+    # Why: unlike foreclosures (§ 35-10-13 mandates publication of trustee
+    # sales) and probate creditor notices (§ 43-2-61 mandates publication
+    # for 3 successive weeks), Alabama eviction statute § 6-6-310 et seq.
+    # requires personal service, not publication. ARCP Rule 4.3 allows
+    # service by publication when a tenant can't be located, but landlords
+    # rarely use it — they take default judgment after the 14-day response
+    # window instead, since publication costs them money and the tenant
+    # has typically already abandoned the property anyway.
+    #
+    # Coverage paths for evictions:
+    #   1. AlaCourt.com subscription (~$100/yr + per-record fees) —
+    #      structured statewide unlawful-detainer search, full coverage.
+    #      Requires Playwright scrape behind login.
+    #   2. County district court online dockets (Jefferson 10th Circuit /
+    #      Madison 23rd Circuit) — free but PDF-format and inconsistent.
+    #   3. Photo-import pipeline (already wired in photo_importer.py)
+    #      — operator photographs courthouse terminal, OCR + LLM parse.
+    #
+    # The eviction LLM prompt + result handler ARE wired (llm_parser.py,
+    # notice_parser.py:1015-1048) so any future eviction-source adapter
+    # plugs into the existing NoticeData → DataSift pipeline cleanly.
+    # Just need a different upstream feed than APN.
 ]
 
 # ── Entity Detection ──────────────────────────────────────────────────
