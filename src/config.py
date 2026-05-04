@@ -124,7 +124,61 @@ class SearchConfig:
 SavedSearch = SearchConfig
 
 # ── Searches ───────────────────────────────────────────────────────────
-SAVED_SEARCHES: list[SearchConfig] = []
+# Jefferson County, AL — mortgage foreclosure sales + rescheduled notices
+# Madison County, AL — newspaper PDF scans; detail pages use image-based PDF display
+SAVED_SEARCHES: list[SearchConfig] = [
+    SearchConfig(
+        county="Jefferson",
+        notice_type="foreclosure",
+        search_terms="MORTGAGE FORECLOSURE SALE JEFFERSON",
+        search_type="AND",
+        exclude_terms="CONDEMNATION",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Jefferson",
+        notice_type="foreclosure",
+        search_terms="NOTICE OF MORTGAGE RESCHEDULE JEFFERSON",
+        search_type="AND",
+        exclude_terms="CONDEMNATION",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Madison",
+        notice_type="foreclosure",
+        search_terms="MORTGAGE FORECLOSURE SALE MADISON",
+        search_type="AND",
+        exclude_terms="CONDEMNATION",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Madison",
+        notice_type="foreclosure",
+        search_terms="NOTICE OF MORTGAGE RESCHEDULE MADISON",
+        search_type="AND",
+        exclude_terms="CONDEMNATION",
+        days_back=7,
+    ),
+    # Probate "Notice to Creditors" publications. APN search has no county
+    # filter — the county-of-property check happens in is_target_county()
+    # against the full notice text after CAPTCHA.
+    SearchConfig(
+        county="Jefferson",
+        notice_type="probate",
+        search_terms="Estate Deceased",
+        search_type="AND",
+        exclude_terms="foreclosure mortgage",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Madison",
+        notice_type="probate",
+        search_terms="Estate Deceased",
+        search_type="AND",
+        exclude_terms="foreclosure mortgage",
+        days_back=7,
+    ),
+]
 
 # ── Entity Detection ──────────────────────────────────────────────────
 # Business entity patterns — shared across obituary_enricher, tax_enricher,
