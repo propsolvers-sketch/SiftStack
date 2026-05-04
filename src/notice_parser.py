@@ -32,10 +32,19 @@ class NoticeData:
     auction_date: str = ""     # Scheduled sale/auction date (YYYY-MM-DD)
     address: str = ""
     city: str = ""
-    state: str = "TN"
+    state: str = "AL"
     zip: str = ""
     owner_name: str = ""
+    owner_first_name: str = ""  # Split from owner_name (first token)
+    owner_middle_name: str = "" # Split from owner_name (middle tokens, joined)
+    owner_last_name: str = ""   # Split from owner_name (last token, ignoring suffixes)
+    owner_suffix: str = ""      # Generational suffix (Jr/Sr/II/III/IV)
     notice_type: str = ""      # foreclosure | tax_sale | tax_lien | probate
+    # Foreclosure-specific party metadata (populated by regex + LLM fallback)
+    mortgage_company: str = ""        # Current Mortgagee/Transferee (e.g. "Nationstar Mortgage LLC")
+    original_lender: str = ""         # Original mortgagee at execution (often MERS as nominee for X)
+    trustee: str = ""                 # Law firm / trustee conducting sale (e.g. "Tiffany & Bosco, P.A.")
+    trustee_file_number: str = ""     # Trustee's internal file # (e.g. "25-40447-WF-AL")
     county: str = ""
     source_url: str = ""
     raw_text: str = ""         # Full notice text for classification
@@ -66,6 +75,7 @@ class NoticeData:
     owner_city: str = ""           # PR/contact mailing city
     owner_state: str = ""          # PR/contact mailing state
     owner_zip: str = ""            # PR/contact mailing zip
+    received_date: str = ""        # When the notice was scraped (UTC, YYYY-MM-DD)
     # County assessor / tax fields
     parcel_id: str = ""                # County assessor parcel ID
     tax_delinquent_amount: str = ""    # Total delinquent tax owed ($)
@@ -150,8 +160,27 @@ TN_CITIES: list[str] = sorted(
     reverse=True,
 )
 
+# ── Known AL cities in Jefferson & Madison counties ────────────────────
+AL_CITIES: list[str] = sorted(
+    [
+        # Jefferson County (Birmingham metro)
+        "Birmingham", "Bessemer", "Hoover", "Vestavia Hills", "Homewood",
+        "Mountain Brook", "Trussville", "Center Point", "Fultondale",
+        "Gardendale", "Pleasant Grove", "Tarrant", "Irondale", "Leeds",
+        "Pinson", "Adamsville", "Forestdale", "Fairfield", "Midfield",
+        "Brighton", "Lipscomb", "Warrior", "Clay", "Graysville",
+        # Madison County (Huntsville metro)
+        "Huntsville", "Madison", "New Hope", "Owens Cross Roads",
+        "Triana", "Gurley", "Hazel Green", "Meridianville", "Harvest",
+        "Toney", "Brownsboro", "Ryland",
+    ],
+    key=len,
+    reverse=True,
+)
+
 # Set version for O(1) membership tests in standalone address validation
-_KNOWN_CITIES_SET: set[str] = {c.title() for c in TN_CITIES}
+# Combined TN + AL — validation only checks if a token *is* a known city
+_KNOWN_CITIES_SET: set[str] = {c.title() for c in TN_CITIES} | {c.title() for c in AL_CITIES}
 
 # ── Reusable suffix pattern ──────────────────────────────────────────
 # Word-boundary at the end prevents matching "Cir" inside "Circuit", etc.
@@ -172,7 +201,9 @@ _ADDR_PART = (
     r"(?:[NSEW]\.?\s+)?"           # optional direction prefix
     r"(?:[\w'-]+\s+)+?"            # street name words (1+)
     + _SUFFIX +
-    r"\.?)"                        # optional trailing period
+    r"\.?"                         # optional trailing period
+    r"(?:\s+(?:NE|NW|SE|SW|N|S|E|W))?"  # optional trailing directional (e.g. "Dr SW")
+    r")"
 )
 
 # ── Property address indicator phrases (high confidence) ─────────────
@@ -182,6 +213,8 @@ _PROP_INDICATOR = (
     r"commonly\s+known\s+as"
     r"|property\s+known\s+as"
     r"|property\s+address\s*(?:is|of|:)"
+    # Alabama foreclosure-notice convention (Jefferson + Madison Counties)
+    r"|property\s+street\s+address\s+for\s+informational\s+purposes(?:\s+only)?\s*[:.]?"
     r"|(?:real\s+)?property\s+(?:located|situated)\s+at"
     r"|said\s+property\s+(?:being|is)"
     r"|hereinafter\s+(?:known|described)\s+as"
@@ -216,7 +249,7 @@ FULL_PROPERTY_RE = re.compile(
     + r"([\w][\w\s]*?)"           # city name
     + _OPTIONAL_COUNTY
     + r"\s*[,.]\s*"
-    + r"(?:Tennessee|Tenn\.?|TN)"
+    + r"(?:Tennessee|Tenn\.?|TN|Alabama|Ala\.?|AL)"
     + r"\s*[,.\s]*"
     + r"(\d{5}(?:-\d{4})?)?",     # optional zip
     re.IGNORECASE,
@@ -237,7 +270,7 @@ LOCATED_AT_FULL_RE = re.compile(
     + r"([\w][\w\s]*?)"
     + _OPTIONAL_COUNTY
     + r"\s*[,.]\s*"
-    + r"(?:Tennessee|Tenn\.?|TN)"
+    + r"(?:Tennessee|Tenn\.?|TN|Alabama|Ala\.?|AL)"
     + r"\s*[,.\s]*"
     + r"(\d{5}(?:-\d{4})?)?",
     re.IGNORECASE,
@@ -256,7 +289,7 @@ STANDALONE_ADDR_RE = re.compile(
     + r"([\w][\w\s]*?)"           # city name
     + _OPTIONAL_COUNTY
     + r"\s*[,.]\s*"
-    + r"(?:Tennessee|Tenn\.?|TN)"
+    + r"(?:Tennessee|Tenn\.?|TN|Alabama|Ala\.?|AL)"
     + r"\s*[,.\s]*"
     + r"(\d{5}(?:-\d{4})?)?",     # optional zip
     re.IGNORECASE,
@@ -453,42 +486,9 @@ PR_ADDRESS_RE = re.compile(
     r"\s*[,.\s]+\s*"
     r"([A-Za-z][\w\s]*?)"             # city
     r"\s*[,.]\s*"
-    r"(?:Tennessee|Tenn\.?|TN)"
+    r"(?:Tennessee|Tenn\.?|TN|Alabama|Ala\.?|AL)"
     r"\s*[,.\s]*"
     r"(\d{5})",                        # zip
-    re.IGNORECASE,
-)
-
-# AL signature-block PR mailing address: name comes BEFORE title, address
-# follows title with only a newline separator (typically). PR_ADDRESS_RE
-# above requires {3,80} non-digit chars between the title and the address,
-# which fits the TN inline format ("Personal Representative: NAME, ADDR")
-# but never matches the AL vertical signature block:
-#
-#     JOHN SMITH
-#     Personal Representative
-#     123 Main St
-#     Birmingham, AL 35203
-#
-# Here, between "Representative" and "123" there is only a single newline
-# (1 char) — well under the 3-char minimum. This variant uses {0,80}?
-# (non-greedy zero minimum) so the address can follow the title with
-# minimal whitespace, and accepts both AL and TN state-name suffixes so
-# either format flows through this single fallback.
-PR_ADDRESS_NAME_FIRST_RE = re.compile(
-    r"(?:Personal\s+Representative(?:\(S\))?|Executor|Executrix|Administrator|Administratrix)"
-    r"[^0-9]{0,80}?"                  # AL: zero+ chars (often just a newline)
-    r"(\d{1,5}\s+"
-    r"[\w\s.,'#-]+?"
-    + _SUFFIX +
-    r"\.?"
-    r"(?:\s*[,.]?\s*(?:Suite|Ste\.?|Apt\.?|Unit|#)\s*\.?\s*[\w.]+)?)"
-    r"\s*[,.\s]+\s*"
-    r"([A-Za-z][\w\s]*?)"
-    r"\s*[,.]\s*"
-    r"(?:Alabama|Ala\.?|AL|Tennessee|Tenn\.?|TN)"
-    r"\s*[,.\s]*"
-    r"(\d{5})",
     re.IGNORECASE,
 )
 
@@ -599,25 +599,43 @@ AUCTION_DATE_PATTERNS = [
     ),
 ]
 
+# Postponement-chain pattern: "postponed from DATE1 until DATE2" — captures DATE2.
+# Alabama foreclosure notices append every postponement to the original notice
+# text rather than re-publishing, so the LAST match in the document is the
+# currently-scheduled sale date.
+POSTPONEMENT_RE = re.compile(
+    r"postponed\s+from\s+[\w\s,]+?\s+until\s+" + _DATE_FRAGMENT,
+    re.IGNORECASE,
+)
+
 
 # ── County validation ────────────────────────────────────────────────
 # These patterns detect when a notice's actual property is in a different
 # county than the saved search that returned it (false positive from keyword match).
 
 # "Register's Office for {County} County" — property deed is recorded there
+# Alabama: "Office of the Judge of Probate of Jefferson County"
+# Also catches "recorded in ... Jefferson County" and "Register's Office of {County}"
 _REGISTER_COUNTY_RE = re.compile(
-    r"Register'?s\s+Office\s+(?:for|of)\s+(\w+)\s+County",
+    r"(?:Office\s+of\s+the\s+Judge\s+of\s+Probate\s+of|"
+    r"Register'?s\s+Office\s+(?:for|of))\s+(\w+)\s+County",
     re.IGNORECASE,
 )
 
-# "{County} County Courthouse" — sale location / property county
+# "{County} County Courthouse" or "State of Alabama, {County} County"
 _COURTHOUSE_COUNTY_RE = re.compile(
-    r"(\w+)\s+County\s+Courthouse",
+    r"(\w+)\s+County\s+(?:Courthouse|,\s*Alabama)",
+    re.IGNORECASE,
+)
+
+# "Publication County: Jefferson" — Alabama Public Notices site header field
+_PUBLICATION_COUNTY_RE = re.compile(
+    r"Publication\s+County\s*:\s*(\w+)",
     re.IGNORECASE,
 )
 
 # Counties we care about — notices for other counties are false positives
-_TARGET_COUNTIES = {"knox", "blount"}
+_TARGET_COUNTIES = {"jefferson", "madison"}
 
 
 def is_target_county(text: str, search_county: str) -> bool:
@@ -631,16 +649,13 @@ def is_target_county(text: str, search_county: str) -> bool:
     Returns True if the property appears to be in Knox or Blount County (or if
     we can't determine the county — benefit of the doubt).
     """
-    # Find all Register's Office mentions — the first one is typically the
-    # property's recording county (later mentions may be trustee appointments)
+    # Collect county mentions from all detection patterns
     register_matches = _REGISTER_COUNTY_RE.findall(text)
     courthouse_matches = _COURTHOUSE_COUNTY_RE.findall(text)
+    publication_matches = _PUBLICATION_COUNTY_RE.findall(text)
 
-    # Collect unique county names from both patterns
     mentioned_counties = set()
-    for c in register_matches:
-        mentioned_counties.add(c.lower())
-    for c in courthouse_matches:
+    for c in register_matches + courthouse_matches + publication_matches:
         mentioned_counties.add(c.lower())
 
     if not mentioned_counties:
@@ -669,11 +684,18 @@ async def _try_extract_pdf_text(page: Page) -> str:
     We look for an <iframe> or <embed>/<object> with a PDF src and download it.
     """
     try:
-        # Look for PDF iframe, embed, or object element
+        # Look for PDF iframe, embed, or object element.
+        # Alabama site serves PDFs via ASP.NET handlers (no .pdf extension in URL).
         pdf_url = await page.evaluate("""() => {
-            // iframe with PDF src
-            const iframe = document.querySelector('iframe[src*=".pdf"], iframe[src*="PDF"]');
-            if (iframe) return iframe.src;
+            // iframe — .pdf extension OR ASP.NET document handlers
+            for (const f of document.querySelectorAll('iframe')) {
+                if (!f.src) continue;
+                if (f.src.includes('.pdf') || f.src.includes('PDF') ||
+                    f.src.includes('GetDocument') || f.src.includes('getdocument') ||
+                    f.src.includes('ViewDocument') || f.src.includes('Document.aspx') ||
+                    f.src.includes('NoticeDocument') || f.src.includes('getpdf') ||
+                    f.src.includes('PublicNotice')) return f.src;
+            }
             // embed element
             const embed = document.querySelector('embed[src*=".pdf"], embed[type="application/pdf"]');
             if (embed) return embed.src;
@@ -683,6 +705,11 @@ async def _try_extract_pdf_text(page: Page) -> str:
             // Link to PDF
             const link = document.querySelector('a[href*=".pdf"]');
             if (link) return link.href;
+            // Any iframe on the page (last resort — the document viewer)
+            const anyIframe = document.querySelector('iframe[src]');
+            if (anyIframe && anyIframe.src && !anyIframe.src.includes('recaptcha') &&
+                !anyIframe.src.includes('google') && !anyIframe.src.includes('captcha'))
+                return anyIframe.src;
             return null;
         }""")
 
@@ -699,18 +726,45 @@ async def _try_extract_pdf_text(page: Page) -> str:
 
         pdf_bytes = await response.body()
 
-        # Extract text using pdfminer (lightweight, included in base image)
+        from io import BytesIO
+
+        # Try pdfminer first — fast text-layer extraction (Jefferson County text PDFs)
         try:
-            from io import BytesIO
             from pdfminer.high_level import extract_text as pdfminer_extract
             text = pdfminer_extract(BytesIO(pdf_bytes))
             if text and len(text.strip()) > 100:
-                logger.info("PDF text extracted: %d chars", len(text))
+                logger.info("PDF text extracted via pdfminer: %d chars", len(text))
                 return text.strip()
         except ImportError:
-            logger.debug("pdfminer not available — skipping PDF extraction")
+            logger.debug("pdfminer not available")
         except Exception as e:
-            logger.warning("PDF text extraction failed: %s", e)
+            logger.warning("pdfminer extraction failed: %s", e)
+
+        # OCR fallback — for image-based PDFs (Madison County newspaper scans)
+        # pypdfium2 renders each page to an image, then Tesseract reads the text.
+        logger.info("No text layer found — attempting OCR on PDF pages")
+        try:
+            import pypdfium2 as pdfium
+            from image_utils import ocr_page
+
+            doc = pdfium.PdfDocument(BytesIO(pdf_bytes))
+            ocr_pages = []
+            for i in range(len(doc)):
+                pdf_pg = doc[i]
+                bitmap = pdf_pg.render(scale=200 / 72)  # 200 DPI — good balance of speed vs accuracy
+                pil_img = bitmap.to_pil()
+                page_text = ocr_page(pil_img, psm=3)   # PSM 3 = fully automatic (newspaper layout)
+                if page_text.strip():
+                    ocr_pages.append(page_text)
+            doc.close()
+            combined = "\n\n".join(ocr_pages)
+            if len(combined.strip()) > 50:
+                logger.info("PDF OCR extracted %d chars from %d pages", len(combined), len(ocr_pages))
+                return combined.strip()
+        except ImportError:
+            logger.debug("pypdfium2 not available — cannot OCR image PDF")
+        except Exception as e:
+            logger.warning("PDF OCR failed: %s", e)
 
     except Exception as e:
         logger.debug("PDF URL detection failed: %s", e)
@@ -731,6 +785,7 @@ async def parse_notice_page(
         county=county,
         notice_type=notice_type,
         source_url=page.url,
+        received_date=datetime.now().strftime("%Y-%m-%d"),
     )
 
     # Get the full page text (includes both metadata labels and notice body)
@@ -742,13 +797,19 @@ async def parse_notice_page(
     # Extract the notice body content (after "Notice Content" header)
     notice_content = _extract_notice_content(full_text)
 
-    # If web text is truncated, try extracting full text from the embedded PDF
-    if notice_content and "Web display limited to" in notice_content:
+    # Try PDF when content is truncated (Jefferson County) OR absent/very short
+    # (Madison County — detail page is a newspaper image-PDF with no web text)
+    _content_short = not notice_content or len((notice_content or "").strip()) < 200
+    _content_truncated = bool(notice_content and "Web display limited to" in notice_content)
+    if _content_truncated or _content_short:
         pdf_text = await _try_extract_pdf_text(page)
         if pdf_text:
             notice_content = pdf_text
 
-    notice.raw_text = notice_content if notice_content else full_text
+    # Normalize PDF line-break hyphens and smart quotes so regex parsers
+    # work on flowing text rather than column-wrapped fragments. Critical for
+    # Madison County notices (newspaper PDFs); harmless for Jefferson (already-flat text).
+    notice.raw_text = _normalize_pdf_text(notice_content if notice_content else full_text)
 
     if not notice.raw_text.strip():
         logger.warning("No notice text found on %s", page.url)
@@ -760,14 +821,24 @@ async def parse_notice_page(
     # ── Extract fields from the notice body text ───────────────────
     _parse_address(notice)
     _parse_name(notice)
+    _split_owner_name(notice)
     _parse_pr_address(notice)
     if notice_type != "probate":
         _parse_auction_date(notice)
+    _parse_foreclosure_parties(notice)
 
     # ── LLM fallback for missing fields ──────────────────────────
     needs_llm = (
-        (notice_type == "probate" and (not notice.owner_name or not notice.decedent_name or not notice.owner_street))
-        or (notice_type != "probate" and (not notice.address or not notice.owner_name or not notice.auction_date))
+        (notice_type == "probate" and (
+            not notice.owner_name or not notice.decedent_name or not notice.owner_street
+        ))
+        or (notice_type == "foreclosure" and (
+            not notice.address or not notice.owner_name or not notice.auction_date
+            or not notice.mortgage_company or not notice.trustee
+        ))
+        or (notice_type not in ("probate", "foreclosure") and (
+            not notice.address or not notice.owner_name or not notice.auction_date
+        ))
     )
     if llm_api_key and needs_llm:
         from llm_parser import extract_with_llm
@@ -787,7 +858,7 @@ async def parse_notice_page(
             if not notice.owner_street and llm_result.get("owner_street"):
                 notice.owner_street = llm_result["owner_street"]
                 notice.owner_city = llm_result.get("owner_city") or notice.owner_city
-                notice.owner_state = llm_result.get("owner_state") or "TN"
+                notice.owner_state = llm_result.get("owner_state") or notice.state or "TN"
                 notice.owner_zip = llm_result.get("owner_zip") or notice.owner_zip
                 logger.info("LLM filled PR address: %s", notice.owner_street)
         else:
@@ -803,11 +874,46 @@ async def parse_notice_page(
             if not notice.auction_date and llm_result.get("auction_date"):
                 notice.auction_date = llm_result["auction_date"]
                 logger.info("LLM filled auction_date: %s", notice.auction_date)
+            # Foreclosure-only party fields
+            if notice_type == "foreclosure":
+                if not notice.mortgage_company and llm_result.get("mortgage_company"):
+                    notice.mortgage_company = llm_result["mortgage_company"]
+                if not notice.original_lender and llm_result.get("original_lender"):
+                    notice.original_lender = llm_result["original_lender"]
+                if not notice.trustee and llm_result.get("trustee"):
+                    notice.trustee = llm_result["trustee"]
+                if not notice.trustee_file_number and llm_result.get("trustee_file_number"):
+                    notice.trustee_file_number = llm_result["trustee_file_number"]
+
+    # Re-run name splits in case the LLM filled owner_name
+    _split_owner_name(notice)
 
     return notice
 
 
 # ── Metadata extractors ──────────────────────────────────────────────
+
+
+def _normalize_pdf_text(text: str) -> str:
+    """De-hyphenate line-wrapped words and normalize smart quotes.
+
+    Newspaper PDFs (Madison County, AL) wrap text at narrow column widths and
+    insert soft hyphens at line breaks: "in-\nformational", "Hunts-\nville",
+    "post-\nponed". Joining these is required for any regex that spans more
+    than one word. Also normalizes smart quotes (used in trustee designations
+    like ("Transferee")) to ASCII so single regexes match both formats.
+    """
+    if not text:
+        return text
+    # "word-\nword" → "wordword" (keeps real hyphenated names like "Smith-Jones")
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
+    # Smart/curly quotes → straight quotes
+    text = (text
+            .replace("’", "'").replace("‘", "'")
+            .replace("“", '"').replace("”", '"'))
+    # Non-breaking spaces → regular spaces
+    text = text.replace("\xa0", " ")
+    return text
 
 
 def _extract_notice_content(full_text: str) -> str:
@@ -863,8 +969,28 @@ def _normalize_date(raw: str) -> str:
 
 
 def _parse_auction_date(notice: NoticeData) -> None:
-    """Extract the scheduled sale/auction date from the notice body text."""
+    """Extract the scheduled sale/auction date from the notice body text.
+
+    For Alabama foreclosure notices, sales are often postponed multiple times
+    in the same notice text (e.g. "postponed from December 22, 2025 until
+    January 29, 2026 ... postponed from January 29, 2026 until June 4, 2026").
+    The LATEST postponement is the actual sale date, so we look for that first
+    and only fall back to the original sale-date patterns if no postponement
+    chain is present.
+    """
     text = notice.raw_text
+
+    # Find ALL postponement targets and pick the last one (chronological order
+    # in the document = chronological order of postponements).
+    postpone_matches = POSTPONEMENT_RE.findall(text)
+    if postpone_matches:
+        latest = postpone_matches[-1].strip()
+        normalized = _normalize_date(latest)
+        if normalized and len(normalized) >= 8:
+            notice.auction_date = normalized
+            return
+
+    # No postponement chain — use the first matching original-sale-date pattern.
     for pattern in AUCTION_DATE_PATTERNS:
         m = pattern.search(text)
         if m:
@@ -1076,12 +1202,12 @@ def _parse_name(notice: NoticeData) -> None:
             if _is_valid_name(dec_name):
                 notice.decedent_name = dec_name
 
-        # Extract PR/Executor name
-        match = PROBATE_NAME_RE.search(text)
-        if match:
-            name = _clean_name(match.group(1))
-            if _is_valid_name(name):
-                notice.owner_name = name
+        # Extract PR/Executor name from "Personal Representative: NAME"
+        pr_match = PROBATE_NAME_RE.search(text)
+        if pr_match:
+            pr_name = _clean_name(pr_match.group(1))
+            if _is_valid_name(pr_name):
+                notice.owner_name = pr_name
         return
 
     # Foreclosure / tax sale / tax lien — "executed by" is the most common
@@ -1102,23 +1228,136 @@ def _parse_name(notice: NoticeData) -> None:
                 return
 
 
+# Suffix tokens to strip when splitting first/last names
+_NAME_SUFFIXES = {"jr", "jr.", "sr", "sr.", "ii", "iii", "iv", "v"}
+
+
+def _split_full_name(name: str) -> tuple[str, str, str, str]:
+    """Split a full name into (first, middle, last, suffix).
+
+    Handles "Alisha N. Vallery", "Curtis C Rush Sr",
+    "Mary Angela Caylor Roling", "John Doe and Jane Doe" (uses first listed),
+    "James F. Smith Jr.", and OCR'd variants. Empty strings for missing parts.
+    """
+    if not name:
+        return ("", "", "", "")
+
+    # If multiple people are joined by "and" / "&", use only the first
+    primary = re.split(r"\s+(?:and|&)\s+", name, maxsplit=1)[0]
+    # Drop trailing parenthetical / role descriptors
+    primary = re.sub(r"\s*\([^)]*\)\s*$", "", primary).strip(" ,;.")
+
+    tokens = primary.split()
+    if not tokens:
+        return ("", "", "", "")
+
+    # Pop generational suffixes off the end (Jr, Sr, II, III, IV — with or without periods)
+    suffixes_collected: list[str] = []
+    suffix_canonical = {s.rstrip(".") for s in _NAME_SUFFIXES}
+    while tokens and tokens[-1].lower().rstrip(".") in suffix_canonical:
+        suffixes_collected.insert(0, tokens.pop())
+
+    suffix_str = " ".join(suffixes_collected)
+    if not tokens:
+        return ("", "", "", suffix_str)
+
+    first = tokens[0]
+    if len(tokens) == 1:
+        return (first, "", "", suffix_str)
+    last = tokens[-1]
+    middle = " ".join(tokens[1:-1])  # everything between first and last
+    return (first, middle, last, suffix_str)
+
+
+def _split_owner_name(notice: NoticeData) -> None:
+    """Populate owner_first_name / owner_middle_name / owner_last_name / owner_suffix."""
+    if not notice.owner_name:
+        return
+    if notice.owner_first_name or notice.owner_last_name:
+        return  # already split
+    first, middle, last, suffix = _split_full_name(notice.owner_name)
+    notice.owner_first_name = first
+    notice.owner_middle_name = middle
+    notice.owner_last_name = last
+    notice.owner_suffix = suffix
+
+
+# ── Foreclosure party regexes (mortgage company, trustee, file number) ─
+
+# "the undersigned X, as Mortgagee/Transferee" — current servicer/holder.
+# Character class allows \s so multi-line entity names ("Nationstar Mortgage\nLLC") match.
+_MORTGAGEE_RE = re.compile(
+    r"(?:the\s+)?undersigned\s+([A-Z][\w\s&,.\-]+?)\s*,?\s*"
+    r"as\s+(?:Mortgagee|Transferee|Mortgagee\s*/\s*Transferee)",
+    re.IGNORECASE,
+)
+
+# "originally in favor of X" — original lender (often MERS)
+_ORIGINAL_LENDER_RE = re.compile(
+    r"originally\s+in\s+favor\s+of\s+([A-Z][\w\s&,.\-]+?(?:Inc\.?|LLC|N\.?\s*A\.?|Corporation|Corp\.?|Bank|Company|Co\.?|Association|Mortgage|Trust|F\.?\s*S\.?\s*B\.?))"
+    r"(?:\s+(?:its|as))",
+    re.IGNORECASE,
+)
+
+# Trustee firm — law firm signature near the end of the notice.
+# Pattern: '<Servicer Name>, ("Transferee") <Law Firm>, <street address>'
+_TRUSTEE_RE = re.compile(
+    r"\(\s*[\"']?Transferee[\"']?\s*\)\s*"
+    r"([A-Z][\w\s&.\-]+?,\s*(?:P\.?\s*A\.?|P\.?\s*C\.?|LLC|L\.?L\.?P\.?|PLLC|LLP)\.?)",
+    re.IGNORECASE,
+)
+
+# Trustee internal file number (e.g. "TB File Number: 25-40447-WF-AL")
+_TRUSTEE_FILE_RE = re.compile(
+    r"(?:File\s+(?:Number|No\.?|#)|Reference\s+No\.?|Our\s+File)\s*[:#]?\s*"
+    r"([A-Z0-9][\w./\-]{4,30})",
+    re.IGNORECASE,
+)
+
+
+def _parse_foreclosure_parties(notice: NoticeData) -> None:
+    """Extract mortgage company, original lender, trustee, and file number.
+
+    Foreclosure-only — these fields don't apply to probate / tax / eviction.
+    """
+    if notice.notice_type != "foreclosure":
+        return
+
+    text = notice.raw_text
+
+    if not notice.mortgage_company:
+        m = _MORTGAGEE_RE.search(text)
+        if m:
+            notice.mortgage_company = _clean_entity_name(m.group(1))
+
+    if not notice.original_lender:
+        m = _ORIGINAL_LENDER_RE.search(text)
+        if m:
+            notice.original_lender = _clean_entity_name(m.group(1))
+
+    if not notice.trustee:
+        m = _TRUSTEE_RE.search(text)
+        if m:
+            notice.trustee = _clean_entity_name(m.group(1))
+
+    if not notice.trustee_file_number:
+        m = _TRUSTEE_FILE_RE.search(text)
+        if m:
+            notice.trustee_file_number = m.group(1).strip()
+
+
 def _parse_pr_address(notice: NoticeData) -> None:
     """Extract the PR's mailing address from probate notice text.
 
     Probate notices contain the PR/Executor's mailing address (where creditors
     send claims), but NOT the decedent's property address. This extracts the
     PR's street, city, state, and zip into the owner_* fields.
-
-    Tries the inline TN format first (PR_ADDRESS_RE — anchored on title with
-    name+colon between), then falls back to the AL signature-block format
-    (PR_ADDRESS_NAME_FIRST_RE — name on prior line, address right after
-    title with minimal separator). Either match populates the owner_* slots.
     """
     if notice.notice_type != "probate":
         return
 
     text = notice.raw_text.replace("\xa0", " ")
-    match = PR_ADDRESS_RE.search(text) or PR_ADDRESS_NAME_FIRST_RE.search(text)
+    match = PR_ADDRESS_RE.search(text)
     if match:
         street = _clean_address(match.group(1))
         # Title-case — PR addresses in notices are usually ALL CAPS
@@ -1126,11 +1365,12 @@ def _parse_pr_address(notice: NoticeData) -> None:
             street = street.title()
         notice.owner_street = street
         notice.owner_city = _clean_city(match.group(2))
-        notice.owner_state = "TN"
+        # Use the notice's state if known (set at scrape time, e.g. "AL"); fall back to TN
+        notice.owner_state = notice.state or "TN"
         notice.owner_zip = match.group(3)
         logger.debug(
-            "PR address: %s, %s, TN %s",
-            notice.owner_street, notice.owner_city, notice.owner_zip,
+            "PR address: %s, %s, %s %s",
+            notice.owner_street, notice.owner_city, notice.owner_state, notice.owner_zip,
         )
 
 
@@ -1144,3 +1384,31 @@ def _clean_name(raw: str) -> str:
     # Title-case
     name = name.title()
     return name
+
+
+# Entity-name acronyms that should stay uppercase after title-casing
+_ENTITY_ACRONYMS = {
+    "Llc": "LLC", "Lp": "LP", "Llp": "LLP", "Pllc": "PLLC",
+    "Inc": "Inc", "Corp": "Corp", "Co": "Co",
+    "Pa": "P.A.", "Pc": "P.C.",
+    "Na": "N.A.", "Fsb": "F.S.B.", "Usa": "USA",
+    "Mers": "MERS",
+}
+
+
+def _clean_entity_name(raw: str) -> str:
+    """Normalize an entity/firm name preserving common acronyms (LLC, P.A., MERS).
+
+    Used for mortgage company / trustee / original lender — title-casing alone
+    would write "LLC" → "Llc". This keeps those tokens uppercase.
+    """
+    name = re.sub(r"\s+", " ", raw).strip()
+    name = name.rstrip(",; ")
+    name = name.title()
+    # Restore acronyms — token-level so "Inca" doesn't get touched
+    tokens = name.split(" ")
+    for i, tok in enumerate(tokens):
+        bare = tok.rstrip(",.")
+        if bare in _ENTITY_ACRONYMS:
+            tokens[i] = _ENTITY_ACRONYMS[bare] + tok[len(bare):]
+    return " ".join(tokens)

@@ -11,23 +11,27 @@ import llm_client
 logger = logging.getLogger(__name__)
 
 MODEL = "claude-haiku-4-5-20251001"
-MAX_TOKENS = 256
+MAX_TOKENS = 512
 
 SYSTEM_PROMPT = (
-    "You extract structured data from Tennessee legal notices. "
+    "You extract structured data from Alabama legal notices. "
     "Return ONLY valid JSON with no markdown formatting, no code fences, no explanation."
 )
 
 USER_PROMPT_TEMPLATE = """\
-Extract the following fields from this {notice_type} legal notice published in {county} County, Tennessee.
+Extract the following fields from this {notice_type} legal notice published in {county} County, Alabama.
 
 Return ONLY a JSON object with these exact keys:
 - "address": the property street address (e.g. "123 Main St"). NOT the courthouse, auction location, or trustee office address.
 - "city": the city where the property is located
-- "state": always "TN"
+- "state": always "AL"
 - "zip": the 5-digit zip code of the property
 - "owner_name": the property owner, borrower, or grantor name(s). For foreclosures this is who executed the deed of trust. Use ALL CAPS as written in the notice.
-- "auction_date": the scheduled sale/auction date in YYYY-MM-DD format. This is the date the property will be sold at auction, NOT the publication date of the notice.
+- "auction_date": the scheduled sale/auction date in YYYY-MM-DD format. If the notice contains a postponement chain ("postponed from X until Y"), use the LAST/most recent postponement date. Otherwise use the originally scheduled sale date. NOT the publication date.
+- "mortgage_company": the current Mortgagee/Transferee — the entity that now holds the loan and is foreclosing (e.g. "Nationstar Mortgage LLC", "U.S. Bank N.A. as Trustee for ..."). Often appears as "the undersigned [X], as Mortgagee/Transferee". Empty string if not foreclosure.
+- "original_lender": the original lender at loan origination (often "Mortgage Electronic Registration Systems, Inc. as nominee for [X]"). Found in "originally in favor of ..." phrasing. Empty string if not foreclosure.
+- "trustee": the law firm or substitute trustee conducting the sale (e.g. "Tiffany & Bosco, P.A.", "Sirote & Permutt, P.C."). Usually appears near the end of the notice with their office address. Empty string if not foreclosure.
+- "trustee_file_number": the trustee's internal file/reference number (e.g. "25-40447-WF-AL", "TB File Number: ..."). Empty string if not present.
 
 If a field cannot be determined from the text, use an empty string "".
 
@@ -35,18 +39,21 @@ Notice text:
 {raw_text}"""
 
 PROBATE_PROMPT_TEMPLATE = """\
-Extract the following fields from this probate "Notice to Creditors" published in {county} County, Tennessee.
+Extract the following fields from this probate "Notice to Creditors" published in {county} County, Alabama.
 
 Return ONLY a JSON object with these exact keys:
 - "decedent_name": the deceased person's full name (from "Estate of [NAME]"). Use ALL CAPS as written.
 - "owner_name": the Personal Representative, Executor, or Administrator name. This is the person appointed to manage the estate. Use ALL CAPS as written. Do NOT include their title (e.g. drop "Administratrix", "Co-Administrator", "Executor").
 - "owner_street": the PR/Executor's mailing street address (e.g. "2004 Shangri-La Drive"). This is where creditors send claims.
 - "owner_city": the city of the PR's mailing address
-- "owner_state": the state of the PR's mailing address (usually "TN")
+- "owner_state": the state of the PR's mailing address (usually "AL")
 - "owner_zip": the 5-digit zip code of the PR's mailing address
+- "case_number": the probate case number (e.g. "PC2025-234", "PR-2026-000557", "2026-00053"). Found near "Case No.", "CASE NO:", "CASE NUMBER", or "Case#".
+- "judge_name": the Judge of Probate's full name (e.g. "Tammy Brown", "James P. Naftel"). Found near "Honorable", "Hon.", or "Judge of Probate". Drop the title.
+- "granted_date": the date Letters Testamentary or Letters of Administration were granted, in YYYY-MM-DD format. Found near "having been granted ... on the X day of MONTH, YYYY" or "granted ... on MONTH X, YYYY". This is NOT the publication date.
 - "address": leave as empty string "" (probate notices do not contain the decedent's property address)
 - "city": leave as empty string ""
-- "state": "TN"
+- "state": "AL"
 - "zip": leave as empty string ""
 
 If a field cannot be determined from the text, use an empty string "".
@@ -55,7 +62,7 @@ Notice text:
 {raw_text}"""
 
 EVICTION_PROMPT_TEMPLATE = """\
-Extract the following fields from this eviction notice / detainer warrant from {county} County, Tennessee.
+Extract the following fields from this eviction notice / detainer warrant from {county} County, Alabama.
 
 The PLAINTIFF is the landlord (property owner) — this is who we want to contact.
 The DEFENDANT is the tenant being evicted.
@@ -64,7 +71,7 @@ Return ONLY a JSON object with these exact keys:
 - "owner_name": the PLAINTIFF name (landlord/property owner). Use ALL CAPS as written.
 - "address": the rental property street address where the eviction is occurring
 - "city": the city where the property is located
-- "state": always "TN"
+- "state": always "AL"
 - "zip": the 5-digit zip code of the property
 - "case_number": the court case number
 - "filing_date": the filing date in YYYY-MM-DD format
@@ -76,13 +83,13 @@ Notice text:
 {raw_text}"""
 
 CODE_VIOLATION_PROMPT_TEMPLATE = """\
-Extract the following fields from this code violation notice from {county} County, Tennessee.
+Extract the following fields from this code violation notice from {county} County, Alabama.
 
 Return ONLY a JSON object with these exact keys:
 - "owner_name": the property owner name. Use ALL CAPS as written.
 - "address": the property street address where the violation exists
 - "city": the city where the property is located
-- "state": always "TN"
+- "state": always "AL"
 - "zip": the 5-digit zip code of the property
 - "parcel_id": the parcel ID / tax map number if shown
 - "violation_type": brief description of the violation (e.g. "overgrown lot", "condemned structure")
@@ -94,14 +101,14 @@ Notice text:
 {raw_text}"""
 
 DIVORCE_PROMPT_TEMPLATE = """\
-Extract the following fields from this divorce filing / complaint from {county} County, Tennessee.
+Extract the following fields from this divorce filing / complaint from {county} County, Alabama.
 
 Return ONLY a JSON object with these exact keys:
 - "owner_name": the PETITIONER name (person filing for divorce). Use ALL CAPS as written.
 - "spouse_name": the RESPONDENT name (other party). Use ALL CAPS as written.
 - "address": the marital home / property address if listed (may be on property schedule page)
 - "city": the city where the property is located
-- "state": always "TN"
+- "state": always "AL"
 - "zip": the 5-digit zip code of the property
 - "case_number": the court case number
 
@@ -128,10 +135,14 @@ Document text:
 {raw_text}"""
 
 # Keys expected from each prompt type
-_FORECLOSURE_KEYS = {"address", "city", "state", "zip", "owner_name", "auction_date"}
+_FORECLOSURE_KEYS = {
+    "address", "city", "state", "zip", "owner_name", "auction_date",
+    "mortgage_company", "original_lender", "trustee", "trustee_file_number",
+}
 _PROBATE_KEYS = {
     "decedent_name", "owner_name", "owner_street", "owner_city",
     "owner_state", "owner_zip", "address", "city", "state", "zip",
+    "case_number", "judge_name", "granted_date",
 }
 _EVICTION_KEYS = {
     "owner_name", "address", "city", "state", "zip",
