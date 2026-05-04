@@ -403,6 +403,27 @@ async def lookup_decedent_properties(notices: list) -> None:
         )
 
         try:
+            if notice.county.lower() in ("jefferson", "madison"):
+                # AL counties — delegate to the multi-parcel locator. It runs
+                # the decedent-name → PR-name waterfall against the county
+                # tax roll (Jefferson E-Ring or Madison AssuranceWeb) and
+                # writes address/city/state/zip/parcel_id/tax_owner_name/
+                # is_homestead/secondary_addresses/total_estate_value/
+                # assessed_value/property_use directly onto the notice.
+                from probate_property_locator import enrich_notice_with_property
+                matched = enrich_notice_with_property(notice)
+                if matched:
+                    logger.info(
+                        "  Found: %s (parcel %s)",
+                        notice.address, notice.parcel_id or "?",
+                    )
+                    found += 1
+                else:
+                    logger.info("  No properties found for %s", search_name)
+                    failed += 1
+                await asyncio.sleep(random.uniform(2.0, 3.0))
+                continue
+
             if notice.county.lower() == "knox":
                 results = await _kgis_lookup(search_name)
                 # Retry with shorter name (drop middle name) if full name fails

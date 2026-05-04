@@ -71,11 +71,36 @@ class NoticeData:
     lot_size: str = ""             # Lot size in sqft
     # Probate-specific fields
     decedent_name: str = ""        # Deceased person's name (probate only)
+    decedent_first_name: str = ""  # Split from decedent_name
+    decedent_middle_name: str = "" # Split from decedent_name (middle tokens, joined)
+    decedent_last_name: str = ""   # Split from decedent_name
+    decedent_suffix: str = ""      # Generational suffix (Jr/Sr/II/III/IV)
     owner_street: str = ""         # PR/contact mailing street address
     owner_city: str = ""           # PR/contact mailing city
     owner_state: str = ""          # PR/contact mailing state
     owner_zip: str = ""            # PR/contact mailing zip
-    received_date: str = ""        # When the notice was scraped (UTC, YYYY-MM-DD)
+    case_number: str = ""          # Probate case # (e.g. "PC2025-234", "PR-2026-000557")
+    judge_name: str = ""           # Judge of Probate (e.g. "Tammy Brown", "James P. Naftel")
+    granted_date: str = ""         # Date Letters Testamentary/Administration granted (YYYY-MM-DD); starts the AL 6-month creditor clock
+    creditor_deadline: str = ""    # granted_date + 6 months (YYYY-MM-DD)
+    # Probate notice subtype + sale-specific fields (Tweak #3)
+    notice_subtype: str = ""           # "probate_creditors" | "probate_sale" | "probate_heirs_notice"
+    petition_filed_date: str = ""      # YYYY-MM-DD; when the PR petitioned to sell (probate_sale only)
+    hearing_date: str = ""             # YYYY-MM-DD; court ruling date for probate_sale petitions
+    co_pr_names: str = ""              # Pipe-delimited co-Personal Representatives
+    heirs_named_in_notice: str = ""    # Pipe-delimited heirs explicitly named (probate_heirs_notice)
+    estate_purpose: str = ""           # e.g. "paying the debts of the said estate"
+    sale_type: str = ""                # "private" | "public auction"
+    # Multi-parcel + homestead enrichment (Tweak #1)
+    secondary_addresses: str = ""      # Pipe-delimited additional parcels owned by decedent
+    total_estate_value: str = ""       # Sum of all parcel total_value (primary + secondary)
+    is_homestead: str = ""             # "Y" if the matched parcel appears to be the primary residence
+    # Final-pass column coverage
+    received_date: str = ""            # When the notice was scraped (UTC, YYYY-MM-DD)
+    assessed_value: str = ""           # Last-assessed value of the PRIMARY parcel only
+    property_use: str = ""             # Assessor classification ("Residential", "Commercial", "Real", etc.)
+    survivor_zip: str = ""             # Zip of the first surviving heir (when distinct from PR)
+    municipality: str = ""             # Assessor's municipality code (Jefferson DispCode: BHAM, TRUSSVILLE, COUNTY, etc.)
     # County assessor / tax fields
     parcel_id: str = ""                # County assessor parcel ID
     tax_delinquent_amount: str = ""    # Total delinquent tax owed ($)
@@ -465,12 +490,111 @@ PROBATE_NAME_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# AL Pattern A — "having been granted to NAME on/as..." — name appears between
+# the action verb and a date/role marker. Most reliable for AL probate prose.
+PROBATE_NAME_GRANTED_RE = re.compile(
+    r"(?:having\s+been\s+)?granted\s+to\s+"
+    r"([A-Z][A-Za-z.'\-]+(?:\s+[A-Z][A-Za-z.'\-]+){1,4})"
+    r"\s+(?:on\s+(?:the\s+)?\d|as\s+(?:Personal|Executor|Executrix|Administrator|Administratrix)|by\s+the\s+(?:Hon|Honorable))",
+    re.IGNORECASE,
+)
+
+# AL Pattern B — "NAME\nPersonal Representative" or "NAME, Personal Representative"
+# Common in the signature block at the end of AL notices.
+PROBATE_NAME_BEFORE_TITLE_RE = re.compile(
+    r"(?:^|\n)\s*"
+    r"([A-Z][A-Za-z.'\-]+(?:\s+[A-Z][A-Za-z.'\-]+){1,4})"
+    r"\s*[\n,]\s*"
+    r"(?:Personal\s+Representative|Executor|Executrix|Administrator|Administratrix)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 # Probate — decedent name from "Estate of [NAME], Deceased"
 DECEDENT_NAME_RE = re.compile(
     r"Estate\s+of\s+([A-Z][A-Za-z\s.,'\-]+?)"
     r"(?:\s*,?\s*(?:Deceased|Dec['\u2019.]?\s*d|who\s+died))",
     re.IGNORECASE,
 )
+
+# ── AL probate metadata patterns ──────────────────────────────────────
+# Case number: "Case No. PC2025-234", "CASE NO: PR-2026-000557", "Case# PC2025-234"
+CASE_NUMBER_RE = re.compile(
+    r"(?:Case\s*(?:No\.?|Number|#)|CASE\s+NO\.?)\s*[:.]?\s*"
+    r"([A-Z]{2,4}[-\s]?\d{4}[-\s]?\d{1,8}|\d{4}[-\s]\d{1,8})",
+    re.IGNORECASE,
+)
+
+# Judge of Probate — "by the Honorable Tammy Brown, Judge of Probate" or "Hon. James P. Naftel".
+JUDGE_RE = re.compile(
+    r"(?:by\s+the\s+)?(?:Honorable|Hon\.?)\s+"
+    r"([A-Z][A-Za-z.'\-]+(?:\s+[A-Z][A-Za-z.'\-]+){1,3})"
+    r"(?:\s*,?\s*Judge\s+of\s+Probate)?",
+    re.IGNORECASE,
+)
+
+# Granted date — handles "the 17 day of April, 2026" and "April 7, 2026" formats.
+GRANTED_DATE_RE = re.compile(
+    r"(?:Letters\s+(?:Testamentary|of\s+Administration)|having\s+been\s+granted)\b"
+    r"[\s\S]{0,200}?"
+    r"\bon\s+(?:the\s+)?"
+    r"(?:(\d{1,2})(?:st|nd|rd|th)?\s+day\s+of\s+"
+    r"(January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"\s*,?\s*(\d{4})"
+    r"|"
+    r"(January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"\s+(\d{1,2})\s*,?\s*(\d{4})"
+    r")",
+    re.IGNORECASE,
+)
+
+# Recording stamp date at the top of AL probate filings — most reliable when
+# OCR garbles the prose. Format: "MM/DD/YYYY HH:MMam/pm".
+RECORDING_DATE_RE = re.compile(
+    r"\b(\d{1,2}/\d{1,2}/\d{4})\s*\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?",
+    re.IGNORECASE,
+)
+
+# ── Probate notice-subtype detection (date-pattern definitions follow below) ──
+# Three subtypes seen in AL APN probate notices:
+#   probate_creditors    — Notice to Creditors (the standard 6-month publication)
+#   probate_sale         — PR petitioning the court for permission to sell real estate
+#   probate_heirs_notice — Notice TO heirs about an estate proceeding (heirs named inline)
+PROBATE_SALE_SIGNATURE_RE = re.compile(
+    r"(?:NOTICE\s+OF\s+(?:PETITION\s+TO\s+APPROVE\s+)?SALE\s+OF\s+REAL\s+(?:PROPERTY|ESTATE)"
+    r"|PETITION\s+TO\s+(?:APPROVE\s+)?SALE\s+OF\s+REAL\s+PROPERTY"
+    r"|NOTICE\s+OF\s+SALE\s+OF\s+REAL\s+ESTATE\s+BY\s+(?:THE\s+)?PERSONAL\s+REPRESENTATIVE)",
+    re.IGNORECASE,
+)
+PROBATE_HEIRS_NOTICE_RE = re.compile(
+    r"NOTICE\s+TO\s*:\s*"
+    r"((?:[A-Z][A-Z.\s\-']+,?\s*){2,})",  # 2+ comma-separated all-caps names
+    re.IGNORECASE,
+)
+
+# "by Co-Personal Representatives of the Estate of NAME" — captures the wrapper
+# so we know there are multiple PRs; the names themselves come from PROBATE_NAME_*
+CO_PR_FLAG_RE = re.compile(
+    r"\bCo[-\s]?(?:Personal\s+Representatives?|Executors?|Administrators?|Executrices)\b",
+    re.IGNORECASE,
+)
+
+# "for purpose of paying the debts of the said estate"
+ESTATE_PURPOSE_RE = re.compile(
+    r"for\s+(?:the\s+)?purposes?\s+of\s+([\w\s,'\-]+?)(?:\s*\.|\s*Notice|\s*$)",
+    re.IGNORECASE,
+)
+
+# Sale type — "private sale" or "public auction"
+SALE_TYPE_RE = re.compile(
+    r"\b(private\s+sale|public\s+(?:auction|sale))\b",
+    re.IGNORECASE,
+)
+
+# PETITION_FILED_RE and HEARING_DATE_RE depend on _DATE_FRAGMENT, defined below;
+# they are constructed lazily after _DATE_FRAGMENT is in scope.
+PETITION_FILED_RE = None  # populated below
+HEARING_DATE_RE = None    # populated below
+
 
 # Probate — PR mailing address (street + city + TN + zip after the PR title)
 # Anchors from the PR title keyword, skips over name/title (non-digit chars),
@@ -489,6 +613,39 @@ PR_ADDRESS_RE = re.compile(
     r"(?:Tennessee|Tenn\.?|TN|Alabama|Ala\.?|AL)"
     r"\s*[,.\s]*"
     r"(\d{5})",                        # zip
+    re.IGNORECASE,
+)
+
+# AL signature-block PR mailing address: name comes BEFORE title, address
+# follows title with only a newline separator (typically). PR_ADDRESS_RE
+# above requires {3,80} non-digit chars between the title and the address,
+# which fits the TN inline format ("Personal Representative: NAME, ADDR")
+# but never matches the AL vertical signature block:
+#
+#     JOHN SMITH
+#     Personal Representative
+#     123 Main St
+#     Birmingham, AL 35203
+#
+# Here, between "Representative" and "123" there is only a single newline
+# (1 char) — well under the 3-char minimum. This variant uses {0,80}?
+# (non-greedy zero minimum) so the address can follow the title with
+# minimal whitespace, and accepts both AL and TN state-name suffixes so
+# either format flows through this single fallback.
+PR_ADDRESS_NAME_FIRST_RE = re.compile(
+    r"(?:Personal\s+Representative(?:\(S\))?|Executor|Executrix|Administrator|Administratrix)"
+    r"[^0-9]{0,80}?"                  # AL: zero+ chars (often just a newline)
+    r"(\d{1,5}\s+"
+    r"[\w\s.,'#-]+?"
+    + _SUFFIX +
+    r"\.?"
+    r"(?:\s*[,.]?\s*(?:Suite|Ste\.?|Apt\.?|Unit|#)\s*\.?\s*[\w.]+)?)"
+    r"\s*[,.\s]+\s*"
+    r"([A-Za-z][\w\s]*?)"
+    r"\s*[,.]\s*"
+    r"(?:Alabama|Ala\.?|AL|Tennessee|Tenn\.?|TN)"
+    r"\s*[,.\s]*"
+    r"(\d{5})",
     re.IGNORECASE,
 )
 
@@ -537,6 +694,21 @@ _DATE_FRAGMENT = (
     r"\s+\d{1,2}\s*,?\s*\d{4}"
     r"|\d{1,2}/\d{1,2}/\d{4}"
     r")"
+)
+
+# Probate-sale date patterns (defined here because they depend on _DATE_FRAGMENT)
+PETITION_FILED_RE = re.compile(
+    r"(?:Petition\b[\s\S]{0,80}?\bwas\s+filed|filed\s+(?:a\s+petition|on))\s+on\s+"
+    + _DATE_FRAGMENT,
+    re.IGNORECASE,
+)
+HEARING_DATE_RE = re.compile(
+    r"(?:"
+    r"hearing\s+(?:is\s+set\s+(?:for\s+)?on\s+|will\s+be\s+held\s+on\s+|on\s+)"
+    r"|to\s+be\s+heard\s+on\s+"
+    r")"
+    + _DATE_FRAGMENT,
+    re.IGNORECASE,
 )
 
 AUCTION_DATE_PATTERNS = [
@@ -822,7 +994,9 @@ async def parse_notice_page(
     _parse_address(notice)
     _parse_name(notice)
     _split_owner_name(notice)
+    _split_decedent_name(notice)
     _parse_pr_address(notice)
+    _parse_probate_metadata(notice)
     if notice_type != "probate":
         _parse_auction_date(notice)
     _parse_foreclosure_parties(notice)
@@ -831,6 +1005,7 @@ async def parse_notice_page(
     needs_llm = (
         (notice_type == "probate" and (
             not notice.owner_name or not notice.decedent_name or not notice.owner_street
+            or not notice.case_number or not notice.judge_name or not notice.granted_date
         ))
         or (notice_type == "foreclosure" and (
             not notice.address or not notice.owner_name or not notice.auction_date
@@ -861,6 +1036,15 @@ async def parse_notice_page(
                 notice.owner_state = llm_result.get("owner_state") or notice.state or "TN"
                 notice.owner_zip = llm_result.get("owner_zip") or notice.owner_zip
                 logger.info("LLM filled PR address: %s", notice.owner_street)
+            # Probate metadata (case#, judge, granted date)
+            if not notice.case_number and llm_result.get("case_number"):
+                notice.case_number = re.sub(r"\s+", "", llm_result["case_number"]).upper()
+            if not notice.judge_name and llm_result.get("judge_name"):
+                notice.judge_name = llm_result["judge_name"]
+            if not notice.granted_date and llm_result.get("granted_date"):
+                notice.granted_date = llm_result["granted_date"]
+            # Re-run probate metadata so creditor_deadline gets computed if granted_date arrived
+            _parse_probate_metadata(notice)
         else:
             # Foreclosure / tax sale / tax lien
             if not notice.address and llm_result.get("address"):
@@ -884,9 +1068,20 @@ async def parse_notice_page(
                     notice.trustee = llm_result["trustee"]
                 if not notice.trustee_file_number and llm_result.get("trustee_file_number"):
                     notice.trustee_file_number = llm_result["trustee_file_number"]
+            # Eviction-specific fields. Plaintiff already filled via owner_name
+            # above; here we capture case # and back-rent owed. amount_owed
+            # rides in tax_delinquent_amount (DataSift schema has no separate
+            # eviction-amount column) so the existing tax_high_exposure tag
+            # fires when ≥ $5K — high back-rent = motivated landlord.
+            if notice_type == "eviction":
+                if not notice.case_number and llm_result.get("case_number"):
+                    notice.case_number = re.sub(r"\s+", "", llm_result["case_number"]).upper()
+                if not notice.tax_delinquent_amount and llm_result.get("amount_owed"):
+                    notice.tax_delinquent_amount = llm_result["amount_owed"]
 
-    # Re-run name splits in case the LLM filled owner_name
+    # Re-run name splits in case the LLM filled owner_name / decedent_name
     _split_owner_name(notice)
+    _split_decedent_name(notice)
 
     return notice
 
@@ -1202,12 +1397,20 @@ def _parse_name(notice: NoticeData) -> None:
             if _is_valid_name(dec_name):
                 notice.decedent_name = dec_name
 
-        # Extract PR/Executor name from "Personal Representative: NAME"
-        pr_match = PROBATE_NAME_RE.search(text)
-        if pr_match:
-            pr_name = _clean_name(pr_match.group(1))
-            if _is_valid_name(pr_name):
-                notice.owner_name = pr_name
+        # Extract PR/Executor name. Try patterns in priority order, validating each:
+        #   (a) AL "granted to NAME on/as..." — most reliable when present
+        #   (b) AL "NAME\nPersonal Representative" — signature-block format
+        #   (c) TN "Personal Representative: NAME" — original/legacy
+        # Skip a match if the captured token is in the invalid-names list (e.g.
+        # "the undersigned" appears in some AL notices in place of the PR name).
+        for pat in (PROBATE_NAME_GRANTED_RE, PROBATE_NAME_BEFORE_TITLE_RE, PROBATE_NAME_RE):
+            m = pat.search(text)
+            if not m:
+                continue
+            candidate = _clean_name(m.group(1))
+            if _is_valid_name(candidate):
+                notice.owner_name = candidate
+                break
         return
 
     # Foreclosure / tax sale / tax lien — "executed by" is the most common
@@ -1282,6 +1485,19 @@ def _split_owner_name(notice: NoticeData) -> None:
     notice.owner_suffix = suffix
 
 
+def _split_decedent_name(notice: NoticeData) -> None:
+    """Populate decedent_first_name / middle / last / suffix from decedent_name."""
+    if not notice.decedent_name:
+        return
+    if notice.decedent_first_name or notice.decedent_last_name:
+        return
+    first, middle, last, suffix = _split_full_name(notice.decedent_name)
+    notice.decedent_first_name = first
+    notice.decedent_middle_name = middle
+    notice.decedent_last_name = last
+    notice.decedent_suffix = suffix
+
+
 # ── Foreclosure party regexes (mortgage company, trustee, file number) ─
 
 # "the undersigned X, as Mortgagee/Transferee" — current servicer/holder.
@@ -1346,18 +1562,180 @@ def _parse_foreclosure_parties(notice: NoticeData) -> None:
             notice.trustee_file_number = m.group(1).strip()
 
 
+def _parse_probate_metadata(notice: NoticeData) -> None:
+    """Extract case#, judge, granted_date, creditor_deadline for AL probate notices.
+
+    Alabama probate Notice-to-Creditors publications follow a predictable shape:
+      - "Case No. PC<year>-<num>"  (e.g. PC2025-234, PR-2026-000557)
+      - "having been granted to ... on the <day> day of <Month>, <year>"
+      - "by the Honorable <Name>, Judge of Probate"
+      - Recording stamp at top: "MM/DD/YYYY HH:MMam"
+
+    Per Alabama Code § 43-2-350, creditors have 6 months from the granted date
+    to file claims. We compute creditor_deadline = granted_date + 6 months.
+    """
+    if notice.notice_type != "probate":
+        return
+
+    text = notice.raw_text
+
+    # Case number — top-of-document field; survives OCR cleanly
+    if not notice.case_number:
+        m = CASE_NUMBER_RE.search(text)
+        if m:
+            # Normalize: collapse internal whitespace, uppercase
+            notice.case_number = re.sub(r"\s+", "", m.group(1)).upper()
+
+    # Judge of Probate
+    if not notice.judge_name:
+        m = JUDGE_RE.search(text)
+        if m:
+            judge = _clean_name(m.group(1))
+            if _is_valid_name(judge):
+                notice.judge_name = judge
+
+    # Granted date — try the prose pattern first; fall back to recording stamp
+    if not notice.granted_date:
+        m = GRANTED_DATE_RE.search(text)
+        if m:
+            # Branch 1: "the <day> day of <Month>, <year>" → groups 1, 2, 3
+            # Branch 2: "<Month> <day>, <year>"           → groups 4, 5, 6
+            if m.group(1):
+                day, month, year = m.group(1), m.group(2), m.group(3)
+            else:
+                month, day, year = m.group(4), m.group(5), m.group(6)
+            normalized = _normalize_date(f"{month} {day}, {year}")
+            if normalized:
+                notice.granted_date = normalized
+
+        if not notice.granted_date:
+            # Fallback: top-of-document recording stamp (always digit-clean)
+            m = RECORDING_DATE_RE.search(text)
+            if m:
+                notice.granted_date = _normalize_date(m.group(1)) or ""
+
+    # Creditor deadline = granted_date + 6 months (AL § 43-2-350)
+    if notice.granted_date and not notice.creditor_deadline:
+        try:
+            from datetime import datetime
+            dt = datetime.strptime(notice.granted_date, "%Y-%m-%d")
+            # 6-month bump preserving day-of-month where possible
+            month = dt.month + 6
+            year = dt.year + (month - 1) // 12
+            month = ((month - 1) % 12) + 1
+            try:
+                deadline = dt.replace(year=year, month=month)
+            except ValueError:
+                # day-of-month doesn't exist in target month (e.g. Aug 31 → Feb 31) — clamp to last
+                deadline = dt.replace(year=year, month=month, day=28)
+            notice.creditor_deadline = deadline.strftime("%Y-%m-%d")
+        except (ValueError, ImportError):
+            pass
+
+    # Subtype detection + sale/heirs-specific extraction
+    _parse_probate_subtype(notice)
+
+
+def _parse_probate_subtype(notice: NoticeData) -> None:
+    """Detect probate notice subtype and extract sale/heirs-specific fields.
+
+    Three mutually-exclusive subtypes (in priority order):
+      probate_sale         — PR petitioning court to approve real estate sale
+      probate_heirs_notice — Notice TO named heirs about an estate proceeding
+      probate_creditors    — default; standard 6-month creditor publication
+    """
+    text = notice.raw_text
+    if not text:
+        notice.notice_subtype = "probate_creditors"
+        return
+
+    # Subtype: probate_sale (highest signal — explicit petition language)
+    if PROBATE_SALE_SIGNATURE_RE.search(text):
+        notice.notice_subtype = "probate_sale"
+
+        # Petition filing date
+        m = PETITION_FILED_RE.search(text)
+        if m and not notice.petition_filed_date:
+            notice.petition_filed_date = _normalize_date(m.group(1).strip()) or ""
+
+        # Hearing date
+        m = HEARING_DATE_RE.search(text)
+        if m and not notice.hearing_date:
+            notice.hearing_date = _normalize_date(m.group(1).strip()) or ""
+
+        # Estate purpose
+        m = ESTATE_PURPOSE_RE.search(text)
+        if m and not notice.estate_purpose:
+            notice.estate_purpose = m.group(1).strip().rstrip(".,;:")
+
+        # Sale type
+        m = SALE_TYPE_RE.search(text)
+        if m and not notice.sale_type:
+            notice.sale_type = m.group(1).lower().strip()
+
+    # Subtype: probate_heirs_notice — "NOTICE TO: NAME1, NAME2, NAME3..."
+    elif PROBATE_HEIRS_NOTICE_RE.search(text):
+        notice.notice_subtype = "probate_heirs_notice"
+        m = PROBATE_HEIRS_NOTICE_RE.search(text)
+        if m and not notice.heirs_named_in_notice:
+            raw_list = m.group(1)
+            # Split on commas, "and", "&"; trim; drop trailers like "AND TO WHOM IT MAY CONCERN"
+            parts = re.split(r"\s*(?:,|\sand\s|&)\s*", raw_list, flags=re.IGNORECASE)
+            heirs = []
+            for p in parts:
+                p = p.strip(" ,;.").rstrip(":")
+                if not p or len(p) < 4:
+                    continue
+                # Drop catch-all phrases
+                low = p.lower()
+                if any(s in low for s in ("whom it may concern", "to all", "next of kin")):
+                    continue
+                # Title-case if all caps
+                heirs.append(p.title() if p.isupper() else p)
+            if heirs:
+                notice.heirs_named_in_notice = " | ".join(heirs[:10])  # cap at 10
+
+    else:
+        notice.notice_subtype = "probate_creditors"
+
+    # Co-PR detection — applies to any subtype. Independent of whether
+    # owner_name has already been extracted.
+    if CO_PR_FLAG_RE.search(text) and not notice.co_pr_names:
+        # Best-effort: look for "NAME1 and NAME2" near the title
+        co_pr_match = re.search(
+            r"([A-Z][A-Za-z.'\-]+(?:\s+[A-Z][A-Za-z.'\-]+){1,3})"
+            r"\s+and\s+"
+            r"([A-Z][A-Za-z.'\-]+(?:\s+[A-Z][A-Za-z.'\-]+){1,3})"
+            r"\s*,?\s*Co[-\s]?(?:Personal\s+Representatives?|Executors?)",
+            text,
+        )
+        if co_pr_match:
+            n1 = _clean_name(co_pr_match.group(1))
+            n2 = _clean_name(co_pr_match.group(2))
+            if _is_valid_name(n1) and _is_valid_name(n2):
+                notice.co_pr_names = f"{n1} | {n2}"
+                # If owner_name was empty or generic, populate from first co-PR
+                if not notice.owner_name or not _is_valid_name(notice.owner_name):
+                    notice.owner_name = n1
+
+
 def _parse_pr_address(notice: NoticeData) -> None:
     """Extract the PR's mailing address from probate notice text.
 
     Probate notices contain the PR/Executor's mailing address (where creditors
     send claims), but NOT the decedent's property address. This extracts the
     PR's street, city, state, and zip into the owner_* fields.
+
+    Tries the inline TN format first (PR_ADDRESS_RE — anchored on title with
+    name+colon between), then falls back to the AL signature-block format
+    (PR_ADDRESS_NAME_FIRST_RE — name on prior line, address right after
+    title with minimal separator). Either match populates the owner_* slots.
     """
     if notice.notice_type != "probate":
         return
 
     text = notice.raw_text.replace("\xa0", " ")
-    match = PR_ADDRESS_RE.search(text)
+    match = PR_ADDRESS_RE.search(text) or PR_ADDRESS_NAME_FIRST_RE.search(text)
     if match:
         street = _clean_address(match.group(1))
         # Title-case — PR addresses in notices are usually ALL CAPS
