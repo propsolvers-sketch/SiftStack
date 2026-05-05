@@ -17,7 +17,6 @@ real-world quirks force address normalization before search:
 from __future__ import annotations
 
 import logging
-import re
 
 from notice_parser import NoticeData
 
@@ -118,6 +117,46 @@ def _enrich_jefferson(notice: NoticeData) -> bool:
     return filled
 
 
+def _split_address_for_madison(address: str) -> tuple[str, str] | None:
+    """Split a street address into (number, root_street_name) for Madison's
+    AssuranceWeb search, which takes them as separate criteria fields and
+    indexes street names without suffix or directional tokens.
+
+    Examples:
+        "3037 Box Canyon Rd Se"      → ("3037", "BOX CANYON")
+        "118 Trenton Creek Lane"     → ("118", "TRENTON CREEK")
+        "120 Oakland Church"         → ("120", "OAKLAND CHURCH")
+        "Lot 6, The Crossings ..."   → None (legal description, not address)
+    """
+    parts = address.strip().upper().split()
+    if not parts or not parts[0].isdigit():
+        return None
+    number = parts[0]
+    rest = parts[1:]
+
+    # Strip trailing direction tokens (NE, NW, SE, SW, N, S, E, W and full words)
+    _DIRS = {
+        "NE", "NW", "SE", "SW", "N", "S", "E", "W",
+        "NORTHEAST", "NORTHWEST", "SOUTHEAST", "SOUTHWEST",
+        "NORTH", "SOUTH", "EAST", "WEST",
+    }
+    while rest and rest[-1].rstrip(".") in _DIRS:
+        rest.pop()
+
+    # Strip trailing street-suffix word (full or abbreviation)
+    _SUFFIX_WORDS = (
+        set(_SUFFIX_ABBR.keys())
+        | set(_SUFFIX_ABBR.values())
+        | {"WAY", "RUN", "PASS", "PATH", "LOOP", "WALK", "ROW", "GLEN", "GLENN", "BEND"}
+    )
+    while rest and rest[-1].rstrip(".") in _SUFFIX_WORDS:
+        rest.pop()
+
+    if not rest:
+        return None
+    return (number, " ".join(rest))
+
+
 def _enrich_madison(notice: NoticeData) -> bool:
     """Look up Madison County parcel + tax data and fill empty NoticeData fields.
 
@@ -125,16 +164,32 @@ def _enrich_madison(notice: NoticeData) -> bool:
     """
     from madison_property_api import search_by_situs_address
 
+    parsed = _split_address_for_madison(notice.address)
+    if not parsed:
+        logger.debug("Madison: address %r doesn't parse to (number, name)", notice.address)
+        return False
+    number, name = parsed
+
     record = None
-    for variant in _address_search_variants(notice.address):
+    # Try full multi-word name first, then progressively shorter prefixes —
+    # Madison's index sometimes has only the first word of compound names.
+    name_variants = [name]
+    name_parts = name.split()
+    if len(name_parts) > 1:
+        name_variants.append(name_parts[0])  # fall back to first word only
+
+    for variant in name_variants:
         try:
-            records = search_by_situs_address(variant)
+            records = search_by_situs_address(number, variant)
         except Exception as e:
-            logger.debug("Madison API error for %r: %s", variant, e)
+            logger.debug("Madison API error for (%r, %r): %s", number, variant, e)
             continue
         if records:
             record = records[0]
-            logger.debug("Madison match on variant %r → parcel %s", variant, record.parcel_number)
+            logger.debug(
+                "Madison match on (%r, %r) → parcel %s",
+                number, variant, record.parcel_number,
+            )
             break
 
     if not record:
