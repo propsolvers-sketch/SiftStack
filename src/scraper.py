@@ -35,7 +35,7 @@ from config import (
     SEL_SEARCH_TYPE_OR,
 )
 from foreclosure_filter import is_valid_foreclosure
-from notice_parser import NoticeData, is_target_county, parse_notice_page
+from notice_parser import NoticeData, is_target_county_async, parse_notice_page
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +129,39 @@ async def _get_page_info(page: Page) -> tuple[int, int]:
     except Exception:
         pass
     return 1, 1
+
+
+async def _click_next_page(page: Page, current_page: int) -> bool:
+    """Click the AL site's "Next page" image-button and wait for the postback.
+
+    AL's pagination is an ASP.NET image button that fires __doPostBack — the
+    URL doesn't change. ``page.expect_navigation`` therefore times out forever
+    even though the grid does update. Instead we click and poll the
+    ``lblCurrentPage`` span until it shows a value different from
+    ``current_page``.
+
+    Returns True if the page advanced, False on click error or timeout.
+    """
+    next_btn = await page.query_selector(SEL_NEXT_PAGE_BUTTON)
+    if not next_btn:
+        return False
+    disabled = await next_btn.get_attribute("disabled")
+    if disabled:
+        return False
+    try:
+        await next_btn.click(timeout=5_000)
+        await page.wait_for_function(
+            "(prev) => { "
+            "const s = document.querySelector('span[id$=\"lblCurrentPage\"]'); "
+            "return s && s.innerText.trim() !== prev; "
+            "}",
+            arg=str(current_page),
+            timeout=15_000,
+        )
+        return True
+    except Exception as e:
+        logger.debug("Next-page click failed: %s", e)
+        return False
 
 
 async def _collect_notice_ids_on_page(page: Page) -> list[str]:
@@ -286,7 +319,9 @@ async def _scrape_notice(
             if not is_valid_foreclosure(notice):
                 logger.debug("  Filtered out (not valid foreclosure): %s", notice_id)
                 return None
-            if not is_target_county(notice.raw_text, search.county):
+            if not await is_target_county_async(
+                notice.raw_text, search.county, api_key=llm_api_key,
+            ):
                 logger.debug("  Filtered out (wrong county): %s", notice_id)
                 return None
 
@@ -413,32 +448,46 @@ async def run_search(
         if current_page >= total_pages:
             break
 
-        # Return to search results and go to next page
+        # Return to search results and go to next page.
+        #
+        # The cached `search_url_with_session` embeds an ASP.NET session GUID
+        # captured BEFORE we visited any detail pages. After ~10 detail-page
+        # CAPTCHA visits the AL site session may have rotated server-side, in
+        # which case goto() returns 200 OK but loads a stale/empty page that
+        # doesn't show the results grid. The previous code only fell through
+        # to resubmit if goto() raised — silent stale-page loads broke
+        # pagination for high-volume searches (probate, where most notices
+        # filter out before we ever advance pages).
+        #
+        # Fix: validate that the results grid is actually present after goto.
+        # If not, force the resubmit-and-click-to-page recovery path.
+        need_resubmit = False
         try:
             await page.goto(search_url_with_session, wait_until="domcontentloaded", timeout=20_000)
             await page.wait_for_timeout(1500)
+            grid = await page.query_selector(SEL_RESULTS_GRID)
+            if not grid:
+                logger.info("  Cached search URL no longer shows results grid — resubmitting")
+                need_resubmit = True
         except Exception:
             logger.warning("  Could not return to search results — resubmitting search")
+            need_resubmit = True
+
+        if need_resubmit:
             if not await _submit_search(page, search, days_back):
                 break
-            # Navigate to the right page
-            for _ in range(current_page):
-                next_btn = await page.query_selector(SEL_NEXT_PAGE_BUTTON)
-                if not next_btn:
+            # Click forward to return to where we were. After _submit_search
+            # we're on page 1; advance through current_page-1 next-clicks so
+            # the click below moves us to current_page+1.
+            replay_page = 1
+            for _ in range(current_page - 1):
+                if not await _click_next_page(page, replay_page):
                     break
-                async with page.expect_navigation(wait_until="domcontentloaded", timeout=15_000):
-                    await next_btn.click()
+                replay_page += 1
                 await delay()
 
-        next_btn = await page.query_selector(SEL_NEXT_PAGE_BUTTON)
-        disabled = await next_btn.get_attribute("disabled") if next_btn else "true"
-        if not next_btn or disabled:
-            break
-
-        try:
-            async with page.expect_navigation(wait_until="domcontentloaded", timeout=15_000):
-                await next_btn.click()
-        except PwTimeout:
+        # Advance to the next page via the ASP.NET image button.
+        if not await _click_next_page(page, current_page):
             break
         await delay()
         current_page, total_pages = await _get_page_info(page)
