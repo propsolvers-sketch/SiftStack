@@ -814,18 +814,25 @@ POSTPONEMENT_RE = re.compile(
 # These patterns detect when a notice's actual property is in a different
 # county than the saved search that returned it (false positive from keyword match).
 
-# "Register's Office for {County} County" — property deed is recorded there
-# Alabama: "Office of the Judge of Probate of Jefferson County"
-# Also catches "recorded in ... Jefferson County" and "Register's Office of {County}"
+# Register/probate-court phrasings. Several variations seen across AL counties:
+#   "Office of the Judge of Probate of Jefferson County"     (Jefferson foreclosure)
+#   "Judge of Probate of Pike County"                        (Pike Notice-to-Creditors)
+#   "Judge of the Probate Court of Lauderdale County"        (Lauderdale Letters of Admin)
+#   "Probate Court of Houston County, Alabama"               (Houston summary distribution)
+#   "Register's Office of/for X County"                      (TN holdover)
 _REGISTER_COUNTY_RE = re.compile(
-    r"(?:Office\s+of\s+the\s+Judge\s+of\s+Probate\s+of|"
-    r"Register'?s\s+Office\s+(?:for|of))\s+(\w+)\s+County",
+    r"(?:Office\s+of\s+the\s+Judge\s+of\s+Probate\s+of"
+    r"|Judge\s+of\s+(?:the\s+)?Probate(?:\s+Court)?\s+of"
+    r"|Probate\s+Court\s+of"
+    r"|Register'?s\s+Office\s+(?:for|of))\s+(\w+)\s+County",
     re.IGNORECASE,
 )
 
-# "{County} County Courthouse" or "State of Alabama, {County} County"
+# "{County} County Courthouse" or "{County} County, Alabama" — note
+# \s* (not \s+) so "County, Alabama" matches when no whitespace separates
+# County and the comma (the standard AL probate phrasing).
 _COURTHOUSE_COUNTY_RE = re.compile(
-    r"(\w+)\s+County\s+(?:Courthouse|,\s*Alabama)",
+    r"(\w+)\s+County\s*(?:Courthouse|,\s*Alabama)",
     re.IGNORECASE,
 )
 
@@ -835,30 +842,56 @@ _PUBLICATION_COUNTY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# AL pleading-header convention: "STATE OF ALABAMA / COUNTY OF LAUDERDALE"
+# (or "COUNTY OF X" inline). Anchors the keyword "COUNTY OF" so we don't
+# match arbitrary genitive uses ("...the county of jefferson...").
+_COUNTY_OF_RE = re.compile(
+    r"\bCOUNTY\s+OF\s+([A-Za-z][A-Za-z\-]+)\b",
+    re.IGNORECASE,
+)
+
+# Reverse AL pleading-header: "STATE OF ALABAMA, / LIMESTONE COUNTY." or
+# "STATE OF ALABAMA / X COUNTY" — comma/period/whitespace between STATE and
+# the county-name token. Distinct from _COURTHOUSE_COUNTY_RE which requires
+# "X County, Alabama" (state-name AFTER county); this pattern handles
+# state-name BEFORE county. Anchored on STATE OF ALABAMA so it can't pick
+# up arbitrary "X County" mentions.
+_STATE_HEADER_COUNTY_RE = re.compile(
+    r"STATE\s+OF\s+ALABAMA[,.\s]+([A-Za-z][A-Za-z\-]+)\s+COUNTY",
+    re.IGNORECASE,
+)
+
 # Counties we care about — notices for other counties are false positives
 _TARGET_COUNTIES = {"jefferson", "madison"}
 
 
-def is_target_county(text: str, search_county: str) -> bool:
-    """Check if the notice's actual property county matches our target counties.
-
-    The search may return notices that merely *mention* Knox County (e.g. the
-    trustee is from Knox County) but the actual property is in Hamilton, Hardeman,
-    Union, etc.  We detect this by looking at Register's Office and Courthouse
-    references which indicate where the property actually is.
-
-    Returns True if the property appears to be in Knox or Blount County (or if
-    we can't determine the county — benefit of the doubt).
-    """
-    # Collect county mentions from all detection patterns
+def _detect_counties_via_regex(text: str) -> set[str]:
+    """Run all county-detection regexes and return the union as lowercase names."""
     register_matches = _REGISTER_COUNTY_RE.findall(text)
     courthouse_matches = _COURTHOUSE_COUNTY_RE.findall(text)
     publication_matches = _PUBLICATION_COUNTY_RE.findall(text)
+    county_of_matches = _COUNTY_OF_RE.findall(text)
+    state_header_matches = _STATE_HEADER_COUNTY_RE.findall(text)
 
-    mentioned_counties = set()
-    for c in register_matches + courthouse_matches + publication_matches:
-        mentioned_counties.add(c.lower())
+    mentioned = set()
+    for c in (register_matches + courthouse_matches + publication_matches
+              + county_of_matches + state_header_matches):
+        mentioned.add(c.lower())
+    return mentioned
 
+
+def is_target_county(text: str, search_county: str) -> bool:
+    """Synchronous regex-only county check (no LLM tiebreaker).
+
+    Use is_target_county_async() when an api_key is available to enable
+    LLM-based fallback for ambiguous cases (zero matches or multiple
+    counties detected).
+
+    Returns True if the property appears to be in Knox/Blount/Jefferson/
+    Madison county, or if we can't determine the county at all (benefit
+    of the doubt).
+    """
+    mentioned_counties = _detect_counties_via_regex(text)
     if not mentioned_counties:
         return True  # Can't determine — keep it
 
@@ -867,6 +900,62 @@ def is_target_county(text: str, search_county: str) -> bool:
         return True
 
     # Only non-target counties found — this is a false positive
+    logger.info(
+        "County mismatch: search='%s' but property in %s — filtering out",
+        search_county, ", ".join(sorted(mentioned_counties)).title(),
+    )
+    return False
+
+
+async def is_target_county_async(
+    text: str, search_county: str, api_key: str | None = None,
+) -> bool:
+    """County check with LLM tiebreaker for ambiguous regex results.
+
+    Decision tree:
+      1. Regex finds exactly ONE county that's in target → KEEP (no LLM)
+      2. Regex finds exactly ONE county not in target → REJECT (no LLM)
+      3. Regex finds ZERO counties → ask LLM (if api_key available)
+      4. Regex finds MULTIPLE counties → ask LLM to disambiguate
+      5. No api_key OR LLM returns nothing → fall back to regex behavior
+         (benefit-of-doubt for empty, intersect-test for multiple)
+
+    Most common-case clean notices stay regex-only. LLM only fires for
+    notices with ambiguous county signals — typically <10% of probate
+    notices, even less for foreclosure.
+    """
+    mentioned_counties = _detect_counties_via_regex(text)
+
+    # Confident single-match cases — no LLM needed
+    if len(mentioned_counties) == 1:
+        return mentioned_counties.issubset(_TARGET_COUNTIES) or bool(
+            mentioned_counties & _TARGET_COUNTIES
+        )
+
+    # Ambiguous: zero or multiple county signals → LLM tiebreaker
+    if api_key:
+        try:
+            from llm_parser import extract_county_from_notice
+            llm_county = await extract_county_from_notice(text, api_key)
+        except Exception as e:
+            logger.debug("LLM county lookup error: %s", e)
+            llm_county = ""
+        if llm_county:
+            keep = llm_county in _TARGET_COUNTIES
+            if not keep:
+                logger.info(
+                    "County mismatch (LLM): regex=%s LLM=%s — filtering out",
+                    sorted(mentioned_counties) or "[]", llm_county.title(),
+                )
+            else:
+                logger.debug("County resolved via LLM: %s", llm_county)
+            return keep
+
+    # No LLM or LLM said unknown — fall back to regex-only behavior
+    if not mentioned_counties:
+        return True  # benefit of doubt
+    if mentioned_counties & _TARGET_COUNTIES:
+        return True
     logger.info(
         "County mismatch: search='%s' but property in %s — filtering out",
         search_county, ", ".join(sorted(mentioned_counties)).title(),

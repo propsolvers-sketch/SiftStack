@@ -237,6 +237,71 @@ async def extract_with_llm(
         return {}
 
 
+_COUNTY_CLASSIFY_PROMPT = """\
+This is a legal notice published in Alabama (foreclosure, probate,
+tax-sale, code-violation, etc.). Identify the Alabama county where this
+matter is being filed/recorded.
+
+Look for the strongest signal in priority order:
+  1. The Probate Court/Judge of Probate's county ("Judge of Probate of X County")
+  2. The "STATE OF ALABAMA / COUNTY OF X" pleading header
+  3. Recorded in / Office of the Judge of Probate of X County
+  4. The X County Courthouse or "X County, Alabama" mention
+  5. Property situs address city → infer the county
+
+Return ONLY JSON in this format:
+{{"county": "<lowercase county name>", "confidence": "high"|"medium"|"low"}}
+
+Examples of valid responses:
+  {{"county": "jefferson", "confidence": "high"}}
+  {{"county": "limestone", "confidence": "medium"}}
+  {{"county": "unknown", "confidence": "low"}}
+
+If the notice mentions multiple counties (e.g. trustee's office in one,
+property in another), pick the county where the MATTER itself is being
+prosecuted/recorded — usually that's the probate court for probate notices,
+the deed-recording office for foreclosure.
+
+Notice text:
+{raw_text}"""
+
+
+async def extract_county_from_notice(raw_text: str, api_key: str) -> str:
+    """Classify the AL county where a notice is being filed/recorded.
+
+    Used as a tiebreaker when regex-based county detection in
+    notice_parser.is_target_county() returns ambiguous results (zero
+    matches or multiple counties). Returns the lowercase county name
+    (e.g. "jefferson", "limestone") or "" if classification fails or
+    confidence is low.
+    """
+    if not raw_text.strip():
+        return ""
+    import config as _cfg
+    if getattr(_cfg, "LLM_BACKEND", "anthropic") == "anthropic" and not api_key:
+        return ""
+
+    text = raw_text[:6000]
+    prompt = _COUNTY_CLASSIFY_PROMPT.format(raw_text=text)
+
+    try:
+        parsed = await llm_client.chat_json_async(
+            prompt, system=SYSTEM_PROMPT, max_tokens=64, api_key=api_key,
+        )
+        if not parsed:
+            return ""
+        county = (parsed.get("county") or "").strip().lower()
+        confidence = (parsed.get("confidence") or "low").strip().lower()
+        if not county or county == "unknown":
+            return ""
+        if confidence == "low":
+            return ""
+        return county
+    except Exception as e:
+        logger.warning("County LLM classification failed: %s", e)
+        return ""
+
+
 async def auto_detect_notice_type(
     raw_text: str,
     county: str,
