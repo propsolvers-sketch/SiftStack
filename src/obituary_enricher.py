@@ -147,6 +147,33 @@ def _state_full_name(state_code: str) -> str:
     """
     return _STATE_FULL_NAMES.get((state_code or "").strip().upper(), "Tennessee")
 
+
+# Default city-hint per county for people-search/skip-trace lookups when
+# the notice text doesn't supply one. Used ONLY for the legacy TN counties
+# where the county seat happens to be the dominant population center.
+#
+# AL counties (Jefferson, Madison) deliberately have NO default — county
+# seats (Birmingham, Huntsville) cover only a minority of residents
+# (Hoover, Bessemer, Trussville, etc. for Jefferson; Madison City,
+# Meridianville, etc. for Madison). Biasing every DM lookup toward the
+# county seat actively harms hit-rate for everyone living elsewhere.
+# Better: pass empty city so people-search returns broader state-level
+# results, then disambiguate via state name + zip when possible.
+_DEFAULT_CITY_BY_COUNTY = {
+    "knox": "Knoxville",
+    "blount": "Maryville",
+}
+
+
+def _default_city_for_county(county: str) -> str:
+    """City to use as fallback when notice.city is empty.
+
+    Returns empty string for counties where the seat doesn't dominate the
+    population — better to let people-search use state-level results than
+    to bias the search toward the wrong city.
+    """
+    return _DEFAULT_CITY_BY_COUNTY.get((county or "").strip().lower(), "")
+
 # Common nickname ↔ formal name pairs for search fallback
 _NICKNAME_MAP: dict[str, list[str]] = {
     "robert": ["bob", "bobby", "rob", "robbie"],
@@ -1101,12 +1128,15 @@ def _fetch_firecrawl(
 
 
 def _extract_address_from_page(
-    page_text: str, name: str, city: str, api_key: str
+    page_text: str, name: str, city: str, api_key: str,
+    state_full: str = "Tennessee", state_code: str = "TN",
 ) -> dict | None:
     """Use Claude Haiku to extract a mailing address from page text."""
     prompt = ADDRESS_EXTRACT_PROMPT.format(
         name=name,
         city=city or "Knoxville",
+        state_full=state_full,
+        state_code=state_code,
         page_text=page_text[:MAX_ADDRESS_TEXT],
     )
     try:
@@ -1119,7 +1149,7 @@ def _extract_address_from_page(
             return {
                 "street": street,
                 "city": parsed.get("city", ""),
-                "state": parsed.get("state", "TN"),
+                "state": parsed.get("state", state_code),
                 "zip": parsed.get("zip", ""),
             }
     except Exception as e:
@@ -1128,7 +1158,8 @@ def _extract_address_from_page(
 
 
 def _lookup_dm_address_serper_firecrawl(
-    name: str, city: str, api_key: str
+    name: str, city: str, api_key: str,
+    state_full: str = "Tennessee", state_code: str = "TN",
 ) -> dict | None:
     """Look up DM address via direct people search URLs + Firecrawl rendering.
 
@@ -1146,7 +1177,8 @@ def _lookup_dm_address_serper_firecrawl(
         if not page_text or len(page_text) < 100:
             continue
 
-        result = _extract_address_from_page(page_text, name, city, api_key)
+        result = _extract_address_from_page(page_text, name, city, api_key,
+                                             state_full=state_full, state_code=state_code)
         if result:
             logger.debug("Direct URL hit for %s: %s", name, url)
             return result
@@ -1165,7 +1197,8 @@ def _lookup_dm_address_serper_firecrawl(
         if not page_text or len(page_text) < 100:
             continue
 
-        result = _extract_address_from_page(page_text, name, city, api_key)
+        result = _extract_address_from_page(page_text, name, city, api_key,
+                                             state_full=state_full, state_code=state_code)
         if result:
             logger.debug("Serper URL hit for %s: %s", name, url)
             return result
@@ -1271,9 +1304,10 @@ def _batch_tracerfy_lookup(notices: list) -> None:
         last_name = parts[-1]
         # Use property address as the known address for skip tracing
         addr = n.address.strip()
-        city_hint = n.city.strip() or "Knoxville"
+        city_hint = n.city.strip() or _default_city_for_county(n.county)
         zip_code = n.zip.strip()
-        writer.writerow([first_name, last_name, addr, city_hint, "TN",
+        state_code = (n.state or "TN").strip().upper() or "TN"
+        writer.writerow([first_name, last_name, addr, city_hint, state_code,
                          zip_code, "", "", ""])
         lookup_map.append((n, first_name, last_name))
 
@@ -1423,7 +1457,8 @@ def _lookup_dm_address(
     # Tier 2: Direct people search URLs + Firecrawl + LLM
     import config as cfg
     sf_result = _lookup_dm_address_serper_firecrawl(
-        name, city or "Knoxville", api_key
+        name, city or "Knoxville", api_key,
+        state_full=state_full, state_code=state_code,
     )
     if sf_result and sf_result.get("street"):
         result.update(sf_result)
@@ -2250,7 +2285,7 @@ def enrich_obituary_data(
             skipped += 1
             continue
 
-        city = notice.city.strip() or "Knoxville"
+        city = notice.city.strip() or _default_city_for_county(notice.county)
         state_full = _state_full_name(notice.state)
         state_code = (notice.state or "TN").strip().upper() or "TN"
         found = False
@@ -2501,7 +2536,7 @@ def enrich_obituary_data(
                             continue
 
                         search_name = names[0]
-                        city = notice.city.strip() or "Knoxville"
+                        city = notice.city.strip() or _default_city_for_county(notice.county)
                         state_full = _state_full_name(notice.state)
                         state_code = (notice.state or "TN").strip().upper() or "TN"
 
@@ -2532,7 +2567,7 @@ def enrich_obituary_data(
                     # Enrich Ancestry hits with DuckDuckGo obituary text for heir extraction
                     for notice, raw_name, is_tax_name, result in ancestry_match_data:
                         confirmed_name = result.get("full_name", "")
-                        city = notice.city.strip() or "Knoxville"
+                        city = notice.city.strip() or _default_city_for_county(notice.county)
                         state_full = _state_full_name(notice.state)
                         state_code = (notice.state or "TN").strip().upper() or "TN"
                         source_url = result.get("source_url", "")
@@ -2614,7 +2649,7 @@ def enrich_obituary_data(
                        "ddg_people_search": 0, "inline_tracerfy": 0, "batch_tracerfy": 0}
 
     for j, (notice, parsed, url, source_type, raw_name, is_tax_name) in enumerate(matches, 1):
-        city = notice.city.strip() or "Knoxville"
+        city = notice.city.strip() or _default_city_for_county(notice.county)
         state_full = _state_full_name(notice.state)
         state_code = (notice.state or "TN").strip().upper() or "TN"
         survivors = parsed.get("survivors", [])
@@ -2996,6 +3031,13 @@ def enrich_obituary_data(
                     "  [%d/%d] Looking up address for DM: %s (city hint: %s)",
                     j, len(matches), dm_name, dm_city_hint or "unknown",
                 )
+                # NOTE: previously force-enabled tracerfy_tier1 for probate,
+                # but Tracerfy's "instant" lookup endpoint REQUIRES an
+                # address as input (it's a verification API, not skip-trace).
+                # Probate PRs by definition don't have an input address —
+                # so Tier 0 returned 400 "address required" 100% of the
+                # time. The Tracerfy BATCH path at end of pipeline handles
+                # name-only lookups correctly (used for foreclosure runs).
                 addr = _lookup_dm_address(dm_name, dm_city_hint, api_key,
                                           tracerfy_tier1=tracerfy_tier1,
                                           state_full=state_full,

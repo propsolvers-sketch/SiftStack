@@ -44,10 +44,22 @@ Extract the following fields from this probate "Notice to Creditors" published i
 Return ONLY a JSON object with these exact keys:
 - "decedent_name": the deceased person's full name (from "Estate of [NAME]"). Use ALL CAPS as written.
 - "owner_name": the Personal Representative, Executor, or Administrator name. This is the person appointed to manage the estate. Use ALL CAPS as written. Do NOT include their title (e.g. drop "Administratrix", "Co-Administrator", "Executor").
-- "owner_street": the PR/Executor's mailing street address (e.g. "2004 Shangri-La Drive"). This is where creditors send claims.
-- "owner_city": the city of the PR's mailing address
-- "owner_state": the state of the PR's mailing address (usually "AL")
-- "owner_zip": the 5-digit zip code of the PR's mailing address
+
+For the mailing address fields below, follow this priority order:
+  1. If the notice gives the PR's OWN mailing address (their home or PO box), use it.
+  2. OTHERWISE, if the notice gives an attorney's address (often "Attorney for the
+     Executor" or "Attorney for Personal Representative"), use the ATTORNEY's address.
+     The attorney is the legal designee for service in the probate proceeding —
+     creditors mail there, and so do we. This is the operative deliverable address
+     for AL Jefferson/Madison probates which rarely include the PR's home address.
+  3. If neither is given, leave these empty.
+- "owner_street": street address per priority above (e.g. "2004 Shangri-La Drive" or "PO Box 489")
+- "owner_city": city per priority above
+- "owner_state": state per priority above (usually "AL")
+- "owner_zip": 5-digit zip per priority above
+- "owner_address_source": "pr" if you used the PR's address, "attorney" if you used the attorney's. Empty if neither.
+
+- "attorney_name": the attorney's name from the notice signature block, if present (e.g. "Allen C. Jones", "Jacob J. Key, Esq."). Drop "Esq." but keep middle initials. Empty if no attorney named.
 - "case_number": the probate case number (e.g. "PC2025-234", "PR-2026-000557", "2026-00053"). Found near "Case No.", "CASE NO:", "CASE NUMBER", or "Case#".
 - "judge_name": the Judge of Probate's full name (e.g. "Tammy Brown", "James P. Naftel"). Found near "Honorable", "Hon.", or "Judge of Probate". Drop the title.
 - "granted_date": the date Letters Testamentary or Letters of Administration were granted, in YYYY-MM-DD format. Found near "having been granted ... on the X day of MONTH, YYYY" or "granted ... on MONTH X, YYYY". This is NOT the publication date.
@@ -143,6 +155,11 @@ _PROBATE_KEYS = {
     "decedent_name", "owner_name", "owner_street", "owner_city",
     "owner_state", "owner_zip", "address", "city", "state", "zip",
     "case_number", "judge_name", "granted_date",
+    # Note: "owner_address_source" and "attorney_name" are optional
+    # bonus fields populated by the prompt's attorney-fallback logic.
+    # NOT in expected because the LLM may omit them on notices that
+    # lack an attorney signature block — making them required would
+    # cause the whole extract to be rejected.
 }
 _EVICTION_KEYS = {
     "owner_name", "address", "city", "state", "zip",

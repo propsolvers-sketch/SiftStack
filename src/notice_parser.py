@@ -658,6 +658,14 @@ _INVALID_NAMES = {
     "all persons", "unknown heirs", "you in the", "you and",
     "the cause", "the following", "the undersigned",
     "executed a deed", "executed a d", "default having",
+    # AL probate-notice boilerplate the LLM/regex sometimes captures as a
+    # PR/owner name. These are role descriptors or sentence fragments,
+    # never real person names.
+    "for the estate", "of the estate", "of the state",
+    "under the will", "personal representative", "executor of",
+    "administrator of", "executrix of", "administratrix of",
+    "co-personal representative", "barred", "having been",
+    "to be barred", "letters testamentary",
 }
 
 
@@ -913,6 +921,10 @@ async def is_target_county_async(
     """County check with LLM tiebreaker for ambiguous regex results.
 
     Decision tree:
+      0. Notice text is too short (failed CAPTCHA / failed PDF extract /
+         placeholder page) → REJECT immediately. Empty text would otherwise
+         trigger the benefit-of-doubt path and waste downstream pipeline
+         work on records that have no parseable content.
       1. Regex finds exactly ONE county that's in target → KEEP (no LLM)
       2. Regex finds exactly ONE county not in target → REJECT (no LLM)
       3. Regex finds ZERO counties → ask LLM (if api_key available)
@@ -924,6 +936,20 @@ async def is_target_county_async(
     notices with ambiguous county signals — typically <10% of probate
     notices, even less for foreclosure.
     """
+    # Step 0: bail out if there's no real content to evaluate. AL probate
+    # notices that survive the captcha but fail the embedded-PDF text
+    # extraction return < 200 chars of placeholder text ("Back / Please
+    # view the PDF for the complete Public Notice."). Without this guard,
+    # the benefit-of-doubt rule keeps them as Jefferson — they then waste
+    # downstream LLM/Tracerfy/validation cost only to be rejected.
+    if not text or len(text.strip()) < 200:
+        logger.debug(
+            "Notice text too short (%d chars) — rejecting (likely failed "
+            "CAPTCHA/PDF extraction)",
+            len(text.strip()) if text else 0,
+        )
+        return False
+
     mentioned_counties = _detect_counties_via_regex(text)
 
     # Confident single-match cases — no LLM needed
@@ -1143,11 +1169,17 @@ async def parse_notice_page(
         if notice_type == "probate":
             # Probate: fill decedent name, PR name, and PR mailing address
             if not notice.decedent_name and llm_result.get("decedent_name"):
-                notice.decedent_name = llm_result["decedent_name"]
-                logger.info("LLM filled decedent: %s", notice.decedent_name)
+                cand = llm_result["decedent_name"].strip()
+                if _is_valid_name(cand):
+                    notice.decedent_name = cand
+                    logger.info("LLM filled decedent: %s", notice.decedent_name)
             if not notice.owner_name and llm_result.get("owner_name"):
-                notice.owner_name = llm_result["owner_name"]
-                logger.info("LLM filled PR: %s", notice.owner_name)
+                cand = llm_result["owner_name"].strip()
+                if _is_valid_name(cand):
+                    notice.owner_name = cand
+                    logger.info("LLM filled PR: %s", notice.owner_name)
+                else:
+                    logger.debug("LLM PR rejected as junk: %r", cand)
             if not notice.owner_street and llm_result.get("owner_street"):
                 notice.owner_street = llm_result["owner_street"]
                 notice.owner_city = llm_result.get("owner_city") or notice.owner_city
@@ -1171,8 +1203,12 @@ async def parse_notice_page(
                 notice.zip = llm_result.get("zip") or notice.zip
                 logger.info("LLM filled address: %s", notice.address)
             if not notice.owner_name and llm_result.get("owner_name"):
-                notice.owner_name = llm_result["owner_name"]
-                logger.info("LLM filled owner: %s", notice.owner_name)
+                cand = llm_result["owner_name"].strip()
+                if _is_valid_name(cand):
+                    notice.owner_name = cand
+                    logger.info("LLM filled owner: %s", notice.owner_name)
+                else:
+                    logger.debug("LLM owner rejected as junk: %r", cand)
             if not notice.auction_date and llm_result.get("auction_date"):
                 notice.auction_date = llm_result["auction_date"]
                 logger.info("LLM filled auction_date: %s", notice.auction_date)

@@ -254,11 +254,15 @@ def _validate_records(notices: list[NoticeData]) -> list[NoticeData]:
         issues = []
 
         if n.notice_type in _NO_PROPERTY_ADDRESS_TYPES:
-            # Probate / divorce: contact value comes from the PR / petitioner
-            # mailing address when the property locator can't match. Validate
-            # that we have ONE workable contact path — either the property
-            # address (locator hit) or the PR mailing address — plus an
-            # owner_name. Without any of those, the record is unmailable.
+            # Probate / divorce: contact value comes from one of three paths:
+            #   (a) the decedent's property address (locator hit), or
+            #   (b) the PR / petitioner mailing address from the notice text, or
+            #   (c) a decision-maker mailing address discovered via skip-trace
+            #       / people-search (decision_maker_street/zip — populated by
+            #       _lookup_dm_address in obituary_enricher).
+            # AL Jefferson + Madison probate notices typically don't include
+            # the PR mailing address inline (path b is empty), so path c is
+            # the dominant path for those counties when the locator misses.
             has_property = bool(
                 n.address.strip() and n.city.strip() and n.zip.strip()
                 and not _GARBAGE_RE.match(n.address)
@@ -266,8 +270,14 @@ def _validate_records(notices: list[NoticeData]) -> list[NoticeData]:
             has_pr_mailing = bool(
                 n.owner_street.strip() and n.owner_zip.strip()
             )
-            if not (has_property or has_pr_mailing):
-                issues.append("missing both property address and PR mailing address")
+            has_dm_mailing = bool(
+                n.decision_maker_street.strip() and n.decision_maker_zip.strip()
+            )
+            if not (has_property or has_pr_mailing or has_dm_mailing):
+                issues.append(
+                    "missing all three of property address, PR mailing address, "
+                    "and DM-lookup mailing address"
+                )
             if not n.owner_name.strip():
                 issues.append("missing owner_name")
         else:
