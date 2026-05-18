@@ -279,16 +279,23 @@ def search_by_owner_name(
     if year is None:
         year = current_al_tax_year()
 
-    # Jefferson's MigratedOwners field uses a DOUBLE space between surname and
-    # given name(s) (e.g. "SMITH  OPAL W"). The API prefix-matches literally,
-    # so a single-spaced multi-token query returns 0 results. Normalize by
-    # inserting the second space after the first token if the caller hasn't.
+    # Jefferson's MigratedOwners field is INCONSISTENT: some parcels use a
+    # double space between surname and given name(s) (e.g. "SMITH  OPAL W")
+    # while others use single space (e.g. "LANEY HARVEY JACK & ..."). The API
+    # prefix-matches literally, so we have to try both. Try double-space first
+    # (preserves coverage for SMITH-style records) and fall back to single-space
+    # when nothing matches.
     cleaned = " ".join(name.strip().upper().split())
     parts = cleaned.split(" ", 1)
-    query = cleaned if len(parts) == 1 else f"{parts[0]}  {parts[1]}"
 
     with _new_client() as client:
-        rows = _post_search(client, query, _SEARCH_TYPE_OWNER, year)
+        if len(parts) == 1:
+            rows = _post_search(client, cleaned, _SEARCH_TYPE_OWNER, year)
+        else:
+            double = f"{parts[0]}  {parts[1]}"
+            rows = _post_search(client, double, _SEARCH_TYPE_OWNER, year)
+            if not rows:
+                rows = _post_search(client, cleaned, _SEARCH_TYPE_OWNER, year)
 
     return list(_iter_records(rows))
 

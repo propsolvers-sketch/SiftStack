@@ -8,8 +8,10 @@ DataSift has no public REST API, so we automate the web UI:
 Requires: DATASIFT_EMAIL and DATASIFT_PASSWORD in .env or environment.
 """
 
+import csv
 import logging
 import os
+import re
 from pathlib import Path
 
 import config
@@ -25,6 +27,44 @@ from datasift_core import (
 logger = logging.getLogger(__name__)
 
 DATASIFT_UPLOAD_URL = "https://app.reisift.io/records/properties"
+
+_COUNT_RE = re.compile(r"(\d[\d,]*)")
+
+
+def _count_csv_rows(csv_path: Path) -> int:
+    """Count data rows in a CSV (excludes header). Returns 0 on read error.
+
+    Respects embedded newlines inside quoted fields, so it stays accurate even
+    when address or notes columns contain literal line breaks.
+    """
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            try:
+                next(reader)
+            except StopIteration:
+                return 0
+            return sum(1 for _ in reader)
+    except Exception as e:
+        logger.warning("Could not count CSV rows for %s: %s", csv_path, e)
+        return 0
+
+
+def _extract_count(text: str | None) -> int | None:
+    """Pull the first integer out of a DataSift success toast.
+
+    Toast strings look like 'Successfully imported 103 records' or '103 records
+    added'. Returns None if no digits are found.
+    """
+    if not text:
+        return None
+    m = _COUNT_RE.search(text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
 
 
 async def _click_next_step(page: Page, timeout: int = 20000) -> bool:
@@ -89,6 +129,8 @@ async def upload_csv(
         result["message"] = f"CSV file not found: {csv_path}"
         logger.error(result["message"])
         return result
+
+    result["records_uploaded"] = _count_csv_rows(csv_path)
 
     # ── Step 1: Click "Upload File" in sidebar ──
     logger.info("Step 1: Clicking Upload File...")
@@ -503,6 +545,9 @@ async def upload_csv(
         success_text = await success_indicator.first.text_content()
         result["success"] = True
         result["message"] = success_text or "Upload completed"
+        parsed = _extract_count(success_text)
+        if parsed is not None:
+            result["records_uploaded"] = parsed
         logger.info("DataSift upload complete: %s", result["message"])
     except PwTimeout:
         await _screenshot(page, "step5_timeout")
@@ -1190,6 +1235,163 @@ async def upload_datasift_split(
 
         finally:
             await browser.close()
+
+
+async def upload_to_datasift_per_distressor(
+    csv_path: Path,
+    email: str | None = None,
+    password: str | None = None,
+    headless: bool = True,
+    enrich: bool = True,
+    skip_trace: bool = True,
+    tmp_dir: Path | None = None,
+) -> dict:
+    """Canonical DataSift upload: split CSV by notice_type, upload each subset to
+    its existing distressor list (no SiftStack wrapper list).
+
+    Splits csv_path into one temp CSV per distinct ``Notice Type`` value, then
+    uploads each subset using ``existing_list=True`` with the list name resolved
+    from ``NOTICE_TYPE_TO_LIST``. Enrich + skip-trace run once at the end against
+    the first list seen (the per-list filter would only pick up that one subset
+    cleanly — multi-list enrich on a mixed batch requires a separate UI flow we
+    haven't built).
+
+    Args:
+        csv_path: Path to a DataSift-formatted CSV with a populated ``Notice
+            Type`` column.
+        email / password: DataSift creds. Default to env vars.
+        headless: Playwright launch flag.
+        enrich: Run enrichment after upload.
+        skip_trace: Run skip-trace after upload.
+        tmp_dir: Override the temp dir for split CSVs (test convenience).
+
+    Returns:
+        Dict with ``success``, ``message``, ``uploads`` (one per distressor),
+        ``enrich_result``, ``skip_trace_result``, ``skipped_unmapped`` (any rows
+        whose notice_type wasn't in NOTICE_TYPE_TO_LIST).
+    """
+    from datasift_formatter import NOTICE_TYPE_TO_LIST
+
+    email = email or os.environ.get("DATASIFT_EMAIL", "")
+    password = password or os.environ.get("DATASIFT_PASSWORD", "")
+    if not email or not password:
+        return {
+            "success": False,
+            "message": "DATASIFT_EMAIL and DATASIFT_PASSWORD must be set",
+            "uploads": [],
+        }
+
+    if not csv_path.exists():
+        return {
+            "success": False,
+            "message": f"CSV not found: {csv_path}",
+            "uploads": [],
+        }
+
+    # Split rows by Notice Type
+    from collections import defaultdict
+    from tempfile import mkdtemp
+    if tmp_dir is None:
+        tmp_dir = Path(mkdtemp(prefix="siftstack_split_"))
+    else:
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        groups: dict[str, list[dict]] = defaultdict(list)
+        for row in reader:
+            nt = (row.get("Notice Type") or "").strip()
+            groups[nt].append(row)
+
+    splits: list[dict] = []
+    skipped_unmapped: dict[str, int] = {}
+    for nt, rows in groups.items():
+        list_name = NOTICE_TYPE_TO_LIST.get(nt)
+        if not list_name:
+            skipped_unmapped[nt or "(blank)"] = len(rows)
+            logger.warning(
+                "No NOTICE_TYPE_TO_LIST mapping for notice_type=%r — skipping %d rows",
+                nt, len(rows),
+            )
+            continue
+        out_path = tmp_dir / f"split_{nt}_{csv_path.stem}.csv"
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        splits.append({
+            "notice_type": nt,
+            "list_name": list_name,
+            "path": out_path,
+            "row_count": len(rows),
+        })
+
+    if not splits:
+        return {
+            "success": False,
+            "message": "No upload-eligible splits produced (no rows matched NOTICE_TYPE_TO_LIST)",
+            "uploads": [],
+            "skipped_unmapped": skipped_unmapped,
+        }
+
+    uploads: list[dict] = []
+    enrich_result: dict = {}
+    skip_result: dict = {}
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 720},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        )
+        page = await context.new_page()
+        try:
+            if not await login(page, email, password):
+                return {
+                    "success": False,
+                    "message": "DataSift login failed",
+                    "uploads": [],
+                    "skipped_unmapped": skipped_unmapped,
+                }
+
+            for i, split in enumerate(splits):
+                logger.info(
+                    "Uploading split %d/%d: %d rows → list %r",
+                    i + 1, len(splits), split["row_count"], split["list_name"],
+                )
+                r = await upload_csv(
+                    page,
+                    split["path"],
+                    list_name=split["list_name"],
+                    existing_list=True,
+                )
+                r["notice_type"] = split["notice_type"]
+                r["list_name"] = split["list_name"]
+                uploads.append(r)
+                if i < len(splits) - 1:
+                    await page.wait_for_timeout(10000)
+
+            if enrich:
+                enrich_result = await enrich_records(page, splits[0]["list_name"])
+            if skip_trace:
+                skip_result = await skip_trace_records(page, splits[0]["list_name"])
+        finally:
+            await browser.close()
+
+    all_ok = all(u.get("success", False) for u in uploads)
+    return {
+        "success": all_ok,
+        "message": f"Uploaded {sum(1 for u in uploads if u.get('success'))}/{len(uploads)} splits",
+        "uploads": uploads,
+        "enrich_result": enrich_result,
+        "skip_trace_result": skip_result,
+        "skipped_unmapped": skipped_unmapped,
+    }
 
 
 # ── Phone Tag Export & Upload ────────────────────────────────────────────

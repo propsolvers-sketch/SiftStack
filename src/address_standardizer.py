@@ -33,7 +33,13 @@ def _build_client(auth_id: str, auth_token: str):
 
 
 def _build_lastline(notice: NoticeData) -> str:
-    """Build a 'city, state zip' lastline string from notice fields."""
+    """Build a 'city, state zip' lastline string from notice fields.
+
+    Fallback: when the notice has no city/state/zip, return the state if
+    known (AL for new Jefferson/Madison/Marshall pipelines, TN for legacy
+    Knox/Blount). Default to AL since the active SiftStack pipelines are
+    all in Alabama as of 2026-05.
+    """
     parts = []
     if notice.city:
         parts.append(notice.city)
@@ -42,7 +48,11 @@ def _build_lastline(notice: NoticeData) -> str:
     lastline = ", ".join(parts)
     if notice.zip:
         lastline += " " + notice.zip if lastline else notice.zip
-    return lastline or "TN"
+    if lastline:
+        return lastline
+    # No city/state/zip — fall back to the notice's state if set,
+    # otherwise AL (active pipelines) instead of TN (legacy).
+    return (notice.state or "").strip() or "AL"
 
 
 def standardize_addresses(
@@ -125,12 +135,25 @@ def standardize_addresses(
             metadata = candidate.metadata
             analysis = candidate.analysis
 
-            # Safety: reject non-TN results (bad match on out-of-state address)
-            if components and components.state_abbreviation and components.state_abbreviation != "TN":
+            # Safety: reject results outside the notice's claimed state
+            # (catches Smarty fuzzy-matching to a same-street-name address
+            # in the wrong state). Use the notice's `state` field — TN for
+            # Knox/Blount, AL for Jefferson/Madison/Marshall. Falls back to
+            # accepting AL+TN when the notice has no state set yet (early
+            # pipeline stages may leave it empty).
+            expected_states = {(notice.state or "").strip().upper()} - {""}
+            if not expected_states:
+                expected_states = {"TN", "AL"}
+            if (
+                components
+                and components.state_abbreviation
+                and components.state_abbreviation not in expected_states
+            ):
                 logger.warning(
-                    "Smarty returned %s for '%s' -- keeping original",
+                    "Smarty returned %s for '%s' (expected %s) -- keeping original",
                     components.state_abbreviation,
                     notice.address,
+                    sorted(expected_states),
                 )
                 failed += 1
                 continue
@@ -318,7 +341,18 @@ def retry_with_geocoded_city(
             metadata = candidate.metadata
             analysis = candidate.analysis
 
-            if components and components.state_abbreviation and components.state_abbreviation != "TN":
+            # Reject Smarty matches that resolve to a state OTHER than the
+            # notice's claimed state. Mirrors the same guard in
+            # standardize_addresses() — without this, Smarty fuzzy-matching
+            # can return an out-of-state same-street-name address.
+            expected_states = {(notice.state or "").strip().upper()} - {""}
+            if not expected_states:
+                expected_states = {"TN", "AL"}
+            if (
+                components
+                and components.state_abbreviation
+                and components.state_abbreviation not in expected_states
+            ):
                 failed += 1
                 continue
 

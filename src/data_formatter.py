@@ -96,6 +96,40 @@ SIFT_COLUMNS = [
     "source_url",
     # Pipeline metadata
     "run_id",
+    # Final-pass probate columns (per AL probate-export schema)
+    "S No",
+    "received_date",
+    "case_number",
+    "judge_name",
+    "granted_date",
+    "creditor_deadline",
+    "notice_subtype",
+    "petition_filed_date",
+    "hearing_date",
+    "co_pr_names",
+    "heirs_named_in_notice",
+    "estate_purpose",
+    "sale_type",
+    "owner_first_name",
+    "owner_middle_name",
+    "owner_last_name",
+    "owner_suffix",
+    "decedent_first_name",
+    "decedent_middle_name",
+    "decedent_last_name",
+    "decedent_suffix",
+    "secondary_addresses",
+    "total_estate_value",
+    "is_homestead",
+    "assessed_value",
+    "property_use",
+    "municipality",
+    "survivor_zip",
+    # Foreclosure-only party fields
+    "mortgage_company",
+    "original_lender",
+    "trustee",
+    "trustee_file_number",
 ]
 
 
@@ -131,8 +165,13 @@ def _split_name(full_name: str) -> tuple[str, str]:
 def _notice_id_from_url(url: str) -> str:
     """Extract the numeric notice ID from a source URL.
 
-    URLs look like: .../Details.aspx?SID=...&ID=509975
-    Returns the ID value, or empty string if not found.
+    Both Alabama (DetailsPrint.aspx?SID={session}&ID={notice_id}) and
+    Tennessee (Details.aspx?SID={session}&ID={notice_id}) put the numeric
+    notice ID in the &ID= parameter. SID is an alphanumeric session token —
+    NOT the notice ID. The earlier "SID=(\\d+)" path silently collided
+    notices whenever session GUIDs happened to share a leading digit (one
+    real run had all 4 records collapsed to nid="0" because they shared
+    SID="0irs1fi0...").
     """
     import re
     m = re.search(r"[?&]ID=(\d+)", url)
@@ -212,9 +251,10 @@ def write_csv(notices: list[NoticeData], filename: str | None = None) -> Path:
         writer = csv.DictWriter(f, fieldnames=SIFT_COLUMNS)
         writer.writeheader()
 
-        for notice in notices:
+        for idx, notice in enumerate(notices, start=1):
             first, last = _split_name(notice.owner_name)
             row = {
+                "S No": idx,
                 "full_name": notice.owner_name,
                 "address": notice.address,
                 "city": notice.city,
@@ -289,6 +329,38 @@ def write_csv(notices: list[NoticeData], filename: str | None = None) -> Path:
                 "entity_research_confidence": notice.entity_research_confidence,
                 "source_url": notice.source_url,
                 "run_id": notice.run_id,
+                # Final-pass probate columns
+                "received_date": _format_date_sift(notice.received_date),
+                "case_number": notice.case_number,
+                "judge_name": notice.judge_name,
+                "granted_date": _format_date_sift(notice.granted_date),
+                "creditor_deadline": _format_date_sift(notice.creditor_deadline),
+                "notice_subtype": notice.notice_subtype,
+                "petition_filed_date": _format_date_sift(notice.petition_filed_date),
+                "hearing_date": _format_date_sift(notice.hearing_date),
+                "co_pr_names": notice.co_pr_names,
+                "heirs_named_in_notice": notice.heirs_named_in_notice,
+                "estate_purpose": notice.estate_purpose,
+                "sale_type": notice.sale_type,
+                "owner_first_name": notice.owner_first_name,
+                "owner_middle_name": notice.owner_middle_name,
+                "owner_last_name": notice.owner_last_name,
+                "owner_suffix": notice.owner_suffix,
+                "decedent_first_name": notice.decedent_first_name,
+                "decedent_middle_name": notice.decedent_middle_name,
+                "decedent_last_name": notice.decedent_last_name,
+                "decedent_suffix": notice.decedent_suffix,
+                "secondary_addresses": notice.secondary_addresses,
+                "total_estate_value": notice.total_estate_value,
+                "is_homestead": notice.is_homestead,
+                "assessed_value": notice.assessed_value,
+                "property_use": notice.property_use,
+                "municipality": notice.municipality,
+                "survivor_zip": notice.survivor_zip,
+                "mortgage_company": notice.mortgage_company,
+                "original_lender": notice.original_lender,
+                "trustee": notice.trustee,
+                "trustee_file_number": notice.trustee_file_number,
             }
             writer.writerow(row)
             written += 1

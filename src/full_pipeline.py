@@ -190,19 +190,41 @@ def run_full_pipeline(
     elif not opts.skip_tracerfy and not cfg.TRACERFY_API_KEY:
         logger.info("Tracerfy skipped — TRACERFY_API_KEY not configured")
 
-    # ── Step 3: Trestle phone scoring (DP candidates only) ────────
+    # DP candidates kept for downstream report generator only (it generates
+    # deep-prospecting PDFs for deceased / heir / DM records specifically).
     dp_candidates = [
         n for n in notices
         if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
     ]
-    if dp_candidates and cfg.TRESTLE_API_KEY:
+
+    # ── Step 3: Trestle phone scoring (ALL records with phones) ───
+    # Previously restricted to DP candidates only, which left living-owner
+    # foreclosures (the bulk of every sweep) unscored. Score every record
+    # that has at least one phone field populated so DataSift filter presets
+    # can dial-prioritize across the full sweep. Litigator screening is on
+    # by default for TCPA risk protection (~$0.005-0.01/phone add-on cost).
+    phone_candidates = [
+        n for n in notices
+        if any(
+            (getattr(n, attr, "") or "").strip()
+            for attr in (
+                "primary_phone", "mobile_1", "mobile_2", "mobile_3", "mobile_4",
+                "mobile_5", "landline_1", "landline_2", "landline_3",
+            )
+        )
+    ]
+    if phone_candidates and cfg.TRESTLE_API_KEY:
         try:
             from phone_validator import score_record_phones
-            tiers = score_record_phones(dp_candidates, cfg.TRESTLE_API_KEY)
+            tiers = score_record_phones(
+                phone_candidates,
+                cfg.TRESTLE_API_KEY,
+                add_litigator=True,
+            )
             result.phone_tiers = tiers
             logger.info(
-                "Trestle scored %d unique phones across %d DP records",
-                len(tiers), len(dp_candidates),
+                "Trestle scored %d unique phones across %d records (litigator-check ON)",
+                len(tiers), len(phone_candidates),
             )
         except Exception as e:
             logger.warning("Per-record Trestle scoring failed: %s — continuing", e)
@@ -233,7 +255,9 @@ def run_full_pipeline(
     if not opts.skip_datasift_csv:
         try:
             from datasift_formatter import write_datasift_split_csvs
-            csv_infos = write_datasift_split_csvs(notices)
+            csv_infos = write_datasift_split_csvs(
+                notices, phone_tiers=result.phone_tiers,
+            )
             result.datasift_csv_infos = csv_infos
             for info in csv_infos:
                 logger.info("DataSift CSV (%s): %s", info.get("label", "?"), info.get("path", "?"))

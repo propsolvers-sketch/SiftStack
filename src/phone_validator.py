@@ -440,10 +440,20 @@ def score_record_phones(
                     continue
                 score = data.get("activity_score")
                 line_type = data.get("line_type")
+                # Trestle returns litigator flag under
+                # add_ons.litigator_checks["phone.is_litigator_risk"]. Surface
+                # it as a flat field so downstream consumers (datasift_formatter
+                # _phone_tier_tags) don't need to parse the add_ons subtree.
+                litigator = False
+                add_ons = data.get("add_ons") or {}
+                lit_block = add_ons.get("litigator_checks") or {}
+                if isinstance(lit_block, dict):
+                    litigator = bool(lit_block.get("phone.is_litigator_risk"))
                 results[ph] = {
                     "score": score,
                     "tier": assign_tier(score, tiers),
                     "line_type": line_type,
+                    "is_litigator_risk": litigator,
                 }
         if batch_start + batch_size < len(phones) and delay > 0:
             time.sleep(delay)

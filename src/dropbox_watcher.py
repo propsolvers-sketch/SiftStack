@@ -335,17 +335,26 @@ def run_watcher(
                             try:
                                 import asyncio as _asyncio
                                 from datasift_formatter import write_datasift_split_csvs
-                                from datasift_uploader import upload_datasift_split, upload_to_datasift
+                                from datasift_uploader import upload_to_datasift_per_distressor
 
                                 csv_infos = write_datasift_split_csvs(notices)
-                                if len(csv_infos) > 1:
-                                    upload_result = _asyncio.run(
-                                        upload_datasift_split(csv_infos, enrich=True, skip_trace=True)
+                                per_csv = []
+                                for info in csv_infos:
+                                    r = _asyncio.run(
+                                        upload_to_datasift_per_distressor(
+                                            info["path"], enrich=True, skip_trace=True,
+                                        )
                                     )
-                                else:
-                                    upload_result = _asyncio.run(
-                                        upload_to_datasift(csv_infos[0]["path"], enrich=True, skip_trace=True)
-                                    )
+                                    r["label"] = info["label"]
+                                    per_csv.append(r)
+                                all_ok = all(r.get("success") for r in per_csv)
+                                upload_result = {
+                                    "success": all_ok,
+                                    "message": "; ".join(
+                                        f"{r['label']}: {r.get('message', '')}" for r in per_csv
+                                    ),
+                                    "csvs": per_csv,
+                                }
                                 if upload_result.get("success"):
                                     logger.info("DataSift upload: %s", upload_result.get("message", "OK"))
                                 else:

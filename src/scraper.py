@@ -1,11 +1,10 @@
-"""Core scraping logic — login, navigate saved searches, paginate results."""
+"""Core scraping logic — submit search form, paginate results, solve CAPTCHA."""
 
 import asyncio
 import logging
 import random
 import re
 from datetime import datetime, timedelta
-from pathlib import Path
 
 from playwright.async_api import Page, TimeoutError as PwTimeout, async_playwright
 
@@ -13,32 +12,35 @@ from captcha_solver import solve_captcha_and_view
 import config
 from config import (
     BASE_URL,
-    COOKIES_FILE,
-    LOGIN_URL,
+    CAPTCHA_FAILED_IDS_FILE,
+    CAPTCHA_FAILED_PRUNE_DAYS,
     MAX_RETRIES,
     REQUEST_DELAY_MAX,
     REQUEST_DELAY_MIN,
     RESULTS_PER_PAGE,
     SAVED_SEARCHES,
+    SEARCH_URL,
     SEEN_IDS_FILE,
     SEEN_IDS_PRUNE_DAYS,
-    CAPTCHA_FAILED_IDS_FILE,
-    CAPTCHA_FAILED_PRUNE_DAYS,
-    SMART_SEARCH_URL,
     STATE_FILE,
-    SavedSearch,
-    SEL_LOGIN_EMAIL,
-    SEL_LOGIN_PASSWORD,
-    SEL_LOGIN_SUBMIT,
+    SearchConfig,
     SEL_NEXT_PAGE_BUTTON,
-    SEL_PAGE_INFO,
     SEL_PER_PAGE_DROPDOWN,
-    SEL_SAVED_SEARCHES_DROPDOWN,
-    SEL_VIEW_BUTTON_PATTERN,
+    SEL_RESULTS_GRID,
+    SEL_SEARCH_DAYS,
+    SEL_SEARCH_EXCLUDE,
+    SEL_SEARCH_SUBMIT,
+    SEL_SEARCH_TEXT,
+    SEL_SEARCH_TYPE_AND,
+    SEL_SEARCH_TYPE_OR,
 )
-from data_formatter import _notice_id_from_url
 from foreclosure_filter import is_valid_foreclosure
-from notice_parser import NoticeData, is_target_county, parse_notice_page
+from notice_parser import (
+    NoticeData,
+    is_target_county_async,
+    parse_notice_page,
+    snippet_passes_county_filter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,578 +51,497 @@ async def delay() -> None:
     await asyncio.sleep(wait)
 
 
-# ── Login ─────────────────────────────────────────────────────────────
-
-
-async def login(page: Page, _retries: int = 3) -> bool:
-    """Log in to tnpublicnotice.com Smart Search. Returns True on success.
-
-    Retries up to ``_retries`` times on transient network errors (e.g. after
-    Apify container migration).
-    """
-    for attempt in range(1, _retries + 1):
-        try:
-            logger.info("Logging in to %s (attempt %d/%d)", LOGIN_URL, attempt, _retries)
-            await page.goto(LOGIN_URL)
-            await page.wait_for_load_state("networkidle")
-            break  # page loaded successfully
-        except Exception as exc:
-            logger.warning("Login navigation failed (attempt %d/%d): %s", attempt, _retries, exc)
-            if attempt < _retries:
-                await asyncio.sleep(5 * attempt)  # back off 5s, 10s
-                continue
-            logger.error("Login navigation failed after %d attempts — giving up", _retries)
-            return False
-
-    # No CAPTCHA on the login page (confirmed via research)
-    await page.fill(SEL_LOGIN_EMAIL, config.TNPN_EMAIL)
-    await page.fill(SEL_LOGIN_PASSWORD, config.TNPN_PASSWORD)
-    await page.click(SEL_LOGIN_SUBMIT)
-    await page.wait_for_load_state("networkidle")
-    await delay()
-
-    # Successful login redirects to /Smartsearch/Default.aspx
-    if "smartsearch" in page.url.lower():
-        logger.info("Login successful — on Smart Search dashboard")
-        return True
-
-    # Check for error message
-    error = await page.query_selector(".error, .validation-summary-errors")
-    if error:
-        msg = await error.inner_text()
-        logger.error("Login failed: %s", msg.strip())
-    else:
-        logger.error("Login failed — landed on %s", page.url)
-    return False
-
-
-# ── Saved Search Execution ────────────────────────────────────────────
+# ── Search Form ───────────────────────────────────────────────────────
 
 
 def _get_session_base(page_url: str) -> str:
-    """Extract the session-aware base URL from the current page URL.
-
-    ASP.NET embeds session IDs in URL paths: /(S({guid}))/
-    Returns the base URL including the session path segment.
-    """
-    m = re.search(r"(https?://[^/]+/\(S\([^)]+\)\)/)", page_url)
+    """Extract the session-aware base URL from the current page URL."""
+    m = re.search(r"(https?://[^/]+/(?:\(S\([^)]+\)\)/)?)", page_url)
     if m:
         return m.group(1)
     return BASE_URL + "/"
 
 
-async def _navigate_to_dashboard(page: Page) -> bool:
-    """Ensure we're on the Smart Search dashboard.
+async def _submit_search(page: Page, search: SearchConfig, days_back: int) -> bool:
+    """Navigate to Search.aspx, fill the form, and submit.
 
-    Returns True on success, False if session is dead and re-login is needed.
+    Returns True if results grid appeared, False on failure.
     """
-    if "smartsearch/default" not in page.url.lower():
-        session_base = _get_session_base(page.url)
-        dashboard_url = session_base + "Smartsearch/Default.aspx"
-        logger.info("Navigating to Smart Search dashboard: %s", dashboard_url)
-        try:
-            await page.goto(dashboard_url, wait_until="domcontentloaded", timeout=30_000)
-            await page.wait_for_load_state("networkidle", timeout=15_000)
-        except PwTimeout:
-            logger.warning("Dashboard navigation timed out")
-            return False
-        except Exception:
-            logger.warning("Dashboard navigation failed", exc_info=True)
-            return False
-        await delay()
-
-    # Session expired → ASP.NET redirected to authenticate page
-    if "authenticate" in page.url.lower():
-        logger.warning("Session expired — redirected to login page")
+    logger.info("Submitting search: %s [%s] last %d days", search.search_terms, search.search_type, days_back)
+    try:
+        await page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=30_000)
+    except Exception as exc:
+        logger.error("Could not load Search.aspx: %s", exc)
         return False
 
-    dropdown = await page.query_selector(SEL_SAVED_SEARCHES_DROPDOWN)
-    if not dropdown:
-        logger.error("Saved Searches dropdown not found on dashboard")
+    # Fill all fields via JS to avoid visibility/interception issues
+    type_id = SEL_SEARCH_TYPE_OR[1:] if search.search_type == "OR" else SEL_SEARCH_TYPE_AND[1:]
+    escaped = search.search_terms.replace("'", "\\'")
+    escaped_ex = search.exclude_terms.replace("'", "\\'")
+    await page.evaluate(f"""() => {{
+        document.getElementById('{SEL_SEARCH_TEXT[1:]}').value = '{escaped}';
+        document.getElementById('{type_id}').checked = true;
+        document.getElementById('{SEL_SEARCH_EXCLUDE[1:]}').value = '{escaped_ex}';
+        document.getElementById('{SEL_SEARCH_DAYS[1:]}').value = '{days_back}';
+    }}""")
+
+    try:
+        async with page.expect_navigation(wait_until="domcontentloaded", timeout=20_000):
+            await page.click(SEL_SEARCH_SUBMIT, force=True)
+    except PwTimeout:
+        logger.warning("Search submission navigation timed out — results may be in UpdatePanel")
+    await page.wait_for_timeout(2000)
+
+    # Verify results grid appeared (no grid = zero results, not an error)
+    grid = await page.query_selector(SEL_RESULTS_GRID)
+    if not grid:
+        logger.info("No results found for search: %s", search.search_terms)
         return False
+
     return True
 
 
 async def _set_per_page(page: Page) -> None:
-    """Set the results-per-page dropdown to max (50) if present."""
+    """Set results-per-page to 50 if dropdown is present."""
     dropdown = await page.query_selector(SEL_PER_PAGE_DROPDOWN)
     if dropdown:
         current = await dropdown.input_value()
         if current != str(RESULTS_PER_PAGE):
-            logger.info("Setting results per page to %d", RESULTS_PER_PAGE)
-            await page.select_option(SEL_PER_PAGE_DROPDOWN, str(RESULTS_PER_PAGE))
-            await page.wait_for_load_state("networkidle")
-            await delay()
-            await delay()  # extra wait — ASP.NET DOM rebuild after postback
+            await page.evaluate(
+                f"document.querySelector('select[name$=\"ddlPerPage\"]').value = '{RESULTS_PER_PAGE}'"
+            )
+            try:
+                async with page.expect_navigation(wait_until="domcontentloaded", timeout=15_000):
+                    await page.evaluate(
+                        "javascript:setTimeout('__doPostBack(\\'ctl00$ContentPlaceHolder1$WSExtendedGridNP1$GridView1$ctl01$ddlPerPage\\',\\'\\')', 0)"
+                    )
+            except PwTimeout:
+                pass
+            await page.wait_for_timeout(1500)
 
 
 async def _get_page_info(page: Page) -> tuple[int, int]:
-    """Parse 'Page X of Y Pages' text. Returns (current_page, total_pages)."""
+    """Parse 'X of Y Pages' from the results header. Returns (current, total)."""
     try:
-        info_el = await page.query_selector(SEL_PAGE_INFO)
-        if info_el:
-            text = await info_el.inner_text()
-            # "Page 1 of 100 Pages"
-            import re
-            m = re.search(r"Page\s+(\d+)\s+of\s+(\d+)", text)
-            if m:
-                return int(m.group(1)), int(m.group(2))
+        span = await page.query_selector("span[id$='lblCurrentPage']")
+        total_span = await page.query_selector("span[id$='lblTotalPages']")
+        if span and total_span:
+            cur = int((await span.inner_text()).strip())
+            total_text = (await total_span.inner_text()).strip()  # " of 9 Pages "
+            m = re.search(r"of\s+(\d+)", total_text)
+            total = int(m.group(1)) if m else cur
+            return cur, total
     except Exception:
         pass
     return 1, 1
 
 
-async def _extract_published_date(row_text: str) -> str:
-    """Pull the 'Published: M/D/YYYY' date from a result row's text."""
-    import re
-    m = re.search(r"Published:\s*(\d{1,2}/\d{1,2}/\d{4})", row_text)
-    if m:
-        try:
-            return datetime.strptime(m.group(1), "%m/%d/%Y").strftime("%Y-%m-%d")
-        except ValueError:
-            return m.group(1)
-    return ""
+async def _click_next_page(page: Page, current_page: int) -> bool:
+    """Click the AL site's "Next page" image-button and wait for the postback.
 
+    AL's pagination is an ASP.NET image button that fires __doPostBack — the
+    URL doesn't change. ``page.expect_navigation`` therefore times out forever
+    even though the grid does update. Instead we click and poll the
+    ``lblCurrentPage`` span until it shows a value different from
+    ``current_page``.
 
-async def run_saved_search(
-    page: Page,
-    search: SavedSearch,
-    since_date: str | None = None,
-    llm_api_key: str | None = None,
-    on_page_batch=None,
-    start_page: int = 1,
-    max_notices: int = 0,
-    seen_ids: dict[str, str] | None = None,
-    captcha_failed_ids: dict[str, dict] | None = None,
-) -> list[NoticeData]:
-    """Select a saved search from the dropdown, paginate, and scrape each notice.
-
-    Args:
-        on_page_batch: Optional async callback(list[NoticeData]) called after each page
-                       to push results incrementally.
-        start_page: Page number to start scraping from (default 1). Use this to
-                    resume a previous run without re-scraping earlier pages.
-
-    Returns list of parsed and filtered NoticeData.
+    Returns True if the page advanced, False on click error or timeout.
     """
-    logger.info("Running saved search: %s", search.saved_search_name)
-
-    # Navigate to dashboard and select the saved search from dropdown
-    if not await _navigate_to_dashboard(page):
-        # Try re-login once and retry
-        if await _try_relogin(page) and await _navigate_to_dashboard(page):
-            pass  # recovered — continue below
-        else:
-            return []
-
-    # Selecting from the dropdown triggers an ASP.NET postback → full page navigation.
-    # Must wait for navigation explicitly or the execution context gets destroyed.
+    next_btn = await page.query_selector(SEL_NEXT_PAGE_BUTTON)
+    if not next_btn:
+        return False
+    disabled = await next_btn.get_attribute("disabled")
+    if disabled:
+        return False
     try:
-        async with page.expect_navigation(wait_until="networkidle", timeout=30000):
-            await page.select_option(
-                SEL_SAVED_SEARCHES_DROPDOWN,
-                label=search.saved_search_name,
-            )
-    except Exception:
-        logger.error("Could not select '%s' from dropdown", search.saved_search_name)
-        return []
-
-    await delay()
-
-    # Verify we're on search results
-    if "search" not in page.url.lower():
-        logger.error("Expected Search.aspx but got %s", page.url)
-        return []
-
-    # Maximize results per page
-    await _set_per_page(page)
-
-    # Scrape all pages
-    notices: list[NoticeData] = []
-    current_page, total_pages = await _get_page_info(page)
-    logger.info("  %d pages of results for %s", total_pages, search.saved_search_name)
-
-    # Skip ahead to start_page if needed
-    if start_page > 1:
-        logger.info("  Skipping to page %d (start_page)", start_page)
-        while current_page < start_page:
-            next_btn = await page.query_selector(SEL_NEXT_PAGE_BUTTON)
-            if not next_btn:
-                logger.error("  Cannot reach page %d — no next button at page %d", start_page, current_page)
-                return []
-            await next_btn.click()
-            await page.wait_for_load_state("load")
-            await delay()
-            current_page, total_pages = await _get_page_info(page)
-        logger.info("  Reached page %d/%d", current_page, total_pages)
-
-    while True:
-        logger.info("  Scraping page %d/%d", current_page, total_pages)
-        page_notices = await _scrape_results_page(
-            page, search, since_date, llm_api_key, seen_ids, captcha_failed_ids,
+        await next_btn.click(timeout=5_000)
+        await page.wait_for_function(
+            "(prev) => { "
+            "const s = document.querySelector('span[id$=\"lblCurrentPage\"]'); "
+            "return s && s.innerText.trim() !== prev; "
+            "}",
+            arg=str(current_page),
+            timeout=15_000,
         )
-        notices.extend(page_notices)
+        return True
+    except Exception as e:
+        logger.debug("Next-page click failed: %s", e)
+        return False
 
-        # Push this page's results immediately so they survive timeouts
-        if on_page_batch and page_notices:
-            await on_page_batch(page_notices)
 
-        # Stop early if we've hit the max_notices limit
-        if max_notices and len(notices) >= max_notices:
-            logger.info("  Reached max_notices limit (%d) — stopping", max_notices)
-            notices = notices[:max_notices]
-            break
+async def _collect_notice_ids_on_page(page: Page) -> list[str]:
+    """Collect all numeric notice IDs from hdnPKValue hidden inputs on current page."""
+    return await page.evaluate("""() => {
+        return Array.from(document.querySelectorAll('input[id*="hdnPKValue"]'))
+            .map(el => el.value)
+            .filter(v => v && /^\\d+$/.test(v));
+    }""")
 
-        # Check if there's a next page
-        if current_page >= total_pages:
-            break
 
-        next_btn = await page.query_selector(SEL_NEXT_PAGE_BUTTON)
-        can_advance = next_btn and not await next_btn.get_attribute("disabled") if next_btn else False
-
-        if can_advance:
-            await next_btn.click()
-            await page.wait_for_load_state("load")
-            await delay()
-            await delay()
-            current_page, total_pages = await _get_page_info(page)
-        else:
-            # Grid lost or next button missing — attempt recovery to next page
-            if current_page < total_pages:
-                logger.warning(
-                    "  Grid lost on page %d/%d — attempting recovery",
-                    current_page, total_pages,
-                )
-                recovered = await _recover_to_search_page(
-                    page, search, current_page + 1,
-                )
-                if recovered:
-                    current_page, total_pages = await _get_page_info(page)
-                    continue
-                logger.error("  Recovery failed — stopping after page %d", current_page)
-            break
-
-    logger.info("  Found %d notices for %s", len(notices), search.saved_search_name)
-    return notices
+async def _extract_row_data(page: Page) -> list[dict]:
+    """Extract notice metadata from result rows (ID, publication date, snippet)."""
+    return await page.evaluate("""() => {
+        const grid = document.getElementById('ctl00_ContentPlaceHolder1_WSExtendedGridNP1_GridView1');
+        if (!grid) return [];
+        const results = [];
+        grid.querySelectorAll('td > table.nested').forEach(nested => {
+            const pk = nested.querySelector('input[id*="hdnPKValue"]');
+            const info = nested.querySelector('.info');
+            const textCell = nested.querySelector('td[colspan]');
+            if (!pk) return;
+            // Parse date from info text e.g. "Alabama Messenger | Monday, April 27, 2026 | County:"
+            const infoText = info ? info.innerText : '';
+            const dateMatch = infoText.match(/([A-Z][a-z]+day,\\s+[A-Z][a-z]+\\s+\\d+,\\s+\\d{4})/);
+            // Newspaper name is in .info .left strong
+            const pubEl = info ? info.querySelector('.left strong') : null;
+            const newspaper = pubEl ? pubEl.textContent.trim() : '';
+            // Detail URL query string from btnView2 onclick: "Details.aspx?SID=xxx&ID=yyy"
+            const viewBtn = nested.querySelector('input[id*="btnView2"]');
+            const onclick = viewBtn ? (viewBtn.getAttribute('onclick') || '') : '';
+            const detailMatch = onclick.match(/location\\.href='Details\\.aspx\\?([^']+)'/);
+            const detailQuery = detailMatch ? detailMatch[1] : '';
+            results.push({
+                notice_id: pk.value,
+                pub_date_raw: dateMatch ? dateMatch[1] : '',
+                snippet: textCell ? textCell.innerText.trim().substring(0, 2000) : '',
+                newspaper: newspaper,
+                detail_query: detailQuery,
+            });
+        });
+        return results;
+    }""")
 
 
 # ── Per-Page Scraping ─────────────────────────────────────────────────
 
 
-async def _scrape_results_page(
+async def _parse_date_raw(raw: str) -> str:
+    """Parse 'Monday, April 27, 2026' → '2026-04-27'."""
+    for fmt in ("%A, %B %d, %Y", "%B %d, %Y"):
+        try:
+            return datetime.strptime(raw.strip(), fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return ""
+
+
+def _notice_from_snippet(
+    row: dict,
+    search: SearchConfig,
+    session_base: str,
+    pub_date: str,
+) -> NoticeData:
+    """Build a NoticeData from search-results snippet text (no CAPTCHA needed).
+
+    Uses the snippet captured directly from the search results page.
+    regex/LLM parsing runs later in the enrichment pipeline; we just need
+    raw_text populated so filters can run and the parser has something to work with.
+    """
+    from notice_parser import _parse_address, _parse_name, _parse_auction_date
+
+    notice_id = row["notice_id"]
+    detail_q = row.get("detail_query") or f"SID={notice_id}"
+    notice = NoticeData(
+        county=search.county,
+        notice_type=search.notice_type,
+        # Pre-classified subtype (e.g. "unsafe_building" for code-violation
+        # condemnation searches). Empty string when the search doesn't pre-tag.
+        notice_subtype=getattr(search, "notice_subtype", "") or "",
+        source_url=f"{session_base}DetailsPrint.aspx?{detail_q}",
+        raw_text=row["snippet"],
+        state="AL",
+        date_added=pub_date,
+        received_date=datetime.now().strftime("%Y-%m-%d"),
+    )
+    _parse_address(notice)
+    _parse_name(notice)
+    if search.notice_type != "probate":
+        _parse_auction_date(notice)
+    return notice
+
+
+async def _scrape_notice(
     page: Page,
-    search: SavedSearch,
+    notice_id: str,
+    detail_query: str,
+    session_base: str,
+    search: SearchConfig,
+    pub_date: str,
     since_date: str | None,
-    llm_api_key: str | None = None,
-    seen_ids: dict[str, str] | None = None,
-    captcha_failed_ids: dict[str, dict] | None = None,
-) -> list[NoticeData]:
-    """Click each View button on a results page, solve CAPTCHA, parse notice."""
-    notices: list[NoticeData] = []
+    llm_api_key: str | None,
+    seen_ids: dict[str, str] | None,
+    captcha_failed_ids: dict[str, dict] | None,
+) -> NoticeData | None:
+    """Navigate to a single DetailsPrint.aspx, solve CAPTCHA, parse notice."""
+    # Date cutoff check
+    if since_date and pub_date and pub_date < since_date:
+        logger.debug("  Skipping old notice %s (%s < %s)", notice_id, pub_date, since_date)
+        return None
 
-    # Wait for view buttons to be stable in the DOM before interacting.
-    # SPA hydration over residential proxies can be slow — try 30s, then one
-    # recovery attempt (networkidle + re-query) before giving up. A silent
-    # empty return here is what caused the 2026-04-15 Blount miss.
-    try:
-        await page.wait_for_selector(SEL_VIEW_BUTTON_PATTERN, state="attached", timeout=30_000)
-    except PwTimeout:
-        logger.warning(
-            "  No view buttons for %s after 30s — waiting for networkidle and retrying",
-            search.saved_search_name,
-        )
+    # Cross-run dedup
+    if seen_ids is not None and notice_id in seen_ids:
+        logger.info("  Skipping already-processed notice ID=%s", notice_id)
+        return None
+
+    # Use the session-bearing query string captured from the results row onclick
+    query = detail_query if detail_query else f"SID={notice_id}"
+    detail_url = f"{session_base}DetailsPrint.aspx?{query}"
+
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            await page.wait_for_load_state("networkidle", timeout=15_000)
+            await page.goto(detail_url, wait_until="domcontentloaded", timeout=30_000)
+            await delay()
+
+            if not await solve_captcha_and_view(page):
+                logger.warning("  CAPTCHA solve failed for notice %s (attempt %d)", notice_id, attempt)
+                if attempt >= MAX_RETRIES and captcha_failed_ids is not None:
+                    captcha_failed_ids[notice_id] = {
+                        "url": detail_url,
+                        "search": search.search_terms,
+                        "county": search.county,
+                        "notice_type": search.notice_type,
+                        "pub_date": pub_date,
+                        "first_seen": datetime.now().strftime("%Y-%m-%d"),
+                    }
+                await delay()
+                continue
+
+            notice = await parse_notice_page(page, search.county, search.notice_type, llm_api_key)
+            notice.source_url = detail_url
+            if pub_date:
+                notice.date_added = pub_date
+            # Apply the search's pre-classified subtype (e.g. "unsafe_building"
+            # for code-violation searches) only when the parser hasn't already
+            # detected one. parse_notice_page auto-detects probate subtypes, so
+            # this only fires for code-violation / future search types.
+            search_subtype = getattr(search, "notice_subtype", "") or ""
+            if search_subtype and not notice.notice_subtype:
+                notice.notice_subtype = search_subtype
+
+            if seen_ids is not None:
+                seen_ids[notice_id] = notice.date_added or datetime.now().strftime("%Y-%m-%d")
+
+            if not is_valid_foreclosure(notice):
+                logger.debug("  Filtered out (not valid foreclosure): %s", notice_id)
+                return None
+            if not await is_target_county_async(
+                notice.raw_text, search.county, api_key=llm_api_key,
+            ):
+                logger.debug("  Filtered out (wrong county): %s", notice_id)
+                return None
+
+            logger.debug("  Kept notice %s", notice_id)
+            return notice
+
         except PwTimeout:
-            pass
-        try:
-            await page.wait_for_selector(SEL_VIEW_BUTTON_PATTERN, state="attached", timeout=15_000)
-        except PwTimeout:
-            logger.warning(
-                "  %s returned zero results after retry — check site manually "
-                "(saved search may have legitimate hits that didn't render)",
-                search.saved_search_name,
-            )
-            return notices
-
-    # Find all View buttons in the results grid
-    view_buttons = await page.query_selector_all(SEL_VIEW_BUTTON_PATTERN)
-    num_results = len(view_buttons)
-    logger.info("  %d results on this page", num_results)
-
-    if num_results == 0:
-        logger.warning(
-            "  %s: selector matched but 0 buttons returned — treating as empty page",
-            search.saved_search_name,
-        )
-        return notices
-
-    # We need to iterate by index because clicking a view button navigates away.
-    # After parsing each notice, we navigate back and re-find the buttons.
-    grid_lost = False
-    for idx in range(num_results):
-        if grid_lost:
-            break
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                # Re-find all view buttons (DOM refreshes after back-navigation)
-                view_buttons = await page.query_selector_all(SEL_VIEW_BUTTON_PATTERN)
-                if idx >= len(view_buttons):
-                    logger.warning("  Button index %d out of range (%d buttons)", idx, len(view_buttons))
-                    if len(view_buttons) == 0:
-                        logger.warning("  Results grid lost — stopping this page")
-                        grid_lost = True
-                    break
-
-                # Grab the row text for date and preview before navigating
-                btn = view_buttons[idx]
-                row = await btn.evaluate_handle("el => el.closest('tr').parentElement.closest('tr')")
-                row_text = ""
-                try:
-                    row_text = await row.evaluate("el => el.innerText")
-                except Exception:
-                    pass
-
-                # Check published date for daily mode cutoff
-                pub_date = await _extract_published_date(row_text)
-                if since_date and pub_date and pub_date < since_date:
-                    logger.debug("  Skipping old notice (%s < %s)", pub_date, since_date)
-                    break
-
-                # Click the View button → navigates to Details.aspx
-                await btn.click()
-                await page.wait_for_load_state("networkidle")
-                await delay()
-
-                # Cross-run dedup: if we've seen this notice ID before, skip CAPTCHA entirely
-                notice_id = _notice_id_from_url(page.url)
-                if seen_ids is not None and notice_id and notice_id in seen_ids:
-                    logger.info("  Skipping already-processed notice ID=%s", notice_id)
-                    await page.go_back()
-                    await page.wait_for_load_state("networkidle")
-                    await delay()
-                    break  # next result
-
-                # Check if notice content is already visible (CAPTCHA previously solved in session)
-                content_visible = await page.query_selector("text='Notice Content'")
-                if not content_visible:
-                    # Need to solve CAPTCHA
-                    if not await solve_captcha_and_view(page):
-                        logger.warning("  CAPTCHA solve failed for result %d (attempt %d)", idx + 1, attempt)
-                        # Track which IDs we lost to CAPTCHA failure so the next run
-                        # can prioritize them and the end-of-run summary surfaces them.
-                        # Record on the final scraper-level attempt, not intermediate retries.
-                        if attempt >= MAX_RETRIES and captcha_failed_ids is not None and notice_id:
-                            captcha_failed_ids[notice_id] = {
-                                "url": page.url,
-                                "search": search.saved_search_name,
-                                "county": search.county,
-                                "notice_type": search.notice_type,
-                                "pub_date": pub_date or "",
-                                "first_seen": datetime.now().strftime("%Y-%m-%d"),
-                            }
-                        # Navigate back and retry
-                        await page.go_back()
-                        await page.wait_for_load_state("networkidle")
-                        await delay()
-                        continue
-
-                # Parse the now-visible notice text
-                notice = await parse_notice_page(page, search.county, search.notice_type, llm_api_key)
-                if pub_date:
-                    notice.date_added = pub_date
-
-                # Record this notice ID so future runs don't re-process it
-                if seen_ids is not None and notice_id:
-                    seen_ids[notice_id] = notice.date_added or datetime.now().strftime("%Y-%m-%d")
-
-                # Apply foreclosure filter
-                if not is_valid_foreclosure(notice):
-                    logger.debug("  Filtered out (not foreclosure): %s", notice.source_url)
-                # Apply county validation — reject notices where the property
-                # is actually in a different county (search false positive)
-                elif not is_target_county(notice.raw_text, search.county):
-                    logger.debug("  Filtered out (wrong county): %s", notice.source_url)
-                else:
-                    notices.append(notice)
-                    logger.debug("  Kept notice: %s", notice.source_url)
-
-                # Navigate back to the results page
-                await page.go_back()
-                await page.wait_for_load_state("networkidle")
-                # Sometimes the back takes us to the CAPTCHA page, need another back
-                if "details" in page.url.lower():
-                    await page.go_back()
-                    await page.wait_for_load_state("networkidle")
-                await delay()
-                break  # Success — next result
-
-            except PwTimeout:
-                logger.warning("  Timeout on result %d (attempt %d/%d)", idx + 1, attempt, MAX_RETRIES)
-                # Try to recover by going back to results
-                try:
-                    await page.go_back()
-                    await page.wait_for_load_state("networkidle")
-                except Exception:
-                    pass
-                await delay()
-
-            except Exception:
-                logger.exception("  Error on result %d (attempt %d/%d)", idx + 1, attempt, MAX_RETRIES)
-                # Only go back if we actually navigated away from search results
-                if "search" not in page.url.lower():
-                    try:
-                        await page.go_back()
-                        await page.wait_for_load_state("networkidle")
-                    except Exception:
-                        pass
-                await delay()
-
-    return notices
-
-
-# ── Session Persistence ───────────────────────────────────────────────
-
-
-async def _save_cookies(context) -> None:
-    """Save browser cookies to disk for session reuse."""
-    try:
-        cookies = await context.cookies()
-        config.save_state(COOKIES_FILE, cookies)
-        logger.debug("Saved %d cookies to %s", len(cookies), COOKIES_FILE)
-    except Exception:
-        logger.debug("Could not save cookies", exc_info=True)
-
-
-async def _load_cookies(context) -> bool:
-    """Load saved cookies into browser context. Returns True if loaded."""
-    cookies = config.load_state(COOKIES_FILE)
-    if not cookies:
-        return False
-    try:
-        await context.add_cookies(cookies)
-        logger.debug("Loaded %d cookies from %s", len(cookies), COOKIES_FILE)
-        return True
-    except Exception:
-        logger.debug("Could not load cookies", exc_info=True)
-        return False
-
-
-async def _try_relogin(page: Page) -> bool:
-    """Detect if session expired and attempt re-login. Returns True if re-login succeeded."""
-    # Check if we're on the authenticate page or if dashboard nav fails
-    is_dead = "authenticate" in page.url.lower()
-    if not is_dead:
-        # Quick check: try navigating to dashboard
-        try:
-            await page.goto(SMART_SEARCH_URL, wait_until="domcontentloaded", timeout=15_000)
-            await page.wait_for_load_state("networkidle", timeout=10_000)
+            logger.warning("  Timeout on notice %s (attempt %d/%d)", notice_id, attempt, MAX_RETRIES)
+            await delay()
         except Exception:
-            is_dead = True
-        else:
-            is_dead = "authenticate" in page.url.lower()
+            logger.exception("  Error on notice %s (attempt %d/%d)", notice_id, attempt, MAX_RETRIES)
+            await delay()
 
-    if not is_dead:
-        return False  # Session is fine, failure was something else
-
-    logger.warning("Session expired — attempting re-login")
-    if await login(page):
-        logger.info("Re-login successful")
-        return True
-
-    logger.error("Re-login failed")
-    return False
+    return None
 
 
-async def _recover_to_search_page(
-    page: Page, search: SavedSearch, target_page: int,
-) -> bool:
-    """Recover from a lost results grid by re-logging in and navigating to target_page."""
-    logger.warning("Attempting to recover search session (target page %d)", target_page)
+# ── Search Execution ──────────────────────────────────────────────────
 
-    # Re-login if session expired
-    if "authenticate" in page.url.lower() or not await _navigate_to_dashboard(page):
-        if not await _try_relogin(page):
-            logger.error("Cannot re-login — recovery failed")
-            return False
-        if not await _navigate_to_dashboard(page):
-            return False
 
-    # Re-select the saved search
-    try:
-        async with page.expect_navigation(wait_until="networkidle", timeout=30000):
-            await page.select_option(
-                SEL_SAVED_SEARCHES_DROPDOWN,
-                label=search.saved_search_name,
-            )
-    except Exception:
-        logger.error("Could not re-select '%s' during recovery", search.saved_search_name)
-        return False
-
-    await delay()
-
-    if "search" not in page.url.lower():
-        return False
-
-    await _set_per_page(page)
-
-    # Navigate to target page by clicking "Next page" repeatedly
-    current, total = await _get_page_info(page)
-    while current < target_page:
+async def run_search(
+    page: Page,
+    search: SearchConfig,
+    since_date: str | None = None,
+    llm_api_key: str | None = None,  # reserved: used when CAPTCHA fallback is re-enabled
+    on_page_batch=None,
+    start_page: int = 1,
+    max_notices: int = 0,
+    seen_ids: dict[str, str] | None = None,
+    captcha_failed_ids: dict[str, dict] | None = None,  # reserved: CAPTCHA fallback queue
+    snippet_dropped_ids: set[str] | None = None,
+) -> list[NoticeData]:
+    """Submit search form, paginate through all result pages, scrape each notice."""
+    days_back = search.days_back
+    if since_date:
+        # Compute days_back from since_date for the search form
         try:
+            delta = (datetime.now() - datetime.strptime(since_date, "%Y-%m-%d")).days + 1
+            days_back = max(1, delta)
+        except ValueError:
+            pass
+
+    if not await _submit_search(page, search, days_back):
+        return []
+
+    session_base = _get_session_base(page.url)
+    current_page, total_pages = await _get_page_info(page)
+    logger.info("  %d pages of results for '%s'", total_pages, search.search_terms)
+
+    # Skip to start_page if needed
+    if start_page > 1:
+        logger.info("  Skipping to page %d", start_page)
+        while current_page < start_page:
             next_btn = await page.query_selector(SEL_NEXT_PAGE_BUTTON)
             if not next_btn:
-                logger.error("Next page button not found during recovery at page %d", current)
-                return False
-            await next_btn.click()
-            await page.wait_for_load_state("load")
+                logger.error("  Cannot reach page %d — no next button", start_page)
+                return []
+            async with page.expect_navigation(wait_until="domcontentloaded", timeout=15_000):
+                await next_btn.click()
             await delay()
-            await delay()
-            current, total = await _get_page_info(page)
+            current_page, total_pages = await _get_page_info(page)
+
+    notices: list[NoticeData] = []
+
+    while True:
+        logger.info("  Scraping results page %d/%d", current_page, total_pages)
+
+        # Collect all notice IDs and metadata from this results page
+        rows = await _extract_row_data(page)
+        logger.info("  %d notices on this results page", len(rows))
+
+        # Remember the search URL to return to after detail pages
+        search_url_with_session = page.url
+        page_notices: list[NoticeData] = []
+
+        for row in rows:
+            notice_id = row["notice_id"]
+            pub_date = await _parse_date_raw(row["pub_date_raw"])
+
+            # Date + dedup pre-checks (avoid CAPTCHA cost)
+            if since_date and pub_date and pub_date < since_date:
+                logger.debug("  Skipping old notice %s (%s)", notice_id, pub_date)
+                continue
+            if seen_ids is not None and notice_id in seen_ids:
+                logger.info("  Skipping already-processed notice ID=%s", notice_id)
+                continue
+            # P2 #7: persistent snippet-drop cache. The same statewide
+            # query (e.g. probate "Estate Deceased") runs 3x — once per
+            # county-labeled SearchConfig — and without persistence each
+            # run re-pays the snippet filter check on the same non-target
+            # IDs. Free per-row but adds ~5 min wall time per re-run.
+            # Skip rows we've already dropped at snippet level in a prior
+            # search this session.
+            if snippet_dropped_ids is not None and notice_id in snippet_dropped_ids:
+                continue
+
+            # Snippet pre-filter: notice type appears in first line — cheap check
+            # before paying CAPTCHA cost. Snippets are 2KB and DO contain
+            # courthouse/county markers for probate + many other notice types.
+            snippet_notice = _notice_from_snippet(row, search, session_base, pub_date)
+
+            # 1) County pre-filter: drops notices for non-target Alabama
+            #    counties without paying CAPTCHA. Critical for statewide
+            #    queries like probate "Estate Deceased" (~1,000 results /
+            #    14-day window across all 67 AL counties, of which ~80% are
+            #    non-target). See notice_parser.snippet_passes_county_filter
+            #    for the decision rules.
+            if not snippet_passes_county_filter(row.get("snippet", "") or ""):
+                logger.debug("  Snippet pre-filter: non-target AL county %s", notice_id)
+                if snippet_dropped_ids is not None:
+                    snippet_dropped_ids.add(notice_id)
+                continue
+
+            # 2) Foreclosure-specific validity check (skip notices whose
+            #    snippet doesn't contain trustee-sale language even when the
+            #    keyword search matched something incidental).
+            if not is_valid_foreclosure(snippet_notice):
+                logger.debug("  Snippet pre-filter: not valid foreclosure %s", notice_id)
+                continue
+
+            # Full detail page: navigate, solve CAPTCHA, parse complete notice text
+            notice = await _scrape_notice(
+                page,
+                notice_id,
+                row.get("detail_query", ""),
+                session_base,
+                search,
+                pub_date,
+                since_date,
+                llm_api_key,
+                seen_ids,
+                captcha_failed_ids,
+            )
+            if notice is None:
+                continue
+
+            logger.debug("  Kept notice %s", notice_id)
+            page_notices.append(notice)
+
+            if max_notices and (len(notices) + len(page_notices)) >= max_notices:
+                break
+
+        notices.extend(page_notices)
+        if on_page_batch and page_notices:
+            await on_page_batch(page_notices)
+
+        if max_notices and len(notices) >= max_notices:
+            logger.info("  Reached max_notices limit (%d)", max_notices)
+            notices = notices[:max_notices]
+            break
+
+        if current_page >= total_pages:
+            break
+
+        # Return to search results and go to next page.
+        #
+        # The cached `search_url_with_session` embeds an ASP.NET session GUID
+        # captured BEFORE we visited any detail pages. After ~10 detail-page
+        # CAPTCHA visits the AL site session may have rotated server-side, in
+        # which case goto() returns 200 OK but loads a stale/empty page that
+        # doesn't show the results grid. The previous code only fell through
+        # to resubmit if goto() raised — silent stale-page loads broke
+        # pagination for high-volume searches (probate, where most notices
+        # filter out before we ever advance pages).
+        #
+        # Fix: validate that the results grid is actually present after goto.
+        # If not, force the resubmit-and-click-to-page recovery path.
+        need_resubmit = False
+        try:
+            await page.goto(search_url_with_session, wait_until="domcontentloaded", timeout=20_000)
+            await page.wait_for_timeout(1500)
+            grid = await page.query_selector(SEL_RESULTS_GRID)
+            if not grid:
+                logger.info("  Cached search URL no longer shows results grid — resubmitting")
+                need_resubmit = True
         except Exception:
-            logger.warning("Recovery navigation failed at page %d", current, exc_info=True)
-            return False
+            logger.warning("  Could not return to search results — resubmitting search")
+            need_resubmit = True
 
-    logger.info("Recovery successful — now on page %d/%d", current, total)
-    return True
+        if need_resubmit:
+            if not await _submit_search(page, search, days_back):
+                break
+            # Click forward to return to where we were. After _submit_search
+            # we're on page 1; advance through current_page-1 next-clicks so
+            # the click below moves us to current_page+1.
+            replay_page = 1
+            for _ in range(current_page - 1):
+                if not await _click_next_page(page, replay_page):
+                    break
+                replay_page += 1
+                await delay()
 
+        # Advance to the next page via the ASP.NET image button.
+        if not await _click_next_page(page, current_page):
+            break
+        await delay()
+        current_page, total_pages = await _get_page_info(page)
+        session_base = _get_session_base(page.url)
 
-async def _is_session_valid(page: Page) -> bool:
-    """Check if saved cookies give us a valid logged-in session."""
-    try:
-        await page.goto(SMART_SEARCH_URL)
-        await page.wait_for_load_state("networkidle")
-        # If we land on the dashboard, session is valid
-        if "smartsearch" in page.url.lower():
-            dropdown = await page.query_selector(SEL_SAVED_SEARCHES_DROPDOWN)
-            if dropdown:
-                logger.info("Reusing saved session — already logged in")
-                return True
-    except Exception:
-        pass
-    return False
+    logger.info("  Found %d notices for '%s'", len(notices), search.search_terms)
+    return notices
 
 
 # ── State Tracking ────────────────────────────────────────────────────
 
 
 def load_last_run_date() -> str | None:
-    """Load the date of the last successful run from state file."""
     data = config.load_state(STATE_FILE)
     return data.get("last_run_date")
 
 
 def save_last_run_date() -> None:
-    """Save today's date as the last run date."""
     config.save_state(STATE_FILE, {"last_run_date": datetime.now().strftime("%Y-%m-%d")})
 
 
 def load_seen_ids() -> dict[str, str]:
-    """Load notice IDs already processed in prior runs, pruning entries older than SEEN_IDS_PRUNE_DAYS.
-
-    Returns a dict of {notice_id: "YYYY-MM-DD"}. The date is when we first saw the
-    notice, used only for pruning to bound file size.
-    """
     data = config.load_state(SEEN_IDS_FILE)
     if not data:
         return {}
@@ -632,19 +553,10 @@ def load_seen_ids() -> dict[str, str]:
 
 
 def save_seen_ids(seen: dict[str, str]) -> None:
-    """Persist the seen-notice-ID cache to disk."""
     config.save_state(SEEN_IDS_FILE, seen)
 
 
 def load_captcha_failed_ids() -> dict[str, dict]:
-    """Load notices that exhausted CAPTCHA retries in prior runs.
-
-    Pruned to CAPTCHA_FAILED_PRUNE_DAYS (default 14) — short window because
-    most failures are transient proxy/2Captcha hiccups; if a notice is still
-    failing after two weeks the site likely changed or the notice was removed.
-
-    Structure: {notice_id: {url, search, county, notice_type, pub_date, first_seen}}.
-    """
     data = config.load_state(CAPTCHA_FAILED_IDS_FILE)
     if not data:
         return {}
@@ -654,15 +566,11 @@ def load_captcha_failed_ids() -> dict[str, dict]:
         if isinstance(meta, dict) and meta.get("first_seen", "") >= cutoff
     }
     if len(pruned) < len(data):
-        logger.info(
-            "Pruned %d CAPTCHA-failed IDs older than %d days",
-            len(data) - len(pruned), CAPTCHA_FAILED_PRUNE_DAYS,
-        )
+        logger.info("Pruned %d CAPTCHA-failed IDs older than %d days", len(data) - len(pruned), CAPTCHA_FAILED_PRUNE_DAYS)
     return pruned
 
 
 def save_captcha_failed_ids(failed: dict[str, dict]) -> None:
-    """Persist the CAPTCHA-failed-notice-ID cache to disk."""
     config.save_state(CAPTCHA_FAILED_IDS_FILE, failed)
 
 
@@ -671,7 +579,7 @@ def save_captcha_failed_ids(failed: dict[str, dict]) -> None:
 
 async def scrape_all(
     mode: str = "daily",
-    searches: list[SavedSearch] | None = None,
+    searches: list[SearchConfig] | None = None,
     proxy_url: str | None = None,
     on_batch=None,
     since_date_override: str | None = None,
@@ -682,43 +590,23 @@ async def scrape_all(
     captcha_failed_ids: dict[str, dict] | None = None,
     on_search_complete=None,
 ) -> list[NoticeData]:
-    """Main entry point for scraping.
+    """Main entry point for scraping Alabama Public Notices.
 
-    Args:
-        mode: "daily" (only new since last run) or "historical" (last 12 months).
-        searches: Optional subset of searches to run. Defaults to all.
-        proxy_url: Optional proxy URL (e.g. Apify residential proxy).
-        on_batch: Optional async callback(list[NoticeData]) called after each search.
-        since_date_override: If set (YYYY-MM-DD), overrides the mode-based date logic.
-        start_page: Start scraping from this page number (default 1).
-        seen_ids: Cross-run dict of already-processed notice IDs. If None, loads from
-                  SEEN_IDS_FILE. Caller (e.g. Apify) can pass its own dict loaded
-                  from KVS to participate in the dedup cache.
-        on_search_complete: Optional async callback(seen_ids) fired after each search
-                            completes, so callers can persist seen_ids to their own
-                            backing store (e.g. Apify KVS).
-
-    Returns:
-        All scraped and filtered NoticeData.
+    No login required. Submits keyword search form, paginates results,
+    solves reCAPTCHA on each detail page.
     """
     if searches is None:
         searches = SAVED_SEARCHES
 
-    # Load the cross-run seen-ID cache (caller may have pre-loaded for KVS-backed stores)
     if seen_ids is None:
         seen_ids = load_seen_ids()
     logger.info("Cross-run dedup: %d previously-seen notice IDs loaded", len(seen_ids))
 
-    # Load the CAPTCHA-failed-ID queue from prior runs so the end-of-run summary
-    # can show which IDs have been repeatedly failing, not just the current run.
     if captcha_failed_ids is None:
         captcha_failed_ids = load_captcha_failed_ids()
     prior_failed = len(captcha_failed_ids)
     if prior_failed:
-        logger.info(
-            "CAPTCHA failure queue: %d IDs from prior runs still pending",
-            prior_failed,
-        )
+        logger.info("CAPTCHA failure queue: %d IDs from prior runs still pending", prior_failed)
 
     # Determine date cutoff
     since_date: str | None = None
@@ -737,16 +625,19 @@ async def scrape_all(
         logger.info("Historical mode: pulling notices since %s", since_date)
 
     all_notices: list[NoticeData] = []
+    # Snippet-drop cache: persists across SearchConfig iterations within
+    # this scrape_all call. Multiple SearchConfigs with identical
+    # search_terms (e.g. "Estate Deceased" probate across Jefferson +
+    # Madison + Marshall county labels) all surface the same statewide
+    # result set; without this cache each re-pays the snippet pre-filter.
+    snippet_dropped_ids: set[str] = set()
 
     async with async_playwright() as p:
         launch_opts: dict = {"headless": True}
         if proxy_url:
-            # Parse proxy URL (format: http://user:pass@host:port)
             from urllib.parse import urlparse
             parsed = urlparse(proxy_url)
-            proxy_cfg: dict = {
-                "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
-            }
+            proxy_cfg: dict = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
             if parsed.username:
                 proxy_cfg["username"] = parsed.username
             if parsed.password:
@@ -757,60 +648,28 @@ async def scrape_all(
         browser = await p.chromium.launch(**launch_opts)
         context = await browser.new_context(
             user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
+                "Chrome/124.0.0.0 Safari/537.36"
             )
         )
-        # Generous timeout for ASP.NET postbacks + CAPTCHA solving
         context.set_default_timeout(60_000)
-
-        # Try to reuse saved session cookies
-        await _load_cookies(context)
         page = await context.new_page()
 
-        if not await _is_session_valid(page):
-            # Fresh login required
-            if not await login(page):
-                logger.error("Login failed — aborting scrape")
-                await browser.close()
-                return []
-            # Save cookies for next run
-            await _save_cookies(context)
-
         for search in searches:
-            # Proactive session check — re-login if session died between searches
-            if "authenticate" in page.url.lower():
-                if not await _try_relogin(page):
-                    logger.error("Cannot recover session — aborting remaining searches")
-                    break
-
             remaining = (max_notices - len(all_notices)) if max_notices else 0
             try:
-                search_notices = await run_saved_search(
+                search_notices = await run_search(
                     page, search, since_date, llm_api_key,
                     on_page_batch=on_batch, start_page=start_page,
                     max_notices=remaining, seen_ids=seen_ids,
                     captcha_failed_ids=captcha_failed_ids,
+                    snippet_dropped_ids=snippet_dropped_ids,
                 )
                 all_notices.extend(search_notices)
             except Exception:
-                logger.exception("Failed to scrape: %s", search.saved_search_name)
-                # Check if failure was due to session expiration and re-login
-                if await _try_relogin(page):
-                    try:
-                        search_notices = await run_saved_search(
-                            page, search, since_date, llm_api_key,
-                            on_page_batch=on_batch, start_page=start_page,
-                            max_notices=remaining, seen_ids=seen_ids,
-                        )
-                        all_notices.extend(search_notices)
-                    except Exception:
-                        logger.exception("Still failing after re-login: %s", search.saved_search_name)
+                logger.exception("Failed to scrape: %s", search.search_terms)
 
-            # Incremental persistence — if a later search crashes fatally, progress
-            # from completed searches is not lost. Covers the re-pull bug where a
-            # single end-of-run save at line 722 used to silently skip on exceptions.
             try:
                 save_seen_ids(seen_ids)
                 if mode == "daily":
@@ -818,10 +677,10 @@ async def scrape_all(
                 if on_search_complete is not None:
                     await on_search_complete(seen_ids)
             except Exception:
-                logger.exception("Failed to persist seen_ids after %s", search.saved_search_name)
+                logger.exception("Failed to persist seen_ids after %s", search.search_terms)
 
             if max_notices and len(all_notices) >= max_notices:
-                logger.info("Reached max_notices limit (%d) — stopping", max_notices)
+                logger.info("Reached max_notices limit (%d)", max_notices)
                 break
 
         await browser.close()
@@ -830,10 +689,6 @@ async def scrape_all(
         save_last_run_date()
     save_seen_ids(seen_ids)
 
-    # Persist CAPTCHA failures + surface a prominent summary so operators
-    # notice silent drops. Previously these notices disappeared from the
-    # pipeline with no end-of-run signal; now they show up in the log and
-    # on disk for follow-up.
     save_captcha_failed_ids(captcha_failed_ids)
     new_failed = len(captcha_failed_ids) - prior_failed
     if new_failed > 0:

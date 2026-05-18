@@ -35,8 +35,9 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
 # ── Credentials ────────────────────────────────────────────────────────
-TNPN_EMAIL = os.getenv("TNPN_EMAIL", "")
-TNPN_PASSWORD = os.getenv("TNPN_PASSWORD", "")
+# Alabama Public Notices — no login required for search; CAPTCHA on detail pages only
+APNA_EMAIL = os.getenv("APNA_EMAIL", "")    # Reserved for future Smart Search login
+APNA_PASSWORD = os.getenv("APNA_PASSWORD", "")
 CAPTCHA_API_KEY = os.getenv("CAPTCHA_API_KEY", "")  # 2Captcha API key
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")  # Claude Haiku for LLM parsing
 SMARTY_AUTH_ID = os.getenv("SMARTY_AUTH_ID", "")        # Smarty address standardization
@@ -65,30 +66,28 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen-2.5-72b-instruct")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
 # ── Site URLs ──────────────────────────────────────────────────────────
-BASE_URL = "https://www.tnpublicnotice.com"
-LOGIN_URL = f"{BASE_URL}/authenticate.aspx"
-SMART_SEARCH_URL = f"{BASE_URL}/Smartsearch/Default.aspx"
+BASE_URL = "https://www.alabamapublicnotices.com"
+SEARCH_URL = f"{BASE_URL}/Search.aspx"
 
 # ── ASP.NET Selectors ─────────────────────────────────────────────────
-# Login form
-SEL_LOGIN_EMAIL = "#ctl00_ContentPlaceHolder1_AuthenticateIPA1_txtEmailAddress"
-SEL_LOGIN_PASSWORD = "#ctl00_ContentPlaceHolder1_AuthenticateIPA1_txtPassword"
-SEL_LOGIN_SUBMIT = "#ctl00_ContentPlaceHolder1_AuthenticateIPA1_btnAuth"
+# Search form (Alabama Public Notices — no login required)
+SEL_SEARCH_TEXT = "#ctl00_ContentPlaceHolder1_as1_txtSearch"
+SEL_SEARCH_TYPE_AND = "#ctl00_ContentPlaceHolder1_as1_rdoType_0"  # All Words
+SEL_SEARCH_TYPE_OR = "#ctl00_ContentPlaceHolder1_as1_rdoType_1"   # Any Words
+SEL_SEARCH_EXCLUDE = "#ctl00_ContentPlaceHolder1_as1_txtExclude"
+SEL_SEARCH_DAYS = "#ctl00_ContentPlaceHolder1_as1_txtLastNumDays"
+SEL_SEARCH_SUBMIT = "#ctl00_ContentPlaceHolder1_as1_btnGo"
 
-# Smart Search dashboard
-SEL_SAVED_SEARCHES_DROPDOWN = "#ctl00_ContentPlaceHolder1_as1_ddlSavedSearches"
+# Search results grid
+SEL_RESULTS_GRID = "#ctl00_ContentPlaceHolder1_WSExtendedGridNP1_GridView1"
 SEL_PER_PAGE_DROPDOWN = 'select[name$="ddlPerPage"]'
-
-# Search results (authenticated grid)
-SEL_RESULTS_GRID = "#ctl00_ContentPlaceHolder1_WSExtendedGrid1_GridView1"
-SEL_VIEW_BUTTON_PATTERN = "input[name$='btnView']"
+SEL_VIEW_BUTTON_PATTERN = "input.viewButton"
 SEL_NEXT_PAGE_BUTTON = "input[title='Next page']"
-SEL_PAGE_INFO = "td:has-text('Page ')"
+SEL_PAGE_INFO = "span[id$='lblTotalPages']"
 
-# Notice detail page
-SEL_CAPTCHA_IFRAME = "iframe[src*='recaptcha']"
+# Notice detail page (DetailsPrint.aspx — reCAPTCHA + Terms gated)
 SEL_VIEW_NOTICE_BUTTON = "#ctl00_ContentPlaceHolder1_PublicNoticeDetailsBody1_btnViewNotice"
-RECAPTCHA_SITEKEY = "6LdtSg8sAAAAADTdRyZxJ2R2sS82pKALNMvMqSyL"
+RECAPTCHA_SITEKEY = "6LccnQ8sAAAAAMNFrb4ZLDtPAqk50k_r-CCwimHJ"
 
 # ── Rate Limiting ──────────────────────────────────────────────────────
 REQUEST_DELAY_MIN = 2.0  # seconds between requests
@@ -102,22 +101,381 @@ TESSERACT_PSM_PDF = 3    # fully automatic — best for PDF tax sale tables
 TESSERACT_PSM_PHOTO = 4  # assume single column of variable-size text — best for terminal screen photos
 
 # ── Notice Types ───────────────────────────────────────────────────────
-NOTICE_TYPES = ["foreclosure", "probate"]
+NOTICE_TYPES = ["foreclosure"]
 
 
 @dataclass
-class SavedSearch:
-    """Represents a saved search on tnpublicnotice.com."""
+class SearchConfig:
+    """Represents a keyword search on alabamapublicnotices.com."""
     county: str
-    notice_type: str  # One of NOTICE_TYPES
-    saved_search_name: str  # Exact name in the Saved Searches dropdown
+    notice_type: str    # One of NOTICE_TYPES
+    search_terms: str   # Keywords for the search box
+    search_type: str    # "AND" (all words) or "OR" (any words)
+    exclude_terms: str  # Keywords to exclude
+    days_back: int      # "Last N days" date range
+    # Optional pre-classification — when set, every notice from this search
+    # gets `notice.notice_subtype = <value>`. Used today for code-violation
+    # searches to flag CONDEMNATION/DEMOLITION as "unsafe_building" so the
+    # DataSift formatter fires the `demolish` tag automatically.
+    notice_subtype: str = ""
 
 
-# ── Saved Searches ─────────────────────────────────────────────────────
-# These names must match exactly what appears in the dropdown on the site.
-SAVED_SEARCHES: list[SavedSearch] = [
-    SavedSearch("Knox", "foreclosure", "Foreclosure V2 Knox"),
-    SavedSearch("Blount", "foreclosure", "Foreclosure V2 Blount"),
+# Keep SavedSearch as alias so non-scraper imports don't break
+SavedSearch = SearchConfig
+
+# ── Searches ───────────────────────────────────────────────────────────
+# Jefferson County, AL — mortgage foreclosure sales + rescheduled notices
+# Madison County, AL — newspaper PDF scans; detail pages use image-based PDF display
+SAVED_SEARCHES: list[SearchConfig] = [
+    SearchConfig(
+        county="Jefferson",
+        notice_type="foreclosure",
+        search_terms="MORTGAGE FORECLOSURE SALE JEFFERSON",
+        search_type="AND",
+        exclude_terms="CONDEMNATION",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Jefferson",
+        notice_type="foreclosure",
+        search_terms="NOTICE OF MORTGAGE RESCHEDULE JEFFERSON",
+        search_type="AND",
+        exclude_terms="CONDEMNATION",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Madison",
+        notice_type="foreclosure",
+        search_terms="MORTGAGE FORECLOSURE SALE MADISON",
+        search_type="AND",
+        exclude_terms="CONDEMNATION",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Madison",
+        notice_type="foreclosure",
+        search_terms="NOTICE OF MORTGAGE RESCHEDULE MADISON",
+        search_type="AND",
+        exclude_terms="CONDEMNATION",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Marshall",
+        notice_type="foreclosure",
+        search_terms="MORTGAGE FORECLOSURE SALE MARSHALL",
+        search_type="AND",
+        exclude_terms="CONDEMNATION",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Marshall",
+        notice_type="foreclosure",
+        search_terms="NOTICE OF MORTGAGE RESCHEDULE MARSHALL",
+        search_type="AND",
+        exclude_terms="CONDEMNATION",
+        days_back=7,
+    ),
+    # Probate "Notice to Creditors" publications. APN search has no county
+    # filter — the county-of-property check happens in is_target_county()
+    # against the full notice text after CAPTCHA.
+    SearchConfig(
+        county="Jefferson",
+        notice_type="probate",
+        search_terms="Estate Deceased",
+        search_type="AND",
+        exclude_terms="foreclosure mortgage",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Madison",
+        notice_type="probate",
+        search_terms="Estate Deceased",
+        search_type="AND",
+        exclude_terms="foreclosure mortgage",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Marshall",
+        notice_type="probate",
+        search_terms="Estate Deceased",
+        search_type="AND",
+        exclude_terms="foreclosure mortgage",
+        days_back=7,
+    ),
+    # Pre-probate via APN — formal "Notice of Death" publications.
+    # Funeral homes and family members occasionally publish a Death Notice
+    # as a legal notice (parallel to Notice-to-Creditors but BEFORE probate
+    # is filed) to flush out unknown heirs, clear creditor claims for
+    # non-probate estates, or for unclaimed-asset purposes. These hits
+    # complement the obituary-driven pre-probate pipeline by catching
+    # decedents whose families used a legal-notice channel instead of (or
+    # in addition to) legacy.com / al.com / a funeral-home website.
+    # Tagged as notice_type="pre_probate" so the existing pre-probate
+    # tier-gate + Slack format picks them up. notice_subtype distinguishes
+    # APN-sourced entries from obituary-harvested ones.
+    SearchConfig(
+        county="Jefferson",
+        notice_type="pre_probate",
+        notice_subtype="apn_death_notice",
+        search_terms="Notice of Death",
+        search_type="AND",
+        # Exclude probate-court-driven publications (already covered above)
+        # plus foreclosure boilerplate that occasionally mentions "death".
+        exclude_terms="Estate Deceased foreclosure",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Madison",
+        notice_type="pre_probate",
+        notice_subtype="apn_death_notice",
+        search_terms="Notice of Death",
+        search_type="AND",
+        exclude_terms="Estate Deceased foreclosure",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Marshall",
+        notice_type="pre_probate",
+        notice_subtype="apn_death_notice",
+        search_terms="Notice of Death",
+        search_type="AND",
+        exclude_terms="Estate Deceased foreclosure",
+        days_back=7,
+    ),
+    # Alt phrasing — some publications use "Death Notice" or boilerplate
+    # like "of the death of" instead of the strict "Notice of Death".
+    SearchConfig(
+        county="Jefferson",
+        notice_type="pre_probate",
+        notice_subtype="apn_death_notice",
+        search_terms="Death Notice deceased",
+        search_type="AND",
+        exclude_terms="Estate Deceased foreclosure mortgage",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Madison",
+        notice_type="pre_probate",
+        notice_subtype="apn_death_notice",
+        search_terms="Death Notice deceased",
+        search_type="AND",
+        exclude_terms="Estate Deceased foreclosure mortgage",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Marshall",
+        notice_type="pre_probate",
+        notice_subtype="apn_death_notice",
+        search_terms="Death Notice deceased",
+        search_type="AND",
+        exclude_terms="Estate Deceased foreclosure mortgage",
+        days_back=7,
+    ),
+    # Code-violation / unsafe-building publications.
+    #
+    # Empirical recon (April 2026) showed naive keywords have severe
+    # false-positive rates:
+    #   CONDEMNATION    → catches drug/firearm forfeitures + ALDOT eminent
+    #                     domain (NOT property teardowns)
+    #   DEMOLITION      → catches construction bid solicitations
+    #   PUBLIC NUISANCE → mixed; catches overgrown-grass soft violations
+    #
+    # The AL Code § 11-53A-20 boilerplate that real condemnation orders use
+    # is the cleanest discriminator: every actual teardown notice cites it
+    # verbatim ("pursuant to Sections 11-53A-20"). We use that as the AND
+    # anchor + the action keyword, which drops the false-positive rate to
+    # near zero. Madison/Jefferson hits will be rare regardless (Birmingham
+    # uses 311; Huntsville publishes its own list — already covered in
+    # Phase 1) but the filter is at least clean when something does land.
+    SearchConfig(
+        county="Jefferson",
+        notice_type="code_violation",
+        notice_subtype="unsafe_building",
+        search_terms="DEMOLITION UNSAFE STRUCTURE",
+        search_type="AND",
+        exclude_terms="bid contractor sealed",
+        days_back=14,
+    ),
+    SearchConfig(
+        county="Jefferson",
+        notice_type="code_violation",
+        notice_subtype="unsafe_building",
+        search_terms="CONDEMNED STRUCTURE DEMOLITION",
+        search_type="AND",
+        exclude_terms="bid contractor sealed",
+        days_back=14,
+    ),
+    SearchConfig(
+        county="Jefferson",
+        notice_type="code_violation",
+        notice_subtype="unsafe_building",
+        search_terms="NUISANCE ABATEMENT DEMOLISHED",
+        search_type="AND",
+        exclude_terms="bid contractor sealed",
+        days_back=14,
+    ),
+    SearchConfig(
+        county="Madison",
+        notice_type="code_violation",
+        notice_subtype="unsafe_building",
+        search_terms="DEMOLITION UNSAFE STRUCTURE",
+        search_type="AND",
+        exclude_terms="bid contractor sealed",
+        days_back=14,
+    ),
+    SearchConfig(
+        county="Madison",
+        notice_type="code_violation",
+        notice_subtype="unsafe_building",
+        search_terms="CONDEMNED STRUCTURE DEMOLITION",
+        search_type="AND",
+        exclude_terms="bid contractor sealed",
+        days_back=14,
+    ),
+    SearchConfig(
+        county="Madison",
+        notice_type="code_violation",
+        notice_subtype="unsafe_building",
+        search_terms="NUISANCE ABATEMENT DEMOLISHED",
+        search_type="AND",
+        exclude_terms="bid contractor sealed",
+        days_back=14,
+    ),
+    SearchConfig(
+        county="Marshall",
+        notice_type="code_violation",
+        notice_subtype="unsafe_building",
+        search_terms="DEMOLITION UNSAFE STRUCTURE",
+        search_type="AND",
+        exclude_terms="bid contractor sealed",
+        days_back=14,
+    ),
+    SearchConfig(
+        county="Marshall",
+        notice_type="code_violation",
+        notice_subtype="unsafe_building",
+        search_terms="CONDEMNED STRUCTURE DEMOLITION",
+        search_type="AND",
+        exclude_terms="bid contractor sealed",
+        days_back=14,
+    ),
+    SearchConfig(
+        county="Marshall",
+        notice_type="code_violation",
+        notice_subtype="unsafe_building",
+        search_terms="NUISANCE ABATEMENT DEMOLISHED",
+        search_type="AND",
+        exclude_terms="bid contractor sealed",
+        days_back=14,
+    ),
+    # Eviction / unlawful-detainer publications.
+    #
+    # NOT WIRED — empirical recon (April 2026) confirmed APN does NOT
+    # carry Alabama eviction publications in any meaningful volume. Four
+    # independent keyword probes statewide over a full 12-month window
+    # all returned ZERO results:
+    #   "UNLAWFUL DETAINER JEFFERSON"  → 0 hits
+    #   "UNLAWFUL DETAINER" (statewide) → 0 hits
+    #   "DETAINER WARRANT" (statewide)  → 0 hits
+    #   "EVICTION TENANT" (statewide)   → 0 hits
+    #   "LANDLORD TENANT NOTICE"        → 0 hits
+    #
+    # Why: unlike foreclosures (§ 35-10-13 mandates publication of trustee
+    # sales) and probate creditor notices (§ 43-2-61 mandates publication
+    # for 3 successive weeks), Alabama eviction statute § 6-6-310 et seq.
+    # requires personal service, not publication. ARCP Rule 4.3 allows
+    # service by publication when a tenant can't be located, but landlords
+    # rarely use it — they take default judgment after the 14-day response
+    # window instead, since publication costs them money and the tenant
+    # has typically already abandoned the property anyway.
+    #
+    # Coverage paths for evictions:
+    #   1. AlaCourt.com subscription (~$100/yr + per-record fees) —
+    #      structured statewide unlawful-detainer search, full coverage.
+    #      Requires Playwright scrape behind login.
+    #   2. County district court online dockets (Jefferson 10th Circuit /
+    #      Madison 23rd Circuit) — free but PDF-format and inconsistent.
+    #   3. Photo-import pipeline (already wired in photo_importer.py)
+    #      — operator photographs courthouse terminal, OCR + LLM parse.
+    #
+    # The eviction LLM prompt + result handler ARE wired (llm_parser.py,
+    # notice_parser.py:1015-1048) so any future eviction-source adapter
+    # plugs into the existing NoticeData → DataSift pipeline cleanly.
+    # Just need a different upstream feed than APN.
+    #
+    # ─────────────────────────────────────────────────────────────────
+    # Tax sale (delinquent-property auction) publications.
+    #
+    # NOT WIRED — recon not performed. Distinct from tax_delinquent
+    # (already covered for Jefferson + Madison via the dedicated
+    # tax-collector adapters in tax_distress_pipeline.py): tax_sale
+    # is the actual auction event, tax_delinquent is the upstream
+    # signal. They overlap in prospecting value — most properties
+    # that hit a tax_sale were tax_delinquent for years first, so
+    # the existing pipeline catches them earlier. The marginal
+    # value-add of wiring tax_sale is the firm auction date for
+    # bidders, not new lead discovery.
+    #
+    # Statutory basis for publication exists: AL Code § 40-10-184
+    # requires the tax collector to publish the sale list once a
+    # week for two consecutive weeks before the sale. Whether that
+    # publication surfaces on APN vs. only in print/county sites
+    # is unverified — needs empirical recon.
+    #
+    # Coverage paths to investigate (in priority order):
+    #   1. APN keyword search — try "TAX SALE JEFFERSON" /
+    #      "TAX SALE MADISON" / "DELINQUENT TAX SALE" with
+    #      days_back=30 (annual sales are typically May/June, so
+    #      a daily run will see them only in season). Wire
+    #      SearchConfigs the same way as the foreclosure entries
+    #      if results materialize.
+    #   2. County tax-collector publication endpoints directly
+    #      (Jefferson Co Revenue Commission / Madison Co Tax
+    #      Collector) — both publish annual tax-sale lists on
+    #      their own sites. More reliable than APN since the
+    #      publication duty is on the county, not a private seller.
+    #
+    # notice_parser.py + llm_parser.py already handle tax_sale as a
+    # distinct notice_type (legacy from the TN scraper era). Wiring
+    # an AL source means SearchConfig entries OR a county-tax-collector
+    # adapter in the shape of madison_tax_delinquent_api.py — no
+    # parser/formatter changes needed.
+    #
+    # ─────────────────────────────────────────────────────────────────
+    # Divorce / dissolution-of-marriage publications.
+    #
+    # NOT WIRED — recon not performed, AND not currently parsed.
+    # Two-layer gap: no upstream feed AND notice_parser.py does not
+    # handle divorce as a notice_type today (only photo_importer.py
+    # does, for courthouse-terminal photo imports).
+    #
+    # Like eviction, AL divorce procedure (§ 30-2-1 et seq.) requires
+    # personal service in most cases. ARCP Rule 4.3 allows service
+    # by publication when the respondent can't be located (typically:
+    # spouse who left and can't be tracked down). Volume is likely
+    # LOW — most divorces are uncontested and personally served.
+    #
+    # Strategic priority is also low: divorce-as-distress signal
+    # works best when the property is ALSO in foreclosure (which the
+    # foreclosure pipeline catches independently) or when the court
+    # has ordered a sale (which would surface as a probate_sale-style
+    # notice). A divorce alone, without financial distress, is a
+    # weak motivated-seller signal.
+    #
+    # Coverage paths if revisited:
+    #   1. APN keyword search — "DIVORCE NOTICE PUBLICATION" /
+    #      "DISSOLUTION OF MARRIAGE BY PUBLICATION".
+    #   2. AlaCourt domestic-relations docket subscription (same
+    #      source proposed for evictions above).
+    #   3. Photo-import pipeline (already handles divorce — see
+    #      photo_importer.py — for courthouse terminal scans).
+    #
+    # Wiring end-to-end requires more work than tax_sale: NoticeData
+    # fields for petitioner/respondent (currently in photo_importer.py
+    # only), an LLM prompt branch in llm_parser.py, and a regex parser
+    # in notice_parser.py. Estimate 1-2 days to bring divorce parity
+    # with the other notice types. Defer until APN recon shows
+    # non-trivial volume to justify the investment.
 ]
 
 # ── Entity Detection ──────────────────────────────────────────────────

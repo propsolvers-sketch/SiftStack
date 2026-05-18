@@ -104,6 +104,15 @@ DATASIFT_COLUMNS = [
     "Entity Type",
     "Entity Contact",
     "Entity Contact Role",
+    # ── AL probate enrichment (added 2026-04) ──
+    # All become custom fields in the SiftStack group on first upload.
+    "Probate Case Number",
+    "Judge of Probate",
+    "Probate Subtype",          # probate_creditors | probate_sale | probate_heirs_notice
+    "Petition Filed Date",      # probate_sale only — when PR petitioned the court
+    "Hearing Date",             # probate_sale only — court approval date
+    "Creditor Claim Deadline",  # granted_date + 6 months (AL § 43-2-350)
+    "Total Estate Value",       # Sum of all parcels owned by the decedent
 ]
 
 
@@ -142,6 +151,52 @@ def _is_entity_name(name: str) -> bool:
     return bool(_ENTITY_SUFFIXES.search(name))
 
 
+# Leading prefix patterns that bleed in from upstream estate / heir parsing.
+# "Estate of NAME" / "Heirs of NAME" / "the Estate of NAME" / orphaned "of NAME"
+# all strip down to just "NAME" before the first/last split. Anchored at start
+# so we don't eat legitimate name parts mid-string.
+_ESTATE_PREFIX_RE = re.compile(
+    r"^(?:"
+    r"(?:the\s+)?(?:estate|heirs?|trust)\s+of\s+(?:the\s+(?:estate|trust)\s+of\s+)?"
+    r"|of\s+"
+    r"|in\s+re\s+(?:the\s+(?:estate|matter)\s+of\s+)?"
+    r")",
+    re.IGNORECASE,
+)
+
+# Role-suffix legalese from foreclosure / probate notices. Stripped from the
+# first comma onwards once the comma is followed by a role keyword. Catches:
+#   "GILCHRIST, SINGLE MAN"
+#   "Powell, Mortgagor"
+#   "SIMMONS, AN UNMARRIED PERSON"
+#   "JONES, husband and wife"
+#   "SMITH, a widow"
+#   "DOE, as Trustee"
+# Anything after the matched comma is dropped.
+_ROLE_SUFFIX_RE = re.compile(
+    r",\s*(?:a\s+|an\s+|as\s+|the\s+)?"
+    r"(?:single|married|unmarried|surviving|widow(?:er)?|deceased|"
+    r"mortgagor|borrower|spouse|trustee|grantor|grantee|tenant|"
+    r"petitioner|respondent|husband|wife|"
+    r"executor|executrix|administrator|administratrix|"
+    r"personal\s+representative|attorney(?:-in-fact)?|"
+    r"individually|jointly|as\s+joint|in\s+his|in\s+her|in\s+their)"
+    r"(?:.*)$",  # everything from this point to end of string
+    re.IGNORECASE,
+)
+
+# Bare role suffix without comma — e.g. "JONES SINGLE MAN" or "DOE WIDOW".
+# Rare but seen. Matches the role keyword as a trailing whole-word and drops it.
+_BARE_ROLE_SUFFIX_RE = re.compile(
+    r"\s+(?:a\s+|an\s+)?"
+    r"(?:single\s+(?:man|woman|person)|"
+    r"unmarried\s+(?:man|woman|person)|"
+    r"married\s+(?:man|woman|person|couple)|"
+    r"husband\s+and\s+wife|wife\s+and\s+husband|widow(?:er)?)$",
+    re.IGNORECASE,
+)
+
+
 def _clean_and_split_name(full_name: str) -> tuple[str, str]:
     """Clean a full name for DataSift upload and split into (first, last).
 
@@ -149,11 +204,29 @@ def _clean_and_split_name(full_name: str) -> tuple[str, str]:
     - Joint names with "&" or "AND": "John & Jane Smith" → ("John", "Smith")
     - Entity names (LLC, Trust, etc.): returns ("", "") — entity goes to Notes
     - Special characters: strips &, @, #, % from name parts
+    - Role suffixes from foreclosure/probate legalese:
+      ", a single man" / ", an unmarried person" / ", mortgagor" /
+      ", husband and wife" / ", a widow" / etc. — stripped before splitting
+    - Prefixes that bleed in from estate/heir parsing:
+      "Estate of ..." / "of ..." / "Heirs of ..." — stripped so the actual
+      person name is what gets split
     """
     if not full_name:
         return ("", "")
 
     name = full_name.strip()
+
+    # Strip estate / heir / "of"-leading prefixes that escaped upstream cleanup.
+    # Repeats once to catch chained prefixes like "Heirs of the Estate of NAME".
+    for _ in range(2):
+        name = _ESTATE_PREFIX_RE.sub("", name).strip()
+
+    # Strip trailing role-suffix legalese (everything from `,` onwards once the
+    # comma is followed by a role keyword). Catches "GILCHRIST, SINGLE MAN",
+    # "Powell, Mortgagor", "SIMMONS, AN UNMARRIED PERSON", etc.
+    name = _ROLE_SUFFIX_RE.sub("", name).strip()
+    # Also handle role suffixes not preceded by a comma (rare but seen)
+    name = _BARE_ROLE_SUFFIX_RE.sub("", name).strip()
 
     # Entity names → empty (don't put business names in person fields)
     if _is_entity_name(name):
@@ -211,19 +284,120 @@ def _split_name(full_name: str) -> tuple[str, str]:
 
 
 # Map notice_type → DataSift list name for niche sequential marketing.
-# DataSift auto-creates lists from CSV if they don't exist yet.
+# BOTH the DMs CSV and the Heirs CSV use this mapping for the Lists column —
+# heirs land in the SAME DataSift list as the DM (Foreclosure, Probate, etc.)
+# and are distinguished only by the per-row ``heir_of_<notice_type>`` tag.
+# This avoids needing separate "Heirs of X" lists in DataSift.
 NOTICE_TYPE_TO_LIST = {
     "foreclosure": "Foreclosure",
     "probate": "Probate",
-    "tax_sale": "Tax Sale",
+    "pre_probate": "Pre-Probate",
+    "tax_sale": "Tax Delinquent",
     "tax_delinquent": "Tax Delinquent",
     "eviction": "Eviction",
     "code_violation": "Code Violation",
     "divorce": "Divorce",
 }
 
+# Display-only labels for heir-row uploads in run summaries / Slack messages.
+# These do NOT correspond to real DataSift lists — heir records land in
+# NOTICE_TYPE_TO_LIST[notice_type] (same as DMs) and are tagged with
+# ``heir_of_<notice_type>`` so filter presets can target them. Used by the
+# run-summary formatter to display "→ Heirs of Foreclosure" instead of
+# "→ Foreclosure" when reporting heir-CSV uploads.
+HEIRS_DISPLAY_LABELS = {
+    "foreclosure": "Heirs of Foreclosure",
+    "probate": "Heirs of Probate",
+    "pre_probate": "Heirs of Pre-Probate",
+    "tax_sale": "Heirs of Tax Delinquent",
+    "tax_delinquent": "Heirs of Tax Delinquent",
+    "eviction": "Heirs of Eviction",
+    "code_violation": "Heirs of Code Violation",
+    "divorce": "Heirs of Divorce",
+}
 
-def _build_tags(notice: NoticeData) -> str:
+
+_PHONE_TIER_TAG = {
+    "Dial First":  "phone_dial_first",
+    "Dial Second": "phone_dial_second",
+    "Dial Third":  "phone_dial_third",
+    "Dial Fourth": "phone_dial_fourth",
+    "Drop":        "phone_drop",
+}
+# Priority order for "best tier" selection — lower index wins
+_PHONE_TIER_RANK = ["Dial First", "Dial Second", "Dial Third", "Dial Fourth", "Drop"]
+
+
+def _collect_notice_phones(notice: NoticeData) -> list[str]:
+    """Return every phone number attached to a notice (DM + heirs), in CSV column
+    order. Phones are returned as raw strings — caller normalizes for lookup."""
+    phones: list[str] = []
+    for attr in (
+        "primary_phone", "mobile_1", "mobile_2", "mobile_3", "mobile_4", "mobile_5",
+        "landline_1", "landline_2", "landline_3",
+    ):
+        v = getattr(notice, attr, "") or ""
+        if v.strip():
+            phones.append(v.strip())
+    return phones
+
+
+def _phone_tier_tags(notice: NoticeData, phone_tiers: dict | None) -> list[str]:
+    """Compute Trestle-derived tags for a notice based on its phone scores.
+
+    Emits:
+      - phone_dial_first / phone_dial_second / ... — BEST tier across all
+        phones on the record (so a filter preset for `phone_dial_first` catches
+        records where AT LEAST ONE phone is top-tier)
+      - phone_litigator_risk — any phone flagged via Trestle litigator_checks
+      - phone_unscored — record has phones but none have Trestle data yet
+
+    Returns an empty list if the record has no phones at all (so we don't
+    pollute non-phone records with phone_unscored).
+    """
+    if phone_tiers is None:
+        phone_tiers = {}
+
+    raw_phones = _collect_notice_phones(notice)
+    if not raw_phones:
+        return []
+
+    from phone_validator import clean_phone  # local import — avoids hard dep
+
+    out: list[str] = []
+    seen_tiers: set[str] = set()
+    has_score = False
+    has_litigator = False
+
+    for raw in raw_phones:
+        cleaned = clean_phone(raw)
+        info = phone_tiers.get(cleaned) if cleaned else None
+        if not info:
+            continue
+        has_score = True
+        tier = info.get("tier") or ""
+        if tier in _PHONE_TIER_TAG:
+            seen_tiers.add(tier)
+        if info.get("is_litigator_risk"):
+            has_litigator = True
+
+    if not has_score:
+        out.append("phone_unscored")
+        return out
+
+    # Pick the BEST tier across all phones on the record
+    for tier in _PHONE_TIER_RANK:
+        if tier in seen_tiers:
+            out.append(_PHONE_TIER_TAG[tier])
+            break
+
+    if has_litigator:
+        out.append("phone_litigator_risk")
+
+    return out
+
+
+def _build_tags(notice: NoticeData, phone_tiers: dict | None = None) -> str:
     """Build comma-separated tags string for DataSift upload.
 
     Tags include:
@@ -234,6 +408,9 @@ def _build_tags(notice: NoticeData) -> str:
     - deceased/living status
     - DM confidence level (for deceased records)
     - has_auction if auction date is upcoming
+    - phone_dial_first / phone_dial_second / phone_drop / phone_unscored —
+      Trestle-derived best phone tier (when ``phone_tiers`` is passed in)
+    - phone_litigator_risk — TCPA risk flag from Trestle litigator_checks
     """
     tags = ["Courthouse Data"]
 
@@ -268,16 +445,46 @@ def _build_tags(notice: NoticeData) -> str:
             auction_dt = datetime.strptime(notice.auction_date, "%Y-%m-%d")
             if auction_dt >= datetime.now():
                 tags.append("has_auction")
+            # Per-date tag for DataSift filter presets that target a specific
+            # foreclosure window (e.g. "show me everything auctioned this week").
+            # Format: foreclosure_YYYY-MM-DD for foreclosure notices, otherwise
+            # auction_YYYY-MM-DD (tax-sale uses tax_auction_YYYY-MM-DD).
+            iso = auction_dt.strftime("%Y-%m-%d")
+            if notice.notice_type == "foreclosure":
+                tags.append(f"foreclosure_{iso}")
+            elif notice.notice_type == "tax_sale":
+                tags.append(f"tax_auction_{iso}")
+            else:
+                tags.append(f"auction_{iso}")
         except ValueError:
             pass
 
-    # Tax delinquent flag
+    # Tax delinquent flag + dollar-exposure ladder. Phase 1 focuses on dollar
+    # amount as the primary distress signal; timeline-based tags are intentionally
+    # absent because Madison's feed surfaces only current-year delinquencies
+    # (older years are pruned after the May auction or redemption).
     if notice.tax_delinquent_amount:
         try:
             amt = float(notice.tax_delinquent_amount)
             if amt > 0:
                 tags.append("tax_delinquent")
+            if amt >= 5000:
+                tags.append("tax_high_exposure")
+            if amt >= 10000:
+                tags.append("tax_high_exposure_10k")
         except (ValueError, TypeError):
+            pass
+
+    # Individual-vs-entity flag for tax records — reuse existing BUSINESS_RE
+    # check so DataSift filter presets can target individuals only.
+    if notice.notice_type in ("tax_sale", "tax_delinquent") and notice.owner_name:
+        try:
+            from config import BUSINESS_RE
+            if not BUSINESS_RE.search(notice.owner_name):
+                tags.append("individual_owner")
+            else:
+                tags.append("entity_owned")
+        except ImportError:
             pass
 
     # Deep prospecting tags
@@ -331,34 +538,140 @@ def _build_tags(notice: NoticeData) -> str:
     if notice.source_url and notice.source_url.startswith("photo:"):
         tags.append("photo_import")
 
+    # ── Tier classification (investor-target ZIP) ────────────────────
+    # Every record runs through zip_tier() so DataSift filter presets can
+    # sort/segment by tier without re-deriving from ZIP. "in_tier" is the
+    # umbrella tag (matches BOTH tier_1 and tier_2) so a single filter
+    # condition keeps the entire investor-target set; the granular tags
+    # (tier_1 / tier_2) let presets target priority vs. secondary
+    # separately. Off-tier records get NO tier tag at all — easy to spot
+    # in DataSift via "no tier_1 AND no tier_2".
+    if notice.zip:
+        try:
+            from target_zips import zip_tier
+            t = zip_tier(notice.zip)
+            if t == 1:
+                tags.append("tier_1")
+                tags.append("in_tier")
+            elif t == 2:
+                tags.append("tier_2")
+                tags.append("in_tier")
+        except ImportError:
+            pass
+
+    # ── AL probate enrichment tags (filter-preset friendly) ─────────
+    # Municipality (Jefferson DispCode or Madison gap) — lowercased, spaces → underscores.
+    # Birmingham metro core: birmingham, hoover, vestavia_hills, mountain_brook, homewood,
+    # trussville. "county" flags unincorporated Jefferson (Dora-edge cases, etc.).
+    if notice.municipality:
+        muni_tag = notice.municipality.lower().replace(" ", "_")
+        tags.append(f"municipality_{muni_tag}")
+
+    # Homestead = primary residence (vs investment / vacant land)
+    if notice.is_homestead == "Y":
+        tags.append("homestead")
+
+    # Notice subtype — the descriptive category (probate_sale, probate_creditors,
+    # probate_heirs_notice, unsafe_building, etc.). Filter presets target this.
+    if notice.notice_subtype:
+        tags.append(notice.notice_subtype)
+
+    # Tear-down signal — every parcel on a city's Unsafe-Building / Condemned
+    # list is, by definition, a demolition candidate. Tag explicitly so the
+    # outreach sequence frames the conversation around tear-down economics
+    # (lot value, demo cost, build-back ARV) rather than rehab.
+    if notice.notice_subtype == "unsafe_building":
+        tags.append("demolish")
+
+    # Early-distress signal — Birmingham Accela code-enforcement subtypes that
+    # indicate soft maintenance failures (tall grass, junk vehicles, IPMC
+    # violations). Owner is still in the property but slipping; outreach
+    # framing is "rehab/clean-up offer" not "tear-down".
+    if notice.notice_subtype in (
+        "housing_enforcement",
+        "inoperable_vehicle",
+        "environmental_enforcement",
+        "zoning_enforcement",
+    ):
+        tags.append("early_distress")
+
+    # Multi-parcel estate — owner has 2+ parcels (rentals + family land)
+    if notice.secondary_addresses:
+        tags.append("multi_parcel")
+
+    # Upcoming hearing (probate_sale) — make offer before court approval closes
+    if notice.hearing_date:
+        try:
+            hd = datetime.strptime(notice.hearing_date, "%Y-%m-%d")
+            days = (hd - datetime.now()).days
+            if 0 <= days <= 30:
+                tags.append("hearing_upcoming")
+        except ValueError:
+            pass
+
+    # Creditor window still open (probate_creditors) — claims period not yet closed
+    if notice.creditor_deadline:
+        try:
+            cd = datetime.strptime(notice.creditor_deadline, "%Y-%m-%d")
+            if cd >= datetime.now():
+                tags.append("creditor_window_open")
+        except ValueError:
+            pass
+
+    # Trestle-derived phone tier tags (added last so they appear after the
+    # subject-matter tags in the joined string, easier to spot at a glance)
+    tags.extend(_phone_tier_tags(notice, phone_tiers))
+
     return ",".join(tags)
 
 
 def _get_contact_info(notice: NoticeData) -> dict:
     """Determine the contact person and mailing address.
 
-    For deceased owners with a decision maker: contact = DM
-    For living owners: contact = property owner
-    For entity-owned properties: try tax_owner_name or DM as real person fallback
+    For deceased owners with a decision maker: contact = DM (the live person
+    we can actually market to). DM mailing address is used as-is; we do NOT
+    fall back to the property address because that's the decedent's house,
+    not the DM's — populating it as the DM's mailing pollutes skip-trace
+    (the service would search for "JANE EXECUTOR @ 123 Dead Person Dr"
+    instead of finding Jane's real address). Leaving mailing blank lets the
+    skip-trace work on name + city/state context only.
 
-    Mailing address always falls back to property address to avoid DataSift
-    marking records as incomplete.
+    Self-DM guard: when the obit / probate extractor falsely set the DM name
+    to the decedent's own name (happens when the obit lists no separate
+    survivors), we fall through to the living-owner path so we don't end up
+    marketing to a dead person under their own name.
+
+    For living owners: contact = property owner. Mailing falls back to
+    property address here (the living owner DOES live there in the common
+    case — owner-occupied foreclosure / probate).
+
+    For entity-owned properties: try tax_owner_name or DM as real person
+    fallback.
     """
     if notice.owner_deceased == "yes" and notice.decision_maker_name:
-        first, last = _split_name(notice.decision_maker_name)
-        # Fall back to property address when DM has no mailing address
-        street = notice.decision_maker_street or notice.address
-        city = notice.decision_maker_city or notice.city
-        state = notice.decision_maker_state or notice.state
-        zip_code = notice.decision_maker_zip or notice.zip
-        return {
-            "first": first,
-            "last": last,
-            "street": street,
-            "city": city,
-            "state": state,
-            "zip": zip_code,
-        }
+        # Reject self-DM (DM name == decedent name) — fall through to the
+        # living-owner path so the decedent's name lands in the owner field
+        # as a last-resort identifier rather than a falsely-mapped "DM".
+        dm_norm = notice.decision_maker_name.strip().lower()
+        dec_norm = (notice.decedent_name or "").strip().lower()
+        if not (dm_norm and dec_norm and dm_norm == dec_norm):
+            first, last = _split_name(notice.decision_maker_name)
+            # DM mailing — do NOT fall back to property address. State falls
+            # back to the property state since the DM is most likely in the
+            # same state as the inherited property and skip-trace needs
+            # state context. Street/city/zip stay blank when unknown.
+            street = notice.decision_maker_street
+            city = notice.decision_maker_city
+            state = notice.decision_maker_state or notice.state
+            zip_code = notice.decision_maker_zip
+            return {
+                "first": first,
+                "last": last,
+                "street": street,
+                "city": city,
+                "state": state,
+                "zip": zip_code,
+            }
 
     # Living owner — try owner_name first
     first, last = _split_name(notice.owner_name)
@@ -440,7 +753,11 @@ def _build_heir_summary(notice: NoticeData) -> str:
             street = h.get("street", "")
             if street:
                 city = h.get("city", "")
-                state = h.get("state", "TN")
+                # Fall back to the notice's own state when the heir record
+                # didn't capture one (catches the "Birmingham, TN" bug for
+                # AL records). Final fallback to "AL" since all active
+                # pipelines are Alabama.
+                state = h.get("state") or notice.state or "AL"
                 zip_code = h.get("zip", "")
                 addr_parts = [street]
                 if city:
@@ -530,6 +847,44 @@ def _build_property_section(notice: NoticeData) -> str:
         if notice.tax_delinquent_years:
             tax_str += f" ({notice.tax_delinquent_years} yrs)"
         parts.append(tax_str)
+
+    # ── Probate-specific extras ──
+    if notice.case_number:
+        parts.append(f"Case#: {notice.case_number}")
+    if notice.judge_name:
+        parts.append(f"Judge: {notice.judge_name}")
+    if notice.granted_date and notice.notice_type == "probate":
+        parts.append(f"Letters Granted: {_format_date(notice.granted_date)}")
+    if notice.creditor_deadline:
+        parts.append(f"Creditor Deadline: {_format_date(notice.creditor_deadline)}")
+    if notice.notice_subtype == "probate_sale":
+        if notice.petition_filed_date:
+            parts.append(f"Petition Filed: {_format_date(notice.petition_filed_date)}")
+        if notice.hearing_date:
+            parts.append(f"Hearing: {_format_date(notice.hearing_date)}")
+        if notice.sale_type:
+            parts.append(f"Sale Type: {notice.sale_type}")
+    if notice.co_pr_names:
+        parts.append(f"Co-PRs: {notice.co_pr_names}")
+    if notice.heirs_named_in_notice and notice.notice_subtype == "probate_heirs_notice":
+        parts.append(f"Named Heirs: {notice.heirs_named_in_notice}")
+    if notice.secondary_addresses:
+        parts.append(f"Additional Parcels: {notice.secondary_addresses}")
+    if notice.total_estate_value:
+        parts.append(f"Total Estate Value: ${notice.total_estate_value}")
+    if notice.municipality:
+        parts.append(f"Municipality: {notice.municipality}")
+
+    # ── Foreclosure-specific extras ──
+    if notice.notice_type == "foreclosure":
+        if notice.mortgage_company:
+            parts.append(f"Mortgagee: {notice.mortgage_company}")
+        if notice.original_lender:
+            parts.append(f"Original Lender: {notice.original_lender}")
+        if notice.trustee:
+            parts.append(f"Trustee: {notice.trustee}")
+        if notice.trustee_file_number:
+            parts.append(f"File#: {notice.trustee_file_number}")
 
     if notice.source_url:
         parts.append(f"Source: {notice.source_url}")
@@ -668,19 +1023,37 @@ def _validate_row(row: dict) -> tuple[bool, list[str]]:
     return (len(issues) == 0, issues)
 
 
-def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
+def _build_row(
+    notice: NoticeData,
+    notes_override: str | None = None,
+    is_heir_row: bool = False,
+    phone_tiers: dict | None = None,
+) -> dict:
     """Build a single CSV row dict for a NoticeData record.
 
     Args:
         notice: The notice to format.
         notes_override: If provided, use this as the Notes value instead of
             calling _build_notes(). Used by write_datasift_split_csvs().
+        is_heir_row: When True, appends a ``heir_of_<notice_type>`` tag to
+            the Tags column so DataSift filter presets can target "Heirs of
+            Foreclosure" / "Heirs of Probate" / etc. without changing which
+            list the row belongs to. Set by the Heirs CSV writer in
+            write_datasift_split_csvs().
+        phone_tiers: Optional ``{cleaned_phone: {"tier": str, ...}}`` dict
+            from Trestle (via ``full_pipeline.result.phone_tiers``). When
+            provided, the row's Tags column gets phone_dial_first /
+            phone_dial_second / phone_drop / phone_unscored tags plus
+            phone_litigator_risk when applicable.
 
     Returns:
         Dict keyed by DATASIFT_COLUMNS headers.
     """
     contact = _get_contact_info(notice)
-    tags = _build_tags(notice)
+    tags = _build_tags(notice, phone_tiers=phone_tiers)
+    if is_heir_row and notice.notice_type:
+        heir_tag = f"heir_of_{notice.notice_type}"
+        tags = f"{tags},{heir_tag}" if tags else heir_tag
     list_name = NOTICE_TYPE_TO_LIST.get(notice.notice_type, "")
     notes = notes_override if notes_override is not None else _build_notes(notice)
 
@@ -693,18 +1066,26 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
     elif notice.notice_type == "foreclosure":
         foreclosure_date = _format_date(notice.auction_date)
     elif notice.notice_type == "probate":
-        probate_open = _format_date(notice.date_added)
+        # Prefer granted_date (when Letters issued) over publication date — more accurate
+        probate_open = _format_date(notice.granted_date or notice.date_added)
 
-    # Personal Representative only for probate notices
+    # Personal Representative for probate — prefer the parsed PR (owner_name)
+    # over the obituary-derived decision_maker_name. owner_name is the verified
+    # PR named in the Letters Testamentary; decision_maker_name may be a
+    # surviving heir derived from the obituary.
     personal_rep = ""
-    if notice.notice_type == "probate" and notice.decision_maker_name:
-        personal_rep = notice.decision_maker_name
+    if notice.notice_type == "probate":
+        personal_rep = notice.owner_name or notice.decision_maker_name
+
+    # Fallbacks — assessor data when Zillow enrichment hasn't run
+    estimated_value = notice.estimated_value or notice.assessed_value
+    structure_type = notice.property_type or notice.property_use
 
     return {
         # ── Core auto-mapped ──
         "Property Street Address": notice.address,
         "Property City": notice.city,
-        "Property State": notice.state or "TN",
+        "Property State": notice.state or "AL",
         "Property ZIP Code": notice.zip,
         "Owner First Name": contact["first"],
         "Owner Last Name": contact["last"],
@@ -731,7 +1112,7 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
         "Lists": list_name,
         "Notes": notes,
         # ── Built-in fields ──
-        "Estimated Value": notice.estimated_value,
+        "Estimated Value": estimated_value,
         "MSL Status": notice.mls_status,
         "Last Sale Date": _format_date(notice.mls_last_sold_date),
         "Last Sale Price": notice.mls_last_sold_price,
@@ -743,7 +1124,7 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
         "Probate Open Date": probate_open,
         "Personal Representative": personal_rep,
         "Parcel ID": notice.parcel_id,
-        "Structure Type": notice.property_type,
+        "Structure Type": structure_type,
         "Year Built": notice.year_built,
         "Living SqFt": notice.sqft,
         "Bedrooms": notice.bedrooms,
@@ -780,18 +1161,30 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
         "Entity Type": notice.entity_type,
         "Entity Contact": notice.entity_person_name,
         "Entity Contact Role": notice.entity_person_role,
+        # ── AL probate enrichment ──
+        "Probate Case Number": notice.case_number,
+        "Judge of Probate": notice.judge_name,
+        "Probate Subtype": notice.notice_subtype,
+        "Petition Filed Date": _format_date(notice.petition_filed_date),
+        "Hearing Date": _format_date(notice.hearing_date),
+        "Creditor Claim Deadline": _format_date(notice.creditor_deadline),
+        "Total Estate Value": notice.total_estate_value,
     }
 
 
 def write_datasift_csv(
     notices: list[NoticeData],
     filename: str | None = None,
+    phone_tiers: dict | None = None,
 ) -> Path:
     """Write notices to a DataSift-formatted CSV file.
 
     Args:
         notices: List of enriched NoticeData objects.
         filename: Optional filename override.
+        phone_tiers: Optional Trestle scoring dict from
+            ``phone_validator.score_record_phones`` — passed through to
+            ``_build_row`` so phone_dial_first/etc. tags land on each row.
 
     Returns:
         Path to the written CSV file.
@@ -800,7 +1193,10 @@ def write_datasift_csv(
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         filename = f"datasift_upload_{timestamp}.csv"
 
-    output_path = OUTPUT_DIR / filename
+    # If caller passed a path (absolute or relative-with-dir), use it as-is.
+    # If they passed a bare filename, drop it in OUTPUT_DIR.
+    fn_path = Path(filename)
+    output_path = fn_path if fn_path.is_absolute() or fn_path.parent != Path(".") else OUTPUT_DIR / filename
     written = 0
     incomplete = 0
     issue_counts: dict[str, int] = {}
@@ -810,7 +1206,7 @@ def write_datasift_csv(
         writer.writeheader()
 
         for notice in notices:
-            row = _build_row(notice)
+            row = _build_row(notice, phone_tiers=phone_tiers)
             is_complete, issues = _validate_row(row)
             if not is_complete:
                 incomplete += 1
@@ -833,6 +1229,7 @@ def write_datasift_csv(
 def write_datasift_split_csvs(
     notices: list[NoticeData],
     date_str: str | None = None,
+    phone_tiers: dict | None = None,
 ) -> list[dict]:
     """Generate separate DM and Heir Map CSVs for two-upload Message Board flow.
 
@@ -845,6 +1242,8 @@ def write_datasift_split_csvs(
     Args:
         notices: List of enriched NoticeData objects.
         date_str: Optional date string for filenames/list names (default: today).
+        phone_tiers: Optional Trestle scoring dict — applied to both DMs and
+            Heirs rows so phone_dial_first/etc. tags appear on every row.
 
     Returns:
         List of dicts: [{"path": Path, "label": str, "list_name": str}, ...]
@@ -865,7 +1264,11 @@ def write_datasift_split_csvs(
         writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
         writer.writeheader()
         for notice in notices:
-            row = _build_row(notice, notes_override=_build_dm_notes(notice))
+            row = _build_row(
+                notice,
+                notes_override=_build_dm_notes(notice),
+                phone_tiers=phone_tiers,
+            )
             is_complete, issues = _validate_row(row)
             if not is_complete:
                 incomplete += 1
@@ -900,7 +1303,12 @@ def write_datasift_split_csvs(
             writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
             writer.writeheader()
             for notice in deceased_with_heirs:
-                row = _build_row(notice, notes_override=_build_heir_notes(notice))
+                row = _build_row(
+                    notice,
+                    notes_override=_build_heir_notes(notice),
+                    is_heir_row=True,
+                    phone_tiers=phone_tiers,
+                )
                 writer.writerow(row)
                 heir_written += 1
 
