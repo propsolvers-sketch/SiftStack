@@ -35,7 +35,12 @@ from config import (
     SEL_SEARCH_TYPE_OR,
 )
 from foreclosure_filter import is_valid_foreclosure
-from notice_parser import NoticeData, is_target_county_async, parse_notice_page
+from notice_parser import (
+    NoticeData,
+    is_target_county_async,
+    parse_notice_page,
+    snippet_passes_county_filter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +356,7 @@ async def run_search(
     max_notices: int = 0,
     seen_ids: dict[str, str] | None = None,
     captcha_failed_ids: dict[str, dict] | None = None,  # reserved: CAPTCHA fallback queue
+    snippet_dropped_ids: set[str] | None = None,
 ) -> list[NoticeData]:
     """Submit search form, paginate through all result pages, scrape each notice."""
     days_back = search.days_back
@@ -406,10 +412,36 @@ async def run_search(
             if seen_ids is not None and notice_id in seen_ids:
                 logger.info("  Skipping already-processed notice ID=%s", notice_id)
                 continue
+            # P2 #7: persistent snippet-drop cache. The same statewide
+            # query (e.g. probate "Estate Deceased") runs 3x — once per
+            # county-labeled SearchConfig — and without persistence each
+            # run re-pays the snippet filter check on the same non-target
+            # IDs. Free per-row but adds ~5 min wall time per re-run.
+            # Skip rows we've already dropped at snippet level in a prior
+            # search this session.
+            if snippet_dropped_ids is not None and notice_id in snippet_dropped_ids:
+                continue
 
             # Snippet pre-filter: notice type appears in first line — cheap check
-            # before paying CAPTCHA cost. County/address are not in 300-char snippets.
+            # before paying CAPTCHA cost. Snippets are 2KB and DO contain
+            # courthouse/county markers for probate + many other notice types.
             snippet_notice = _notice_from_snippet(row, search, session_base, pub_date)
+
+            # 1) County pre-filter: drops notices for non-target Alabama
+            #    counties without paying CAPTCHA. Critical for statewide
+            #    queries like probate "Estate Deceased" (~1,000 results /
+            #    14-day window across all 67 AL counties, of which ~80% are
+            #    non-target). See notice_parser.snippet_passes_county_filter
+            #    for the decision rules.
+            if not snippet_passes_county_filter(row.get("snippet", "") or ""):
+                logger.debug("  Snippet pre-filter: non-target AL county %s", notice_id)
+                if snippet_dropped_ids is not None:
+                    snippet_dropped_ids.add(notice_id)
+                continue
+
+            # 2) Foreclosure-specific validity check (skip notices whose
+            #    snippet doesn't contain trustee-sale language even when the
+            #    keyword search matched something incidental).
             if not is_valid_foreclosure(snippet_notice):
                 logger.debug("  Snippet pre-filter: not valid foreclosure %s", notice_id)
                 continue
@@ -593,6 +625,12 @@ async def scrape_all(
         logger.info("Historical mode: pulling notices since %s", since_date)
 
     all_notices: list[NoticeData] = []
+    # Snippet-drop cache: persists across SearchConfig iterations within
+    # this scrape_all call. Multiple SearchConfigs with identical
+    # search_terms (e.g. "Estate Deceased" probate across Jefferson +
+    # Madison + Marshall county labels) all surface the same statewide
+    # result set; without this cache each re-pays the snippet pre-filter.
+    snippet_dropped_ids: set[str] = set()
 
     async with async_playwright() as p:
         launch_opts: dict = {"headless": True}
@@ -626,6 +664,7 @@ async def scrape_all(
                     on_page_batch=on_batch, start_page=start_page,
                     max_notices=remaining, seen_ids=seen_ids,
                     captcha_failed_ids=captcha_failed_ids,
+                    snippet_dropped_ids=snippet_dropped_ids,
                 )
                 all_notices.extend(search_notices)
             except Exception:

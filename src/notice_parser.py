@@ -662,11 +662,56 @@ _INVALID_NAMES = {
     # PR/owner name. These are role descriptors or sentence fragments,
     # never real person names.
     "for the estate", "of the estate", "of the state",
-    "under the will", "personal representative", "executor of",
+    "under the will", "of the will",
+    "personal representative", "executor of",
     "administrator of", "executrix of", "administratrix of",
     "co-personal representative", "barred", "having been",
     "to be barred", "letters testamentary",
+    # P2 #8: live-observed leaks — these phrases were captured as PR
+    # names in 2026-05-13 main.py daily run (Embril Dale Edwards →
+    # "Of The Will"; Willie James Fitts → "A Protected Person, Now";
+    # Linda Gay Fullman → "A.K.A. Linda G. Fullman").
+    "a protected person", "an incapacitated person", "an adult",
+    "a/k/a", "a.k.a.", "aka",
 }
+
+
+# P2 #8: legal-qualifier phrases that get appended to decedent names in
+# AL probate notices and must be stripped before the property locator runs.
+# Examples observed in 2026-05-13 main.py daily:
+#   "Jean Sutliffe, A Protected Person, Now Deceased"
+#       → cleaned to "Jean Sutliffe"
+#   "Linda Gay Fullman, A.K.A. Linda G. Fullman, Deceased"
+#       → cleaned to "Linda Gay Fullman"
+_DECEDENT_NAME_SUFFIX_RE = re.compile(
+    r",\s*(?:"
+    r"a\s+protected\s+person"
+    r"|an?\s+incapacitated\s+person"
+    r"|an?\s+adult"
+    r"|a[./]?k[./]?a[.\s]"
+    r"|aka\s"
+    r"|now"
+    r"|deceased"
+    r").*$",
+    re.IGNORECASE,
+)
+
+
+def _clean_decedent_name(name: str) -> str:
+    """Strip trailing legal-qualifier phrases from a decedent name.
+
+    Probate notices often append clarifying phrases (", A Protected Person,
+    Now Deceased" / ", A.K.A. ..." / ", an Adult") that get captured by
+    the DECEDENT_NAME_RE non-greedy match. These phrases break the
+    downstream property locator (searches "Jean Sutliffe A Protected Person
+    Now" instead of "Jean Sutliffe") so we strip them here before storing.
+    """
+    if not name:
+        return name
+    cleaned = _DECEDENT_NAME_SUFFIX_RE.sub("", name).strip()
+    # Trim trailing punctuation
+    cleaned = cleaned.rstrip(",.;:")
+    return cleaned
 
 
 def _is_valid_name(name: str) -> bool:
@@ -870,7 +915,7 @@ _STATE_HEADER_COUNTY_RE = re.compile(
 )
 
 # Counties we care about — notices for other counties are false positives
-_TARGET_COUNTIES = {"jefferson", "madison"}
+_TARGET_COUNTIES = {"jefferson", "madison", "marshall"}
 
 
 def _detect_counties_via_regex(text: str) -> set[str]:
@@ -886,6 +931,41 @@ def _detect_counties_via_regex(text: str) -> set[str]:
               + county_of_matches + state_header_matches):
         mentioned.add(c.lower())
     return mentioned
+
+
+def snippet_passes_county_filter(snippet: str) -> bool:
+    """Cheap pre-CAPTCHA county pre-filter for APN search-result snippets.
+
+    APN's search box has no county filter (statewide full-text) and probate
+    searches like "Estate Deceased" return ~1,000 notices per 14-day window
+    across all 67 Alabama counties. Without a pre-filter, every notice gets
+    CAPTCHA-solved at ~$0.003 each just to apply the downstream county check.
+
+    This function reads the 2KB result-row snippet (free — no CAPTCHA) and
+    drops notices that clearly belong to a non-target county. Decision rules:
+
+    - Snippet mentions ≥1 target county (jefferson/madison/marshall): KEEP.
+      Will pass the full post-CAPTCHA county filter.
+    - Snippet mentions a non-target county AND no target county: DROP. The
+      notice is for some other Alabama county and we don't want it.
+    - Snippet mentions no county at all: KEEP (don't risk a false negative —
+      some notices have the county only in the body, not the snippet header).
+
+    Trades a small false-negative rate (notices whose snippet is too short
+    to contain the county marker) for a ~80%+ CAPTCHA-cost reduction on
+    statewide searches like probate Notice-to-Creditors.
+    """
+    if not snippet:
+        return True
+    mentioned = _detect_counties_via_regex(snippet)
+    if not mentioned:
+        # No county detected anywhere — can't tell, keep it (cheap to
+        # CAPTCHA + drop downstream than to miss a real target hit).
+        return True
+    if mentioned & _TARGET_COUNTIES:
+        return True
+    # Snippet mentions only non-target counties — safe to drop.
+    return False
 
 
 def is_target_county(text: str, search_county: str) -> bool:
@@ -1146,16 +1226,23 @@ async def parse_notice_page(
     _parse_foreclosure_parties(notice)
 
     # ── LLM fallback for missing fields ──────────────────────────
+    # pre_probate (APN "Notice of Death" publications) is shaped like probate
+    # but typically lacks case_number / granted_date — we just need
+    # decedent_name + optional contact. Reuse probate trigger conditions
+    # without the strict case/judge/granted requirements.
     needs_llm = (
         (notice_type == "probate" and (
             not notice.owner_name or not notice.decedent_name or not notice.owner_street
             or not notice.case_number or not notice.judge_name or not notice.granted_date
         ))
+        or (notice_type == "pre_probate" and (
+            not notice.decedent_name or not notice.owner_name
+        ))
         or (notice_type == "foreclosure" and (
             not notice.address or not notice.owner_name or not notice.auction_date
             or not notice.mortgage_company or not notice.trustee
         ))
-        or (notice_type not in ("probate", "foreclosure") and (
+        or (notice_type not in ("probate", "pre_probate", "foreclosure") and (
             not notice.address or not notice.owner_name or not notice.auction_date
         ))
     )
@@ -1169,7 +1256,7 @@ async def parse_notice_page(
         if notice_type == "probate":
             # Probate: fill decedent name, PR name, and PR mailing address
             if not notice.decedent_name and llm_result.get("decedent_name"):
-                cand = llm_result["decedent_name"].strip()
+                cand = _clean_decedent_name(llm_result["decedent_name"].strip())
                 if _is_valid_name(cand):
                     notice.decedent_name = cand
                     logger.info("LLM filled decedent: %s", notice.decedent_name)
@@ -1183,7 +1270,7 @@ async def parse_notice_page(
             if not notice.owner_street and llm_result.get("owner_street"):
                 notice.owner_street = llm_result["owner_street"]
                 notice.owner_city = llm_result.get("owner_city") or notice.owner_city
-                notice.owner_state = llm_result.get("owner_state") or notice.state or "TN"
+                notice.owner_state = llm_result.get("owner_state") or notice.state or "AL"
                 notice.owner_zip = llm_result.get("owner_zip") or notice.owner_zip
                 logger.info("LLM filled PR address: %s", notice.owner_street)
             # Probate metadata (case#, judge, granted date)
@@ -1548,6 +1635,9 @@ def _parse_name(notice: NoticeData) -> None:
         dec_match = DECEDENT_NAME_RE.search(text)
         if dec_match:
             dec_name = _clean_name(dec_match.group(1))
+            # Strip legal-qualifier phrases like ", A Protected Person, Now",
+            # ", A.K.A. ...", ", an Adult" — they break the property locator.
+            dec_name = _clean_decedent_name(dec_name)
             if _is_valid_name(dec_name):
                 notice.decedent_name = dec_name
 
@@ -1897,8 +1987,9 @@ def _parse_pr_address(notice: NoticeData) -> None:
             street = street.title()
         notice.owner_street = street
         notice.owner_city = _clean_city(match.group(2))
-        # Use the notice's state if known (set at scrape time, e.g. "AL"); fall back to TN
-        notice.owner_state = notice.state or "TN"
+        # Use the notice's state if known (set at scrape time, e.g. "AL");
+        # fall back to AL since all active pipelines are Alabama.
+        notice.owner_state = notice.state or "AL"
         notice.owner_zip = match.group(3)
         logger.debug(
             "PR address: %s, %s, %s %s",

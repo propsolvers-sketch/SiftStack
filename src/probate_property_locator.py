@@ -119,31 +119,58 @@ def _score(query_name: str, record_owner: str) -> float:
 
 def _search_jefferson(name: str) -> list[_PropertyRecord]:
     """Jefferson tax roll stores names as 'LAST FIRST MIDDLE' but probate notices
-    write 'FIRST MIDDLE LAST'. Try the original form first; if no hits, retry
-    with the last token moved to the front. Combine both result sets.
+    write 'FIRST MIDDLE LAST'. Three retry layers handle the format gaps:
+
+      1. Original form (handles tax-roll-format input)
+      2. Last-first reordering (handles probate-notice format → tax roll)
+      3. Truncate-to-LAST+FIRST (handles tax-roll storing middle as initial:
+         e.g. probate says "FEREBEE ROBERT ALLEN" but tax roll has
+         "FEREBEE ROBERT A JR & DEDE S")
+
+    Caller is expected to score the combined results and reject low-confidence
+    hits via min_score.
     """
     from jefferson_property_api import search_by_owner_name
-    try:
-        results = search_by_owner_name(name)
-    except Exception as e:
-        logger.warning("Jefferson search failed for %r: %s", name, e)
-        return []
-    if results:
-        return results
 
-    # Retry with last-first reordering — only when the input has 2+ tokens
+    def _safe(q: str) -> list[_PropertyRecord]:
+        try:
+            return search_by_owner_name(q)
+        except Exception as e:
+            logger.warning("Jefferson search failed for %r: %s", q, e)
+            return []
+
+    seen: set[str] = set()
+    combined: list[_PropertyRecord] = []
+
+    def _accumulate(records: list[_PropertyRecord]) -> None:
+        for r in records:
+            pid = getattr(r, "parcel_number", "") or getattr(r, "parcel_id", "")
+            if pid and pid not in seen:
+                seen.add(pid)
+                combined.append(r)
+
+    queries: list[str] = [name]
     tokens = name.strip().split()
-    if len(tokens) < 2:
-        return results
-    reordered = " ".join([tokens[-1]] + tokens[:-1])
-    if reordered.upper() == name.strip().upper():
-        return results
-    try:
-        logger.debug("Jefferson retry with last-first form: %r", reordered)
-        return search_by_owner_name(reordered)
-    except Exception as e:
-        logger.warning("Jefferson retry failed for %r: %s", reordered, e)
-        return []
+
+    # Last-first retry (probate-notice → tax-roll order)
+    if len(tokens) >= 2:
+        reordered = " ".join([tokens[-1]] + tokens[:-1])
+        if reordered.upper() != name.strip().upper():
+            queries.append(reordered)
+
+    # Truncate-to-LAST+FIRST — handles middle-name abbreviation in the tax roll.
+    # Apply to both orderings so we cover probate "FIRST MIDDLE LAST" and
+    # tax-roll "LAST FIRST MIDDLE" inputs.
+    if len(tokens) >= 3:
+        queries.append(f"{tokens[0]} {tokens[1]}")              # tax-roll: LAST FIRST
+        queries.append(f"{tokens[-1]} {tokens[0]}")             # probate: LAST FIRST
+
+    for q in queries:
+        records = _safe(q)
+        if records:
+            _accumulate(records)
+
+    return combined
 
 
 def _search_madison(name: str) -> list[_PropertyRecord]:
@@ -205,12 +232,65 @@ def _search_madison(name: str) -> list[_PropertyRecord]:
     return combined
 
 
+def _search_marshall(name: str) -> list[_PropertyRecord]:
+    """Marshall tax roll is the same AssuranceWeb platform as Madison's, with
+    the same 'LAST, FIRST MIDDLE' storage convention and the same comma-vs-space
+    interpretation problem. The dispatcher mirrors `_search_madison` exactly —
+    `MarshallPropertyRecord` is structurally identical to `MadisonPropertyRecord`
+    so the downstream `_record_to_match()` works unchanged via getattr.
+    """
+    from marshall_property_api import search_by_owner_name
+
+    if "," in name:
+        last, first = [s.strip() for s in name.split(",", 1)]
+        try:
+            return search_by_owner_name(last, first or None)
+        except Exception as e:
+            logger.warning("Marshall search failed for %r: %s", name, e)
+            return []
+
+    parts = name.strip().split()
+    if not parts:
+        return []
+    if len(parts) == 1:
+        try:
+            return search_by_owner_name(parts[0], None)
+        except Exception as e:
+            logger.warning("Marshall search failed for %r: %s", name, e)
+            return []
+
+    interpretations = [
+        (parts[-1], " ".join(parts[:-1])),  # FIRST MIDDLE LAST (probate)
+        (parts[0], " ".join(parts[1:])),    # LAST FIRST MIDDLE (tax-roll / PR fallback)
+    ]
+
+    seen_parcels: set[str] = set()
+    combined: list[_PropertyRecord] = []
+    for last, first in interpretations:
+        try:
+            for rec in search_by_owner_name(last, first or None):
+                pid = getattr(rec, "parcel_number", "") or getattr(rec, "parcel_id", "")
+                if pid and pid in seen_parcels:
+                    continue
+                if pid:
+                    seen_parcels.add(pid)
+                combined.append(rec)
+        except Exception as e:
+            logger.warning(
+                "Marshall search failed for last=%r first=%r: %s", last, first, e,
+            )
+            continue
+    return combined
+
+
 def _adapter_for(county: str):
     c = county.strip().lower()
     if c == "jefferson":
         return _search_jefferson
     if c == "madison":
         return _search_madison
+    if c == "marshall":
+        return _search_marshall
     return None
 
 
@@ -251,6 +331,134 @@ def _record_to_match(rec, query_name: str, source: str) -> PropertyMatch:
         score=score,
         source=source,
     )
+
+
+# ── Tier 3 fallback: obit-cross-reference for spouse + obit address ──
+# When neither the decedent name nor the PR name surface a parcel, look up an
+# obituary for the decedent. The obit usually names a surviving spouse (often
+# the actual on-title owner) and sometimes states the decedent's residence
+# address directly. Two extra searches:
+#   (a) by situs address from the obit  → catches property held in trust, LLC,
+#       or spouse-only name
+#   (b) by spouse name with last-name validation → catches property where the
+#       decedent never went on title (common when one spouse is the deedholder)
+# Both paths are gated on a successful obit fetch + LLM extraction. If the obit
+# search fails, we return cleanly with no match — the upstream caller logs it.
+
+
+def _obit_lookup_for_notice(notice: NoticeData):
+    """Search for the decedent's obituary and LLM-extract spouse + obit address.
+
+    Reuses the pre-probate path's DDG search + LLM parser. Returns a
+    DecedentExtraction with at least decedent_full_name populated, or None.
+    """
+    if not notice.decedent_name:
+        return None
+    try:
+        # Lazy import to avoid pulling LLM + DDG modules into pipelines that
+        # never use the fallback (e.g. main.py daily without an LLM key).
+        from obituary_enricher import _search_obituary, _fetch_page_text
+        from pre_probate_pipeline_al import _extract_decedent_with_llm
+    except Exception as e:
+        logger.debug("Tier 3 obit imports failed: %s", e)
+        return None
+
+    state_full = "Alabama"  # All current pipelines are AL — TN expansion can override
+    results = _search_obituary(
+        notice.decedent_name, notice.city or "", state_full=state_full,
+    )
+    if not results:
+        logger.debug("Tier 3: no obit hits for %r", notice.decedent_name)
+        return None
+
+    # Fetch and LLM-extract the first obit-domain hit
+    for hit in results[:3]:
+        url = hit.get("url", "")
+        if not url:
+            continue
+        try:
+            text = _fetch_page_text(url)
+        except Exception as e:
+            logger.debug("Tier 3 obit fetch failed for %s: %s", url, e)
+            continue
+        if not text or len(text) < 200:
+            continue
+        try:
+            extraction = _extract_decedent_with_llm(text)
+        except Exception as e:
+            logger.debug("Tier 3 LLM extract failed for %s: %s", url, e)
+            continue
+        if extraction and extraction.is_obituary:
+            # Cross-check name: decedent_full_name must share the last token
+            # with notice.decedent_name to avoid same-name strangers.
+            notice_last = notice.decedent_name.strip().split()[-1].upper()
+            obit_last = (extraction.decedent_last_name
+                         or extraction.decedent_full_name.split()[-1] if extraction.decedent_full_name
+                         else "").upper()
+            if notice_last and obit_last and notice_last != obit_last:
+                logger.debug(
+                    "Tier 3 obit last-name mismatch (notice=%s, obit=%s) — skipping",
+                    notice_last, obit_last,
+                )
+                continue
+            return extraction
+    return None
+
+
+def _situs_search_for_county(county: str, address: str) -> list:
+    """Per-county situs-address search wrapper.
+
+    Returns a list of raw county records (Jefferson/Madison/Marshall shape).
+    Splits "123 Main St" into number + street-root for AssuranceWeb counties.
+    """
+    c = county.strip().lower()
+    if not address or not address.strip():
+        return []
+    if c == "jefferson":
+        from jefferson_property_api import search_by_situs_address as _j
+        try:
+            return _j(address)
+        except Exception as e:
+            logger.debug("Jefferson situs search failed for %r: %s", address, e)
+            return []
+    if c in ("madison", "marshall"):
+        # AssuranceWeb counties want (number, name-root) as two args
+        parts = address.strip().split(None, 1)
+        if len(parts) < 2 or not parts[0][0].isdigit():
+            return []
+        number, name = parts[0], parts[1]
+        api_module = "madison_property_api" if c == "madison" else "marshall_property_api"
+        try:
+            mod = __import__(api_module)
+            return mod.search_by_situs_address(number, name)
+        except Exception as e:
+            logger.debug("%s situs search failed for %r: %s", county, address, e)
+            return []
+    return []
+
+
+def _spouse_search_for_county(county: str, spouse_name: str, decedent_last: str) -> list:
+    """Per-county owner-name search using the spouse's name, validated by the
+    decedent's last name appearing in the matched record's owner_name.
+
+    Filters out same-name-stranger matches by requiring the decedent's last
+    name to appear in the matched owner_name (proves family property).
+    """
+    if not spouse_name or not spouse_name.strip() or not decedent_last:
+        return []
+    adapter = _adapter_for(county)
+    if adapter is None:
+        return []
+    try:
+        records = adapter(spouse_name)
+    except Exception as e:
+        logger.debug("%s spouse search failed for %r: %s", county, spouse_name, e)
+        return []
+    decedent_last_upper = decedent_last.upper()
+    return [
+        r for r in records
+        if decedent_last_upper in (r.owner_name or "").upper()
+    ]
 
 
 # ── Public API ───────────────────────────────────────────────────────
@@ -305,6 +513,44 @@ def find_probate_properties(
             m = _record_to_match(rec, notice.owner_name, source="pr_name")
             if m.score >= min_score:
                 candidates.append(m)
+
+    # Tier 3: obit cross-reference — search by spouse name and obit-stated
+    # address. Runs only when 1+2 returned nothing because each step costs
+    # one DDG search + one Firecrawl fetch + one LLM call.
+    if not candidates:
+        extraction = _obit_lookup_for_notice(notice)
+        if extraction is not None:
+            # Path A: obit-stated address → situs search
+            obit_addr = (extraction.decedent_obit_address or "").strip()
+            if obit_addr:
+                for rec in _situs_search_for_county(notice.county, obit_addr):
+                    m = _record_to_match(rec, notice.decedent_name, source="obit_address")
+                    # Bypass min_score for situs-address matches — the address
+                    # match is the signal, owner-name overlap may legitimately
+                    # be low (property in spouse's or trust's name).
+                    candidates.append(m)
+                if candidates:
+                    logger.info(
+                        "  [obit-addr-fallback] %r → %s @ %s",
+                        notice.decedent_name, candidates[0].owner_name, obit_addr,
+                    )
+
+            # Path B: spouse-name search with decedent-last-name validation
+            spouse = (extraction.spouse_name or "").strip()
+            decedent_last = (
+                extraction.decedent_last_name
+                or (notice.decedent_name.split()[-1] if notice.decedent_name else "")
+            )
+            if not candidates and spouse and decedent_last:
+                for rec in _spouse_search_for_county(notice.county, spouse, decedent_last):
+                    m = _record_to_match(rec, spouse, source="spouse_name")
+                    if m.score >= min_score:
+                        candidates.append(m)
+                if candidates:
+                    logger.info(
+                        "  [obit-spouse-fallback] %r (spouse=%s) → %s",
+                        notice.decedent_name, spouse, candidates[0].owner_name,
+                    )
 
     if not candidates:
         logger.info(

@@ -159,6 +159,22 @@ SAVED_SEARCHES: list[SearchConfig] = [
         exclude_terms="CONDEMNATION",
         days_back=7,
     ),
+    SearchConfig(
+        county="Marshall",
+        notice_type="foreclosure",
+        search_terms="MORTGAGE FORECLOSURE SALE MARSHALL",
+        search_type="AND",
+        exclude_terms="CONDEMNATION",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Marshall",
+        notice_type="foreclosure",
+        search_terms="NOTICE OF MORTGAGE RESCHEDULE MARSHALL",
+        search_type="AND",
+        exclude_terms="CONDEMNATION",
+        days_back=7,
+    ),
     # Probate "Notice to Creditors" publications. APN search has no county
     # filter — the county-of-property check happens in is_target_county()
     # against the full notice text after CAPTCHA.
@@ -176,6 +192,83 @@ SAVED_SEARCHES: list[SearchConfig] = [
         search_terms="Estate Deceased",
         search_type="AND",
         exclude_terms="foreclosure mortgage",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Marshall",
+        notice_type="probate",
+        search_terms="Estate Deceased",
+        search_type="AND",
+        exclude_terms="foreclosure mortgage",
+        days_back=7,
+    ),
+    # Pre-probate via APN — formal "Notice of Death" publications.
+    # Funeral homes and family members occasionally publish a Death Notice
+    # as a legal notice (parallel to Notice-to-Creditors but BEFORE probate
+    # is filed) to flush out unknown heirs, clear creditor claims for
+    # non-probate estates, or for unclaimed-asset purposes. These hits
+    # complement the obituary-driven pre-probate pipeline by catching
+    # decedents whose families used a legal-notice channel instead of (or
+    # in addition to) legacy.com / al.com / a funeral-home website.
+    # Tagged as notice_type="pre_probate" so the existing pre-probate
+    # tier-gate + Slack format picks them up. notice_subtype distinguishes
+    # APN-sourced entries from obituary-harvested ones.
+    SearchConfig(
+        county="Jefferson",
+        notice_type="pre_probate",
+        notice_subtype="apn_death_notice",
+        search_terms="Notice of Death",
+        search_type="AND",
+        # Exclude probate-court-driven publications (already covered above)
+        # plus foreclosure boilerplate that occasionally mentions "death".
+        exclude_terms="Estate Deceased foreclosure",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Madison",
+        notice_type="pre_probate",
+        notice_subtype="apn_death_notice",
+        search_terms="Notice of Death",
+        search_type="AND",
+        exclude_terms="Estate Deceased foreclosure",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Marshall",
+        notice_type="pre_probate",
+        notice_subtype="apn_death_notice",
+        search_terms="Notice of Death",
+        search_type="AND",
+        exclude_terms="Estate Deceased foreclosure",
+        days_back=7,
+    ),
+    # Alt phrasing — some publications use "Death Notice" or boilerplate
+    # like "of the death of" instead of the strict "Notice of Death".
+    SearchConfig(
+        county="Jefferson",
+        notice_type="pre_probate",
+        notice_subtype="apn_death_notice",
+        search_terms="Death Notice deceased",
+        search_type="AND",
+        exclude_terms="Estate Deceased foreclosure mortgage",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Madison",
+        notice_type="pre_probate",
+        notice_subtype="apn_death_notice",
+        search_terms="Death Notice deceased",
+        search_type="AND",
+        exclude_terms="Estate Deceased foreclosure mortgage",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Marshall",
+        notice_type="pre_probate",
+        notice_subtype="apn_death_notice",
+        search_terms="Death Notice deceased",
+        search_type="AND",
+        exclude_terms="Estate Deceased foreclosure mortgage",
         days_back=7,
     ),
     # Code-violation / unsafe-building publications.
@@ -241,6 +334,33 @@ SAVED_SEARCHES: list[SearchConfig] = [
     ),
     SearchConfig(
         county="Madison",
+        notice_type="code_violation",
+        notice_subtype="unsafe_building",
+        search_terms="NUISANCE ABATEMENT DEMOLISHED",
+        search_type="AND",
+        exclude_terms="bid contractor sealed",
+        days_back=14,
+    ),
+    SearchConfig(
+        county="Marshall",
+        notice_type="code_violation",
+        notice_subtype="unsafe_building",
+        search_terms="DEMOLITION UNSAFE STRUCTURE",
+        search_type="AND",
+        exclude_terms="bid contractor sealed",
+        days_back=14,
+    ),
+    SearchConfig(
+        county="Marshall",
+        notice_type="code_violation",
+        notice_subtype="unsafe_building",
+        search_terms="CONDEMNED STRUCTURE DEMOLITION",
+        search_type="AND",
+        exclude_terms="bid contractor sealed",
+        days_back=14,
+    ),
+    SearchConfig(
+        county="Marshall",
         notice_type="code_violation",
         notice_subtype="unsafe_building",
         search_terms="NUISANCE ABATEMENT DEMOLISHED",

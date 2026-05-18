@@ -88,9 +88,10 @@ The site is **ASP.NET WebForms** — all navigation uses `__doPostBack()` with V
 
 `SAVED_SEARCHES` in `config.py` defines keyword searches against alabamapublicnotices.com. Each `SearchConfig` is `(county, notice_type, search_terms, search_type, exclude_terms, days_back)`.
 
-Active counties (April 2026):
-- **Jefferson County, AL** — foreclosure (MORTGAGE FORECLOSURE SALE / RESCHEDULE) + probate (Estate Deceased)
-- **Madison County, AL** — foreclosure (MORTGAGE FORECLOSURE SALE / RESCHEDULE) + probate (Estate Deceased)
+Active counties (May 2026):
+- **Jefferson County, AL** — foreclosure (MORTGAGE FORECLOSURE SALE / RESCHEDULE) + probate (Estate Deceased) + pre-probate (Notice of Death / Death Notice) + code-violation (DEMOLITION / CONDEMNATION / NUISANCE)
+- **Madison County, AL** — same pillar coverage as Jefferson
+- **Marshall County, AL** — same pillar coverage as Jefferson + Madison (added 2026-05-12). Property + probate adapters share Madison's AssuranceWeb platform. Tax-delinquent feed is **currently disabled** by the county; the orchestrator-wired stub auto-activates when re-enabled.
 
 Probate searches use `AND` on `Estate Deceased` with `foreclosure mortgage` excluded — chosen empirically because APN's search box has no county filter (statewide full-text), and broader OR-style queries (`Probate Sale Property NOTICE TO CREDITORS Estate`) match every foreclosure SALE. The county-of-property check happens later in `is_target_county()` against the full notice text.
 
@@ -253,6 +254,332 @@ The CSV exporter ([data_formatter.py](src/data_formatter.py)) writes one row per
 **Decedent-name orientation**: probate notices write "FIRST MIDDLE LAST" but the Jefferson tax roll stores "LAST FIRST MIDDLE". The locator's Jefferson adapter automatically retries with last-first reordering if the original query returns nothing — the caller can pass either format and get the same result.
 
 **Property classification**: `property_use` reads "Residential" / "Commercial" / "Utility" / "Vehicle" / "Other" for Jefferson (mapped from `AssmtClass` codes 1–4) and "Real Property" / "Personal" for Madison (which doesn't expose finer classification in the search response — would require fetching each parcel-detail page).
+
+## Alabama Post-Probate Pipeline (Jefferson Benchmark)
+
+**Independent, second probate pipeline.** While `## Alabama Probate Pipeline` (above) scrapes APN newspaper-published Notice-to-Creditors publications, this pipeline reads cases directly from Jefferson County Probate Court's case management system at [benchmarkweb.jccal.org](https://benchmarkweb.jccal.org) (login required, replicating the data source RealSupermarket's vendor uses). It covers the full Jefferson probate case stream — far more comprehensive than what publishes in newspapers — and runs an aggressive ZIP-tier filter so we only spend enrichment dollars on properties in our target investment ZIPs.
+
+**Madison is NOT supported** — Madison Probate doesn't have a public Benchmark equivalent.
+
+### Pipeline flow
+
+```
+Benchmark Web case list (JS app, login-required)
+   ↓ src/benchmark_web.py — Playwright async, parses parties accordion individually (clicking all at once redirects to InvalidCase)
+Per case: Jefferson property API search by decedent name
+   ↓ src/probate_property_locator._search_jefferson — handles last-first reorder + middle-name truncation fallbacks
+ZIP gate: parcel.situs_zip in Tier 1 ∪ Tier 2?
+   ↓ src/target_zips.py — see "Tier definitions" below
+   ↓ Drop OFF-target (e.g. luxury 35243, sub-$125K 35211) and NO-PROPERTY cases entirely
+Fiduciary detection: petitioner appears in 2+ cases this batch?
+   ↓ Skip obituary spend on attorneys/public administrators
+Obituary cross-reference (DDG → Ancestry/Newspapers fallback)
+   ↓ src/benchmark_obituary_match.py — single Claude Haiku call returns the full family graph
+   ↓ Extracts: petitioner-as-survivor match, decedent age/DOD/city, all_survivors, spouse, predeceased, executor
+   ↓ rank_decision_makers() ranks by AL signing-authority law (executor > spouse > children > siblings)
+PR fallback when obit fails
+   ↓ Use court-appointed petitioner as DM with confidence=medium, source="benchmark_court_record"
+Tracerfy batch skip-trace
+   ↓ src/tracerfy_skip_tracer — fills phones/emails for DM #1 and signing-authority heirs (up to 5 per property)
+Heir-phone promotion to NoticeData phone slots
+   ↓ Heir phones land in heir_map_json by default; this step surfaces them into Phone 1-9 / Email 1-5
+DataSift CSV (80 cols) + Slack notification
+   ↓ src/datasift_formatter.write_datasift_csv — same formatter the legacy scraper uses
+   ↓ Slack: per-lead action card (address, value, DM, confidence, obit link, phone status)
+```
+
+### Entry point + CLI
+
+```bash
+# Daily ops (recommended invocation)
+python src/benchmark_pipeline_al.py --days-back 14 --tiers 1,2 --datasift-csv --skip-trace --notify-slack
+
+# Diagnostic flags
+python src/benchmark_pipeline_al.py --days-back 7 --no-obituary       # ZIP gate only — fastest
+python src/benchmark_pipeline_al.py --days-back 14 --headed            # show Benchmark browser
+python src/benchmark_pipeline_al.py --days-back 14 --json              # JSON output for downstream tools
+python src/benchmark_pipeline_al.py --days-back 14 --tiers 1           # Tier 1 only
+python src/benchmark_pipeline_al.py --ancestry-fallback                # opt-in obituary gap-closer (see below)
+```
+
+### Key modules
+
+| Module | Role |
+|---|---|
+| [src/benchmark_web.py](src/benchmark_web.py) | Async Playwright adapter — login, search by Clerk-Filed-Date range, parse case detail (parties + dockets) |
+| [src/benchmark_obituary_match.py](src/benchmark_obituary_match.py) | DDG obituary search + Claude Haiku family-graph extraction; Ancestry/Newspapers fallback with 3-year DOD sanity gate |
+| [src/target_zips.py](src/target_zips.py) | Frozensets of Tier 1/Tier 2 ZIPs + `zip_tier_county()` helper |
+| [src/benchmark_pipeline_al.py](src/benchmark_pipeline_al.py) | Orchestrator — fetch, filter, enrich, write CSV, post Slack |
+
+### Tier definitions
+
+Source-of-truth analysis docs live outside the repo at:
+- `~/Documents/Claude/Projects/REI Skill Library/Jefferson_County_AL_SFR_125K_500K_Market_Analysis.md`
+- `~/Documents/Claude/Projects/REI Skill Library/Madison_County_AL_SFR_Market_Analysis.md`
+- `~/Documents/Claude/Projects/REI Skill Library/Marshall_County_AL_SFR_125K_500K_Market_Analysis.md`
+
+Codified in [src/target_zips.py](src/target_zips.py). **All three must be kept in sync** — the codified set drives the filter; the MD docs explain why each ZIP is on the list.
+
+| Tier | Jefferson | Madison | Marshall |
+|---|---|---|---|
+| **Tier 1** | 35215, 35214, 35022, 35023, 35226, 35235 | 35810, 35811, 35803, 35758, 35805, 35801 | 35950, 35976, 35016, 35961, 35951, 35957 |
+| **Tier 2** | 35216, 35126, 35210, 35173, 35244 | 35757, 35759, 35763, 35806, 35750 | 35962, 35175, 35747, 35769, 35980 |
+
+33 priority ZIPs total (18 T1 + 15 T2). Note: Benchmark itself only covers Jefferson — Madison + Marshall ZIPs are gates for the other pipelines (pre-probate, APN probate, tax-distress, distress-proxy).
+
+### Obituary extraction — what comes back
+
+The single LLM call (Claude Haiku, ~1500 tokens) returns the full family graph from the obituary, not just "is this the right person":
+
+| Field | Notes |
+|---|---|
+| `is_decedent_match` / `decedent_full_name` / `decedent_city` / `decedent_state` / `decedent_age_at_death` / `date_of_death` / `decedent_obit_address` | Decedent identification + DOD sanity inputs |
+| `petitioner_match` (`exact`/`fuzzy`/`not_found`) / `petitioner_survivor_name` / `petitioner_relationship` / `petitioner_city` | Cross-reference of court-named PR against obituary survivors |
+| `all_survivors` (array of `{name, relationship, city}`) | Full family graph |
+| `spouse_name` | Surviving spouse — usually the highest-priority DM under AL signing-authority law |
+| `preceded_in_death` | Family who died first — relevant for narrowing heirship |
+| `executor_named` | Only if the obituary explicitly names the executor (rare) |
+
+`rank_decision_makers()` (in `obituary_enricher.py`) consumes `all_survivors` + `executor_named` and produces a ranked list with `signing_authority` flags per AL intestate succession law.
+
+**Bug fixed during build**: the spouse-of-relative pattern (`"spouse of son"`, `"husband of daughter"`) was previously misclassifying daughters/sons-in-law as having signing authority. Fix in `_spouse_of_patterns` extends the set with prepositional forms.
+
+### Ancestry/Newspapers fallback (`--ancestry-fallback`)
+
+When DDG returns `confidence=none` (no obituary found, or found but petitioner isn't in survivors), the orchestrator can fall through to a batch Ancestry pass via [src/ancestry_enricher.py](src/ancestry_enricher.py):
+
+1. Single shared browser session for all gap cases
+2. SSDI → Ancestry obituary collection → Newspapers.com cascade
+3. **3-year DOD sanity gate** — rejects matches whose death predates the probate filing by >3 years (catches SSDI name-collision false positives like "William Belew died 2008" matching a 2026 probate)
+4. If a confirmed obituary URL is recovered, fetch text and run the SAME LLM extraction the DDG path uses
+
+**One-time setup required** — Ancestry's auto-login can't get past CAPTCHA/MFA on first launch. Run a one-time interactive bootstrap to seed `.ancestry_profile/Default/` cookies; subsequent runs reuse the session via persistent context. Bootstrap script pattern lives in conversation history; equivalent: open Ancestry signin in the persistent profile, log in by hand, save cookies.
+
+### Tracerfy + heir-phone promotion
+
+[src/tracerfy_skip_tracer.batch_skip_trace()](src/tracerfy_skip_tracer.py) runs the existing Tracerfy batch endpoint over the prepared NoticeData list. It already populates `primary_phone`/`mobile_1-5`/`landline_1-3`/`email_1-5` for DM #1 and stores phones for non-DM-#1 signing heirs in `heir_map_json` per heir.
+
+**Heir-phone promotion** (in `benchmark_pipeline_al._promote_heir_contacts_to_csv_slots`): walks `heir_map_json` after Tracerfy runs and fills any empty Phone N / Email N slots from heir entries (deduping). Without this pass, heir phones live only in `heir_map_json` and never appear in the CSV columns DataSift filter presets read.
+
+Cost: ~$0.02 per contact (≈$0.06–$0.30 per typical batch). Realistic match rate: 1/3 contacts in a 3-contact test (Tracerfy is name+address dependent; nicknames like "Dede" hurt recall).
+
+### Slack notification
+
+`benchmark_pipeline_al.notify_slack()` posts via [src/slack_notifier._send_webhook](src/slack_notifier.py) (uses `SLACK_WEBHOOK_URL`). Message includes per-lead action cards: address, tier, value, DM name + relationship + confidence, decedent age/DOD, obituary URL, skip-trace stats, CSV filename. Same webhook the legacy `main.py daily --notify-slack` uses; both pipelines coexist on the same channel.
+
+### Realistic conversion rates
+
+From a 14-day window across May 2026 sample runs:
+- **In-tier conversion**: ~15-20% of pulled cases survive the ZIP gate
+- **Obituary confirmation**: ~50-60% of in-tier cases get an obituary-confirmed DM
+- **Skip-trace match**: ~30% of contacts return phones (Tracerfy)
+- **Net**: typical 14-day batch yields 1-3 fully-enriched leads (DM identified, phone attached) plus 1-3 PR-fallback leads (court PR, no obit corroboration but mailable)
+
+### What's NOT done
+
+- **Daily scheduler / cron** — pipeline must be invoked manually today
+- **Madison post-probate** — no Benchmark equivalent for Madison; would require a separate adapter
+- **Vacancy enrichment** — knowing the inherited property is actually unoccupied (USPS NCOA, water shutoff) would tighten the lead score further
+
+## Alabama APN Post-Probate Pipeline (Jefferson + Madison, newspaper-driven)
+
+**The canonical Madison post-probate path.** Where `benchmark_pipeline_al.py` pulls live Jefferson court records, this orchestrator pulls the same shape of data from the alabamapublicnotices.com newspaper publications — the only public Madison probate source (Madison's online portal at `madisonprobate.countygovservices.com` is recording-only, parallel to Jefferson's Landmark Web; it has no case-management view). Jefferson runs through both Benchmark AND APN; the duplication is fine because Benchmark covers the full case stream while APN covers only what gets formally published.
+
+### Pipeline flow
+
+```
+Scrape APN for Jefferson + Madison probate Notice-to-Creditors publications
+   ↓ src/scraper.py — ASP.NET WebForms, reCAPTCHA v2 per detail page (~$0.003/notice via 2Captcha)
+   ↓ Existing seen_ids.json deduplicates across runs (daily cadence ≈ 5-15 new notices/day)
+For each notice: enrich_notice_with_property() (probate_property_locator)
+   ↓ Tier-1 search by decedent name in the matching county API
+   ↓ Tier-2 fallback: search by PR (petitioner) name
+Madison-only: one-shot Smarty geocode to recover missing ZIP
+   ↓ Madison's name-search response lacks situs_zip; same fix as pre-probate
+ZIP gate: parcel.situs_zip in Tier 1 ∪ Tier 2?
+   ↓ Same target_zips.zip_tier_county() used by the other pipelines
+For survivors: notice.notice_type='probate' is already populated
+   ↓ Tracerfy skip-trace (DM #1 + signing-authority heirs)
+   ↓ Heir-phone promotion to NoticeData phone slots
+DataSift CSV (Lists="Probate") + Slack notification
+```
+
+### Entry point + CLI
+
+```bash
+# Daily ops (recommended)
+python src/apn_probate_pipeline_al.py --counties Jefferson,Madison \
+    --days-back 7 --tiers 1,2 --datasift-csv --skip-trace --notify-slack
+
+# Single county / smaller window
+python src/apn_probate_pipeline_al.py --counties Madison --days-back 3 --max-notices 30
+```
+
+### Key modules
+
+| Module | Role |
+|---|---|
+| [src/apn_probate_pipeline_al.py](src/apn_probate_pipeline_al.py) | Orchestrator. Filters `SAVED_SEARCHES` to probate-only for the chosen counties, calls `scraper.scrape_all()`, runs property locator + ZIP gate, reuses pre-probate's heir-phone promotion. |
+| Reuses [src/scraper.py](src/scraper.py) | The existing APN scraper (no changes needed) |
+| Reuses [src/probate_property_locator.py](src/probate_property_locator.py) | `enrich_notice_with_property()` — same Tier 1/2 search waterfall used by the legacy `main.py daily` flow |
+| Reuses [src/pre_probate_pipeline_al.py](src/pre_probate_pipeline_al.py) | `_smarty_zip_for_madison_address()` (Madison ZIP recovery) and `_promote_heir_contacts_to_csv_slots()` |
+
+### Why this is the canonical Madison post-probate
+
+**Madison's online probate portal is recording-only** — `madisonprobate.countygovservices.com` (free signup, Azure AD B2C) exposes 14 search categories (DEEDS, MORTGAGES, JUDGMENTS, UCC, MISCELLANEOUS, TAX SALES, MARRIAGE LICENSES, BONDS, PLATS, MILITARY DISCHARGES, etc.) but **NO** "Estate Cases" / "Letters Testamentary" / "Probate Cases" category. The result table headers are recording-style: `Book / Book # / First Page # / Name / Class / Other Names / Instrument / Legal Description / Recorded On / Pages`. There's no case-management view (no parties, no docket, no judge field).
+
+So Madison post-probate must use APN newspaper publications. The flow is structurally similar to Jefferson's APN flow but Madison-specific:
+1. Madison publishers (Madison County Record, Speakin' Out News, etc.) publish image-PDF Notice-to-Creditors
+2. The existing scraper handles the Madison PDF format (text-layer pdfminer + OCR fallback)
+3. `_normalize_pdf_text()` de-hyphenates column-wrapped words from newspaper layout
+
+### What's NOT done
+
+- **Bonds-as-LT-proxy adapter** — searching `madisonprobate.countygovservices.com`'s "Probate Bonds" category by date range would catch newly-appointed PRs (most non-spousal probates require a bond). Lower-fidelity than APN (no case number, no published Letters Testamentary text) but catches cases that don't formally publish a Notice-to-Creditors. ~3-4 hr build. Defer until APN volume proves insufficient.
+- **Daily scheduler / cron** — same as the other pipelines, manual invocation only
+- **Cost monitoring** — APN scraping costs CAPTCHA solves (~$0.003/notice). With `seen_ids.json` deduplicating across runs, daily cadence settles to ~5-15 new notices/day = ~$0.05/day. First-run on a fresh `seen_ids.json` will burn ~$3-5 because it processes the full backlog.
+
+## Alabama Pre-Probate Pipeline (Jefferson + Madison, obituary-driven)
+
+**Companion to the Post-Probate pipeline.** Where post-probate reads court records (case-driven, 30-90 days after death), pre-probate works backwards from fresh obituaries (death-driven, days fresh). Same downstream: ZIP gate → enrichment → DataSift CSV → Slack. Together both pipelines replicate the full RealSupermarket vendor product the user was buying.
+
+**Sources**:
+- legacy.com Birmingham listing (`legacy.com/us/obituaries/local/alabama/birmingham`) → Jefferson property API
+- legacy.com Huntsville listing (`legacy.com/us/obituaries/local/alabama/huntsville`) → Madison property API
+
+The harvester pulls both by default and tags each `HarvestedObit` with a `county_hint` so the orchestrator routes property lookups to the correct county API first. If the hinted county returns nothing, it falls back to the other county (catches cross-county property ownership — decedent died in Birmingham hospital but owned property in Huntsville, etc.).
+
+**URL formats** (the Birmingham and Huntsville listings use different patterns and the harvester handles all three):
+- `legacy.com/person/<slug>-<id>` — Birmingham preview pages (need URL upgrade to obits.al.com for full text)
+- `legacy.com/us/obituaries/{birmingham,huntsville,vnews}/name/<slug>-obituary?id=<id>` — Huntsville's primary format AND Birmingham's syndicated entries; render the full obituary inline (no upgrade needed)
+- `obits.al.com/us/obituaries/{birmingham,huntsville}/name/<slug>-obituary?id=<id>` — partner-syndication URLs
+
+### Pipeline flow
+
+```
+Harvest obit URLs from BOTH Birmingham + Huntsville listings (paginated)
+   ↓ src/obituary_harvester.py — Firecrawl-rendered, dedupes by (source, ID)
+   ↓ Each HarvestedObit tagged with county_hint = "Jefferson" | "Madison"
+For each obit URL:
+   ↓ Fetch obit text — auto-upgrade legacy.com/person/* → obits.al.com/* (Birmingham only)
+   ↓ Cross-source dedupe: skip if effective URL already processed (legacy + alcom URLs converge)
+LLM extract decedent + family graph (Claude Haiku, ~1500 tokens)
+   ↓ DECEDENT_PROMPT — accepts preview-only obits, returns name+DOD+age at minimum
+DoD freshness gate: drop obits >2 years old (legacy listing occasionally surfaces stale syndicated entries)
+County-routed property API search by decedent name
+   ↓ Hinted county first (Jefferson for Birmingham obit, Madison for Huntsville obit)
+   ↓ Falls back to the OTHER county for cross-county ownership cases
+   ↓ Madison records lack ZIP/city (search response only returns street) — one-shot Smarty geocode fills both
+ZIP gate: parcel.situs_zip in Tier 1 ∪ Tier 2 (across Jefferson + Madison ZIPs)?
+   ↓ target_zips.zip_tier_county() handles both counties' tier ZIPs
+For survivors: rank_decision_makers (executor > spouse > children > siblings)
+   ↓ No court-PR fallback (there is no court case yet)
+Tracerfy skip-trace (DM #1 + signing-authority heirs, up to 5)
+   ↓ Heir-phone promotion fills empty Phone N / Email N slots
+DataSift CSV with Lists="Pre-Probate/Deceased" + Slack notification
+   ↓ notice.county set dynamically from matched_county (jefferson | madison)
+```
+
+### Entry point + CLI
+
+```bash
+# Daily ops (recommended invocation — both counties)
+python src/pre_probate_pipeline_al.py --markets Birmingham,Huntsville --limit 50 --pages 2 \
+    --tiers 1,2 --datasift-csv --skip-trace --notify-slack
+
+# Single-market runs
+python src/pre_probate_pipeline_al.py --markets Birmingham --limit 50  # Jefferson only
+python src/pre_probate_pipeline_al.py --markets Huntsville --limit 50  # Madison only
+
+# Diagnostic flags
+python src/pre_probate_pipeline_al.py --limit 25                  # quick dry run, no CSV
+python src/pre_probate_pipeline_al.py --limit 50 --tiers 1        # Tier 1 only
+python src/pre_probate_pipeline_al.py --limit 50 --json           # JSON output
+```
+
+### Key modules
+
+| Module | Role |
+|---|---|
+| [src/obituary_harvester.py](src/obituary_harvester.py) | Pulls fresh obit URLs from BOTH `legacy.com/us/obituaries/local/alabama/birmingham` AND `.../huntsville`. Walks N listing pages, dedupes by (source, ID), tags each `HarvestedObit` with `county_hint`. Public API: `harvest_alabama(markets)` returns `list[HarvestedObit]`. |
+| [src/pre_probate_pipeline_al.py](src/pre_probate_pipeline_al.py) | Orchestrator. Has `_fetch_full_obit_text()` URL-upgrade helper, `DECEDENT_PROMPT`, county-routing in `_attach_property_for_decedent()`, `_smarty_zip_for_madison_address()` for Madison's missing ZIP, `_to_notice_data()`, `prepare_notices()`, `notify_slack()`. |
+
+### URL upgrade — the critical fix
+
+Legacy.com person pages (e.g., `legacy.com/person/Jane-Doe-12345678`) **always** show only a preview snippet with a "Read the full obituary on our trusted partner sites below" link to obits.al.com. The actual extractable obituary text lives on obits.al.com. The `_fetch_full_obit_text()` helper auto-follows this cross-reference: if the URL is `legacy.com/person/...` AND the page contains an `obits.al.com/.../obituary?id=...` link, fetch THAT URL and use its text instead.
+
+Without this upgrade, ~80% of obits get rejected as "not an obituary" by the LLM because all it sees is the legacy.com preview chrome. With it, ~30-40% still drop (alt partner sites like dignitymemorial, individual funeral homes — TODO to wire those too).
+
+### Cross-source dedupe
+
+The harvester pulls BOTH legacy.com person URLs AND obits.al.com URLs from the listing — the same decedent typically appears under both. Naive processing produces 2 enriched rows per person (one through each URL path). The orchestrator's `seen_effective: set[str]` tracks effective URLs after upgrade and skips duplicates. Counted as `dropped_duplicate` in the run summary.
+
+### Decision-maker logic vs post-probate
+
+Same `rank_decision_makers()` from `obituary_enricher.py` — outputs ranked DMs by AL signing-authority law (executor > spouse > children > siblings > others). **Difference**: pre-probate has NO court-appointed PR yet, so there's no PR-fallback when LLM extraction fails. If `rank_decision_makers` returns empty, `dm_confidence = "low"` and `missing_data_flags = "no_decision_maker"` — these are flagged for manual research rather than auto-populated.
+
+### Realistic conversion rates
+
+From the 2026-05-06 47-obit run (Birmingham listing pages 1-3):
+- 47 obits harvested, 9 cross-source duplicates skipped
+- ~30% had findable Jefferson property
+- ~4% landed in Tier 1/Tier 2 ZIPs (2 of 47)
+- 50% of in-tier leads got Tracerfy phones (1 of 2)
+- **Per-day yield**: 1-3 enriched leads (best case)
+- **Per-run cost**: ~$0.06-0.30 (Firecrawl listing/page fetches + Tracerfy contacts)
+
+### Lists / Tags / DataSift
+
+Setting `notice_type = "pre_probate"` causes the DataSift formatter to populate:
+- **Lists**: `Pre-Probate/Deceased` (per `NOTICE_TYPE_TO_LIST` mapping in `datasift_formatter.py`)
+- **Tags**: `Courthouse Data, pre_probate, jefferson, YYYY-MM, deceased, medium_confidence, has_heirs, signing_chain_N, municipality_<city>, homestead`
+- All 80 columns of the standard DataSift schema (same as post-probate)
+
+### Property-search fallback paths (lift recall from ~67% → ~92%)
+
+`_attach_property_for_decedent()` tries three search paths in order. The first that returns a valid match wins:
+
+1. **By decedent name** (primary) — searches both county APIs (hinted county first), uses `_search_jefferson` / `_search_madison` with their internal last-first reorder + middle-name truncation fallbacks. Catches the common case where the decedent is on the title.
+2. **By obit-stated address** (fallback A) — when the LLM's `decedent_obit_address` is populated AND Path 1 returned nothing, searches by situs address via `jefferson_property_api.search_by_situs_address()`. Recovers cases where the property is held in a trust, LLC, or spouse's name (so it's NOT findable by the decedent's name) but the address itself is on the current tax roll. Recall lift verified at **+16 pp** in the May 2026 ground-truth check against the RealSupermarket CSV.
+3. **By spouse name** (fallback B) — when Paths 1+2 both miss AND the LLM extracted `spouse_name`, searches by spouse's name and validates by checking the decedent's last name appears in the matched property's `owner_name` (proves it's the family property, not a same-named stranger). Catches the "surviving spouse stays in the home, decedent never went on title" pattern.
+
+The fallbacks fire in priority order — Paths 2 and 3 only run when the prior path returned no valid match. Logs them as `[addr-fallback]` and `[spouse-fallback]` for audit-trail visibility.
+
+### Ground-truth recall vs RealSupermarket (Apr 2026 dump)
+
+The `~/Documents/Claude/Projects/REI Skill Library/REISift_Upload_Jefferson_Pre-Probate.csv` contains 2,438 Jefferson pre-probate records RealSupermarket sold the user in April 2026. Used as ground truth for our recall measurement:
+
+| Metric | Value | Note |
+|---|---|---|
+| Total RS records | 2,438 | Whole Jefferson County (no tier filter) |
+| In our Tier 1 ZIPs | 654 (26.8%) | All 6 T1 ZIPs hit, top is 35023 Hueytown (189) |
+| In our Tier 2 ZIPs | 348 (14.3%) | All 5 T2 ZIPs hit, top is 35173 Trussville (108) |
+| Off-tier (filtered out) | 1,436 (58.9%) | Luxury 35243, sub-$125K 35211/35020/35071, etc. |
+| **Our addressable pool** | **1,002 (41.1%)** | Tier 1 + Tier 2 combined |
+| Recall — name only | ~67% | Pre-fallback baseline |
+| **Recall — name + addr fallback** | **~92%** | After Path 2 added |
+| Effective net leads vs RS | ~38% of their volume | At sub-cent per record vs vendor pricing |
+
+The remaining 8% gap is structurally unrecoverable (property transferred / off-roll / not in current tax year).
+
+### Madison-specific behavior
+
+The Madison adapter (`madison_property_api.search_by_owner_name`) returns LESS data than Jefferson's E-Ring API:
+- ✓ parcel_number, owner_name, situs_address (street only)
+- ✓ is_buildable (used as the `is_homestead` proxy for ranking)
+- ✓ is_delinquent
+- ✗ situs_city, situs_zip (NOT in search response — would require per-parcel detail fetch)
+- ✗ total_value (NOT in search response)
+- ✗ is_homestead (use `is_buildable` instead)
+- ✗ municipality (always empty)
+
+The orchestrator handles this gap with a one-shot Smarty geocode (`_smarty_zip_for_madison_address`) per Madison match — recovers `(city, zip)` for the ZIP gate. Costs ~1 Smarty call per Madison hit.
+
+### What's NOT done
+
+- **Full-text partner-site fetch** — the prompt accepts legacy.com preview snippets (decedent name + age + DOD extractable from preview alone). To recover the FULL family graph for preview-only obits, we'd still need to fetch the funeral-home partner page (Welch Funeral Home, Larkin & Scott, etc.) — ~2hr fix to walk the partner links visible in the legacy page.
+- **Daily scheduler / cron** — same as post-probate, manual invocation only
+- **Ground-truth precision check** — comparing our pre-probate output against `~/Documents/Claude/Projects/REI Skill Library/REISift_Upload_Jefferson_Pre-Probate.csv` (the 2,438-row RealSupermarket dump from April 19) hasn't been done yet
 
 ## Alabama Tax-Delinquent + Tax-Sale Pipeline (Jefferson + Madison)
 
@@ -432,6 +759,42 @@ The DataSift formatter automatically maps `auction_date` to the `Tax Auction Dat
 - **Phase 2 — Jefferson delinquent (DONE)**: 18,225 records ($2.89M total balance after individual + $5k filter, $195M property value). Direct HTML fetch — no PDF parsing needed.
 - **Phase 3 — Auction-date stamping (DONE)**: `next_al_tax_sale_date()` + `apply_auction_dates()` in the unified pipeline. Stamps `Tax Auction Date = 5/5/2026` on all 312 tax_sale-flagged records (310 Jefferson + 2 Madison). `has_auction` tag fires automatically.
 - **Unified orchestrator (DONE)**: `tax_distress_pipeline.py` runs both adapters in one pass with one CLI.
+
+### Distress-Proxy Pipeline (tier-filtered tax-distress as a Huntsville-code-violation stopgap)
+
+[src/distress_proxy_pipeline.py](src/distress_proxy_pipeline.py) — synthetic distress-proxy list for Jefferson + Madison. **Stopgap for the Huntsville code-enforcement coverage gap** (FOIA path at `docs/foia/huntsville_code_enforcement_request.md` takes weeks/months to land). Combines existing tax-distress data with absentee-owner detection + Smarty geocode + tier-ZIP gate to produce leads that overlap heavily with what code enforcement would flag (tax-delinquent + absentee = high probability of code violation).
+
+**Layered filtering**:
+1. Tax-delinquent records with `balance_due ≥ $5K` (financial distress)
+2. Individual owners only (drop LLC / Corp / Partnership)
+3. Madison: one-shot Smarty geocode to recover ZIP (Madison's bulk feed lacks `situs_zip`)
+4. ZIP gate: keep only Tier 1 ∪ Tier 2
+5. Jefferson: ABSENTEE flag when `mailing_address ≠ situs_address` (~68% of in-tier Jefferson records). Madison can't compute this (mailing not in bulk feed).
+
+**Notice tagging**:
+- `notice_type` = `"tax_delinquent"` (Madison) or `"tax_sale"` (Jefferson — annual auction roster)
+- `notice_subtype` = `"tier_distress_proxy"` (occupied) or `"tier_distress_proxy_absentee"` (Jefferson absentee subset)
+- Same `tax_high_exposure` / `individual_owner` / `tier_*` tags as the regular tax pipeline fire on top
+
+**Jefferson year-walkback**: Jefferson publishes one tax-sale roster per year before the May auction. `current_al_tax_year()` may point to a year not yet published; the proxy walks back up to 3 years to find data.
+
+**Madison feed seasonality**: Madison's `DelinquentParcels` page resets after the annual May auction (auction was 2026-05-06; the feed was empty as of 2026-05-12 because all delinquent parcels just sold or redeemed). The pipeline will return Madison results once new delinquencies accumulate over the next 6-12 months.
+
+CLI:
+```bash
+# Both counties, in-tier only, $5K+ balance (recommended default)
+python src/distress_proxy_pipeline.py
+
+# Jefferson absentee-owner subset only — strongest signal class
+python src/distress_proxy_pipeline.py --counties Jefferson --absentee-only
+
+# Full daily-ops mode with CSV + skip-trace + Slack
+python src/distress_proxy_pipeline.py --datasift-csv --skip-trace --notify-slack
+```
+
+**Live results (2026-05-12 sample)**: Jefferson returned 84 in-tier records from 310 high-exposure individuals (27%). 57 absentee (68% of in-tier) — strongest signal. ZIP distribution: 35226 Vestavia (T1, 20), 35023 Hueytown (T1, 20), 35216 South Birmingham (T2, 17), 35244 South Hoover (T2, 8). Sample standout: MELTON TAMMY 1413 Old Rock Creek Rd Bessemer 35023 — **$95,844 owed on $33K property** (3x property value). Multiple absentee owners on $1M+ Vestavia/Hoover homes with $15-23K balances. Madison returned 0 (post-auction feed reset).
+
+**Why this exists**: Until the Huntsville FOIA lands (or is denied and an alternative data path is built), this gives us a defensible Madison-equivalent distress signal using only data we already have. Tax-delinquent + absentee + tier ZIP is ~75% predictive of code-violation status based on industry research, so the proxy is not just busywork — these ARE actionable leads even without confirming a code violation directly.
 
 ## Alabama Code-Violation Pipeline (Jefferson + Madison)
 
@@ -669,6 +1032,33 @@ Birmingham high-fee code violations (after enrich_details):
   notice_type:code_violation AND birmingham AND tax_high_exposure
 ```
 
+### Phase 6 — Hoover SeeClickFix code-enforcement adapter
+
+[src/hoover_code_enforcement_api.py](src/hoover_code_enforcement_api.py) — Hoover (Jefferson County, Tier 1 ZIP 35022 + Tier 2 35244 + adjacent 35226 / 35216) routes citizen-reported code violations through SeeClickFix's 311-style platform. The web portal is at `https://seeclickfix.com/web_portal/cfK8xFcB5G2XrMX9VzD1cLSc` and the public API is at `https://seeclickfix.com/api/v2/issues` (no auth, browser-like User-Agent + Referer required to bypass anti-bot).
+
+**Filtering approach** — the SeeClickFix `web_portal_id` URL parameter is silently ignored by the API; instead we filter by **lat/lng + zoom** (33.4054, -86.8114, zoom=11 covers ~10mi radius bounding Birmingham metro), then post-filter strictly on `"hoover"` in the address string. ~360 strictly-Hoover issues at any time across all categories; ~30 are dedicated `CODE ENFORCEMENT` per 30 days = ~1/day.
+
+**Signal class** — these are **citizen-reported complaints** (early-stage distress: overgrown grass, junk vehicles, dilapidated property), not formal code citations. Softer evidence than Huntsville's Unsafe Buildings list but earlier in the funnel — most issues are still Open or Acknowledged at time of pull. Sets `notice_subtype="code_enforcement_complaint"` to distinguish from `unsafe_building` (Huntsville) and `housing_enforcement` / `inoperable_vehicle` / etc. (Birmingham Accela subtypes).
+
+**Address parsing** — anchor-based: locate the literal `"Hoover"` in the address string, treat everything before it as the street, capture the trailing 5-digit ZIP. Tolerates the three formats SeeClickFix users enter (`"... Hoover, Alabama, 35244"`, `"... Hoover, AL, 35226, USA"`, `"... Hoover AL 35226, United States"`).
+
+**Owner enrichment via Jefferson E-Ring** — `enrich_with_owner()` mirrors the Birmingham Accela adapter: passes `notice.address` to `jefferson_property_api.search_by_situs_address()`, picks exact-situs match if available. ~80% hit rate. Adds owner_name, parcel_id, assessed_value, is_homestead.
+
+CLI:
+```bash
+# Default: last 30d, target ZIPs only, no owner enrichment
+python src/hoover_code_enforcement_api.py
+
+# Full daily-ops mode with owner enrichment + open-only + CSV
+python src/hoover_code_enforcement_api.py --days-back 7 --target-zips-only \
+    --enrich-owners --open-only --csv-out output/hoover_codes.csv
+
+# Distribution recon (no request_type filter — useful to characterize Hoover SeeClickFix volume)
+python src/hoover_code_enforcement_api.py --all-types --max-pages 5
+```
+
+**Realistic 30-day yield (May 2026 sample)**: 30 in-tier issues across 35226 (T1, 19), 35216 (T2, 6), 35244 (T2, 5). Status mix: 15 Open + 4 Acknowledged + 11 Closed. Owner enrichment resolved cleanly on all sampled records (real homeowner names + parcels + valuations $286K-$529K).
+
 ### Status
 
 - **Phase 1 — Huntsville unsafe buildings (DONE)**: 222 active cases per monthly PDF.
@@ -676,6 +1066,24 @@ Birmingham high-fee code violations (after enrich_details):
 - **Phase 3 — Owner enrichment via Madison address-search (DONE)**: `search_by_situs_address()` + `enrich_with_owner()`. ~80% hit rate on Huntsville unsafe-building records.
 - **Phase 4 — Birmingham Accela early-distress scraper (DONE)**: Playwright-based adapter for 5 enforcement categories. Adds ~300-500 Birmingham early-distress records per month with `early_distress` tag (separate from `demolish`). Optional detail-page enrichment for owner + fees.
 - **Phase 5 — Birmingham owner enrichment via Jefferson tax-roll (DONE)**: `jefferson_property_api.search_by_situs_address()` (E-Ring `searchtype=4`) + `birmingham_code_enforcement_api.enrich_with_owner()`. CLI flag `--enrich-owner`. ~80% hit rate; directional-fallback retry handles `1124 SW 16TH ST SW`-style addresses. ~10x faster than `--enrich-details` and works without an Accela session.
+- **Phase 6 — Hoover SeeClickFix code-enforcement (DONE, 2026-05-08)**: Citizen-complaint adapter for Hoover (Tier 1 + Tier 2 ZIPs). ~30 in-tier issues per 30 days. `notice_subtype="code_enforcement_complaint"`. Wired into `code_violation_pipeline._fetch_hoover()` with `include_hoover=True` default; toggle via `--no-hoover`.
+
+### Other Birmingham-metro municipalities — researched 2026-05-08, NOT viable for online scraping
+
+Researched these 4 cities at the user's request — each was confirmed to have no publicly-scrapeable code-enforcement data. Decision: stay APN-only for these cities; do not re-research without new evidence.
+
+| City | Tier ZIPs | Platform | Why not viable |
+|---|---|---|---|
+| **Vestavia Hills** | T1 35226 | Vestavia Hills Connect + OpenGov (permits only) | Connect is anonymous-submit-only with no public list. OpenGov record types 1071/1082 cover permits (Portable Storage, Land Disturbance), not violations. |
+| **Trussville** | T2 35173 | `compliance.trussville.org` — **Freshdesk** ticket portal | Public can SUBMIT tickets; viewing requires staff login. Freshdesk API is paid + auth-gated. |
+| **Hueytown** | T1 35023 | `hueytown.govtportal.com` | Payments only (citations/utility bills/business licenses). No code-violation search. |
+| **Pinson** | T2 35126 | `pinsonalabama.com` returns ~114 bytes | Essentially no municipal web presence — small population (~7K), no public infrastructure. |
+
+**SeeClickFix probe**: Each city was also probed against the SeeClickFix API (same source as Hoover). Volume was 0-7 issues per city across 2 pages of bbox queries — essentially absent. Generalizing the Hoover SeeClickFix adapter to these cities yields no usable signal.
+
+**Floor coverage**: The APN code-violation scraper (Phase 2) catches FORMAL condemnation/demolition publications statewide via tightened keywords (`DEMOLITION + UNSAFE STRUCTURE`, `CONDEMNED STRUCTURE`, `NUISANCE ABATEMENT DEMOLISHED`). When these cities publish formal teardowns, they're already in the daily scrape. Early-distress signals (housing maintenance, junk vehicles, zoning) are not available for these 4 cities — they live in private/paid platforms.
+
+**Path to close the gap (if ever needed)**: File recurring open-records requests to each city's code-enforcement office (parallel to the planned Huntsville FOIA at [docs/foia/huntsville_code_enforcement_request.md](docs/foia/huntsville_code_enforcement_request.md)). Manual workflow, monthly cadence, requires human-in-loop to file/receive/import. Worth the effort only if APN volume proves insufficient.
 
 ### Coverage gap (planned to close via FOIA)
 
@@ -685,10 +1093,10 @@ Closing this gap requires a recurring Alabama Open Records Act request to Huntsv
 
 ### Unified pipeline — [src/code_violation_pipeline.py](src/code_violation_pipeline.py)
 
-Single orchestrator that runs both county adapters in one pass and converts to `NoticeData`. Mirrors the `tax_distress_pipeline.py` shape:
-- `fetch_code_violations(counties=("Madison","Jefferson"), ...)` — public API. Returns combined `NoticeData` list.
-- Per-county wrappers `_fetch_madison()` (Huntsville Unsafe Buildings PDF) and `_fetch_jefferson()` (Birmingham Accela).
-- Knobs are passed through: Birmingham gets `categories`, `days_back`, `max_pages`, `enrich_details`, `headless`; Huntsville gets `min_age_years`. Both share `enrich_owner` (tax-roll address-search via Madison or Jefferson property API depending on county).
+Single orchestrator that runs all city adapters in one pass and converts to `NoticeData`. Mirrors the `tax_distress_pipeline.py` shape:
+- `fetch_code_violations(counties=("Madison","Jefferson"), ...)` — public API. Returns combined `NoticeData` list across all selected cities.
+- Per-city wrappers: `_fetch_madison()` (Huntsville Unsafe Buildings PDF), `_fetch_jefferson()` (Birmingham Accela), `_fetch_hoover()` (Hoover SeeClickFix — fires when Jefferson is selected AND `include_hoover=True`).
+- Knobs are passed through: Birmingham gets `categories`, `days_back`, `max_pages`, `enrich_details`, `headless`; Huntsville gets `min_age_years`; Hoover gets `include_hoover` (default True) and `hoover_target_zips_only` (default True). All three share `enrich_owner` (tax-roll address-search — Madison API for Huntsville, Jefferson E-Ring for Birmingham + Hoover).
 
 CLI examples:
 ```bash
@@ -705,6 +1113,42 @@ python src/code_violation_pipeline.py --enrich-owner \
 # Birmingham early-distress only, 60-day window, 10 pages per category
 python src/code_violation_pipeline.py --counties Jefferson --days 60 --max-pages 10
 ```
+
+## Marshall County, AL — Distressor Coverage (added 2026-05-12)
+
+Marshall County (Albertville-anchored, ~99K population, north-central AL) was added as the third active county after Jefferson + Madison. The build economy was large because Marshall shares Madison's vendor platform: **AssuranceWeb (countygovservices.com)** for both property search and tax-delinquent recording. The Madison property + probate adapter patterns clone almost directly.
+
+### Tier ZIPs
+
+Codified in [src/target_zips.py](src/target_zips.py) as `MARSHALL_TIER_1` (6 ZIPs) and `MARSHALL_TIER_2` (5 ZIPs). Source-of-truth analysis at `~/Documents/Claude/Projects/REI Skill Library/Marshall_County_AL_SFR_125K_500K_Market_Analysis.md`. Codification is a **union** of the MD volume rankings AND operator-strategic additions (2026-05-12):
+
+| Tier | ZIPs | Coverage |
+|---|---|---|
+| **Tier 1** | 35950, 35976, 35016, 35961, 35951, 35957 | Albertville (35950 + 35951 fringe), Guntersville/Union Grove (35976), Arab (35016), Boaz (35961), Crossville/Geraldine (35957). First four are MD's volume-ranked picks; 35951 + 35957 operator-promoted for full Albertville-zone + Crossville-corridor coverage. |
+| **Tier 2** | 35962, 35175, 35747, 35769, 35980 | Boaz area (35962, MD-ranked) + four border ZIPs (35175 Cullman line, 35747 Grant supplemental, 35769 Jackson line / Scottsboro, 35980 DeKalb line). Border ZIPs capture cross-county property where the owner lives over the line. |
+
+### Data sources
+
+| Distressor | Source | Module | Status |
+|---|---|---|---|
+| **Property search** | AssuranceWeb `marshall.countygovservices.com/property/Property/Search` | [src/marshall_property_api.py](src/marshall_property_api.py) | **Live**. Clone of `madison_property_api`. Live-verified 936 SMITH hits, 14 SMITH JOHN hits. |
+| **Probate (post-probate)** | APN newspaper publications + `_search_marshall` enrichment | Reuses [src/apn_probate_pipeline_al.py](src/apn_probate_pipeline_al.py) + [src/probate_property_locator.py](src/probate_property_locator.py) | **Live**. `_TARGET_COUNTIES` updated; `_adapter_for("Marshall")` routes to `_search_marshall`. |
+| **Pre-probate** | legacy.com Marshall County aggregator (`/us/obituaries/local/alabama/marshall-county`) | Reuses [src/pre_probate_pipeline_al.py](src/pre_probate_pipeline_al.py) | **Live**. `ALABAMA_LISTINGS["Marshall"]` added; `LEGACY_MARKET_URL_RE` broadened to accept any market slug (e.g. `albertville`, `guntersville`, `marshall-county`). |
+| **Foreclosure** | APN newspaper publications | 2 SAVED_SEARCHES (MORTGAGE FORECLOSURE SALE / RESCHEDULE) | **Live**. |
+| **Code-violation** | APN-floor only (no online municipal source) | 3 SAVED_SEARCHES (DEMOLITION+UNSAFE, CONDEMNED+DEMOLITION, NUISANCE ABATEMENT DEMOLISHED) | **Live**. `code_violation_pipeline.py` accepts `--counties Marshall` but no-ops with a log line — the APN scraper carries Marshall's code-violation coverage. |
+| **Tax-delinquent** | AssuranceWeb `marshall.countygovservices.com/property/Property/DelinquentParcels` | [src/marshall_tax_delinquent_api.py](src/marshall_tax_delinquent_api.py) | **STUB — source disabled by the county** ("The Delinquent Parcels listing is currently disabled" + "Payments are currently disabled" as of 2026-05-12). Adapter probes the page on each call via `is_source_disabled()` and returns `[]` while offline. The orchestrators (`tax_distress_pipeline.py`, `distress_proxy_pipeline.py`) wire the stub through; the moment Marshall re-enables the listing, back-fill the parser in `fetch_delinquent_parcels()` (`NotImplementedError` is raised today if the page comes back online, by design — to prevent silent data loss). |
+
+### Why no dedicated code-enforcement adapter
+
+Researched 2026-05-12: Marshall has no Accela / SeeClickFix / municipal-portal exposure for code violations. Albertville, Boaz, Guntersville, and Arab all handle code enforcement through internal staff workflows with no public read interface. SeeClickFix probe across all four cities returned essentially zero issues — citizen-complaint volume is too low to justify a dedicated adapter. **Coverage path**: the APN-floor scraper (3 Marshall SAVED_SEARCHES on tightened keywords) catches FORMAL condemnation/demolition publications statewide when Marshall cities file them. Same posture as the Birmingham-metro dead-end cities (Vestavia/Trussville/Hueytown/Pinson).
+
+### Smarty ZIP recovery for Marshall
+
+Marshall property records (like Madison) return only street in `search_by_owner_name` — city/zip are not in the bulk response. `_smarty_zip_for_marshall_address()` (in `pre_probate_pipeline_al.py`) uses **`"Albertville AL"`** as the USPS-CASS anchor; Smarty resolves Boaz (35957), Guntersville (35976), Arab (35016), and rural Marshall addresses to their correct delivery cities from this anchor automatically. Generalized as `_smarty_zip_for_assuranceweb_address(situs, lastline_hint)` so future AL counties on the same vendor platform plug in cleanly.
+
+### Cross-county property ownership
+
+The pre-probate orchestrator's `search_order` rotates all 3 counties (`_search_jefferson`, `_search_madison`, `_search_marshall`) with the hinted county first. Decedent died in Huntsville but owned property in Boaz? The Madison hint loses, Marshall wins on the fallback. The `obituary_harvester` regex change (broader market-slug pattern) also lets the harvester catch obits syndicated under any city slug from the Marshall County aggregator listing.
 
 ## Key Domain Rules
 
@@ -849,15 +1293,21 @@ DataSift.ai (formerly REISift) is the CRM where scraped records land for niche s
 DataSift's niche sequential system uses filter presets to guide records through SMS → Call → Mail → Deep Prospecting phases. Two preset folders: "00 Niche Sequential Marketing" (12 presets, courthouse data) and "01. Bulk Sequential Marketing" (9 presets, bulk data). All 21 presets exclude Sold status (build 1.0.23). A "Sold Property Cleanup" sequence in the Transactions folder auto-fires on "Sold" tag to change status, remove from lists, clear tasks, and clear assignee.
 
 - **"Courthouse Data" tag:** Every record gets this tag — signals first-to-market county data (prioritized over bulk data in filter presets)
-- **Lists column:** Maps `notice_type` → DataSift list name (`foreclosure` → "Foreclosure", `probate` → "Probate", `tax_sale` → "Tax Sale", `tax_delinquent` → "Tax Delinquent", `eviction` → "Eviction", `code_violation` → "Code Violation", `divorce` → "Divorce"). DataSift auto-creates lists from CSV.
+- **Lists column:** Maps `notice_type` → DataSift list name (`foreclosure` → "Foreclosure", `probate` → "Probate", `pre_probate` → "Pre-Probate", `tax_sale` → "Tax Delinquent", `tax_delinquent` → "Tax Delinquent", `eviction` → "Eviction", `code_violation` → "Code Violation", `divorce` → "Divorce"). The Heirs CSV uses the SAME `NOTICE_TYPE_TO_LIST` mapping — heir rows land in the same distressor list as the DM row from the same source notice. To distinguish heir rows from DM rows after upload, each heir row carries a per-row `heir_of_<notice_type>` tag (e.g. `heir_of_foreclosure`). DataSift filter presets can target these with `foreclosure AND heir_of_foreclosure` to isolate the heirs-only audience inside the broader Foreclosure list.
+
+  **Important:** the per-row `Lists` column does NOT auto-route records — the upload wizard creates ONE target list per session. To land records in the correct per-distressor list, the canonical pipeline (`upload_to_datasift_per_distressor`) splits the CSV by `Notice Type` and uploads each subset using `existing_list=True` with the mapped list name. Each target list must already exist in DataSift. Tax-sale records are intentionally consolidated under "Tax Delinquent" — the auction-roster distinction is preserved on the record via `notice_type=tax_sale` tag. **Run-summary display:** `HEIRS_DISPLAY_LABELS` (in `datasift_formatter.py`) provides "Heirs of Foreclosure" / "Heirs of Probate" / etc. labels so Slack and terminal summaries can call out heir-CSV uploads distinctly even though both DM and heir rows go to the same DataSift list.
 - **Tags:** Courthouse Data, notice_type, county, YYYY-MM date, deceased/living, DM confidence level, has_auction, tax_delinquent, photo_import (for photo-sourced records). **AL probate adds:** `municipality_birmingham` / `municipality_trussville` / `municipality_county` / etc. (lowercased Jefferson DispCode), `homestead`, `probate_sale` / `probate_creditors` / `probate_heirs_notice`, `multi_parcel`, `hearing_upcoming` (within 30 days), `creditor_window_open` (deadline still in future). These let filter presets target Birmingham metro core (`municipality_birmingham,municipality_hoover,municipality_vestavia_hills,municipality_mountain_brook,municipality_homewood,municipality_trussville`) or active probate-sale opportunities (`probate_sale,hearing_upcoming`).
 
 ### Upload Wizard (5 Steps)
-1. **Setup:** Click "Upload File" sidebar → "Add Data" → dropdown "Uploading a new list not in DataSift yet" → enter list name → organization questions
+1. **Setup:** Click "Upload File" sidebar → "Add Data" → dropdown selects either:
+   - **"Uploading a new list not in DataSift yet"** (creates a SiftStack-named wrapper list — used by the legacy `upload_to_datasift` / `upload_datasift_split` helpers; do NOT use for new code).
+   - **"Adding properties to an existing list inside DataSift"** (canonical path — picks the per-distressor list from the dropdown). The new `upload_to_datasift_per_distressor` helper uses this mode after splitting the CSV by Notice Type.
 2. **Tags:** Skip through (tags are in CSV column)
 3. **Upload File:** Set file on `input[type="file"]`
 4. **Map Columns:** Core address fields auto-map; Tags, Lists, and enrichment columns may need manual mapping
 5. **Review + Finish Upload:** Click "Finish Upload" — processing happens in background
+
+**Update Data mode caveat:** the wizard's "Update Data" toggle (intended to merge into existing records instead of creating duplicates) has a different downstream step sequence than "Add Data" — a modal interrupts the file-input step and the existing helper times out. Until that flow is mapped, the canonical helper uses Add Data mode + existing-list selection. Records are matched on property address by DataSift when present, but duplicate creation is possible if the same row is uploaded twice without manual cleanup in between.
 
 ### Column Mapping Notes
 - Only core address fields (Property Street, City, State, ZIP) reliably auto-map

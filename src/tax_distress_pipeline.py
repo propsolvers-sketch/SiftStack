@@ -113,20 +113,39 @@ def _fetch_jefferson(*, individuals_only: bool, min_balance: float) -> list[Noti
     return [to_notice_data(r) for r in recs]
 
 
+def _fetch_marshall(*, individuals_only: bool, min_balance: float) -> list[NoticeData]:
+    """Marshall delinquent feed wrapper. Returns [] while the source is offline.
+
+    The Marshall County delinquent-parcels listing was disabled by the county
+    as of 2026-05-12 (page shows "Delinquent Parcels listing is currently
+    disabled"). The stub adapter in marshall_tax_delinquent_api probes the
+    page on each call and returns [] when disabled, so this wrapper is a
+    no-op today. Once Marshall re-enables the listing the stub parser will
+    be back-filled and this orchestrator wrapper will start contributing
+    records without any further changes here.
+    """
+    from marshall_tax_delinquent_api import fetch_delinquent_parcels, to_notice_data
+    recs = fetch_delinquent_parcels(
+        individuals_only=individuals_only, min_balance=min_balance,
+    )
+    return [to_notice_data(r) for r in recs]
+
+
 # ── Public API ───────────────────────────────────────────────────────
 
 
 def fetch_tax_distress(
     *,
-    counties: tuple[str, ...] = ("Madison", "Jefferson"),
+    counties: tuple[str, ...] = ("Madison", "Jefferson", "Marshall"),
     individuals_only: bool = False,
     min_balance: float = 0.0,
     stamp_auction_dates: bool = True,
+    tiers: tuple[int, ...] | None = (1, 2),
 ) -> list[NoticeData]:
     """Pull the full tax-distress feed for the requested AL counties.
 
     Args:
-        counties: Counties to query. Defaults to ("Madison", "Jefferson").
+        counties: Counties to query. Defaults to ("Madison", "Jefferson", "Marshall").
             Case-insensitive on input. Anything else is ignored with a warning.
         individuals_only: When True, drop entity-owned parcels (LLC/Inc/Corp
             etc.) via ``config.BUSINESS_RE``. Same semantics as each adapter.
@@ -134,10 +153,19 @@ def fetch_tax_distress(
             Recommended: 5000 for the high-exposure focus.
         stamp_auction_dates: When True (default), apply the next first-Tuesday
             of May to every tax_sale-typed notice via ``apply_auction_dates``.
+        tiers: Tuple of ZIP tiers (1, 2) to keep. ``None`` (or empty tuple)
+            disables the filter — returns everything. Default ``(1, 2)``.
+
+            Note: Madison's bulk feed doesn't expose ZIP (the AssuranceWeb
+            search response returns only street). Tier filtering on Madison
+            records therefore drops them all under the default. Use
+            ``distress_proxy_pipeline`` for Smarty-anchored ZIP recovery +
+            tier filtering — that's the canonical tier-aware orchestrator
+            for this signal. The flag here is for cross-pipeline consistency.
 
     Returns:
         Combined list of NoticeData across all requested counties, in the
-        order Madison → Jefferson when both are requested.
+        order Madison → Jefferson → Marshall when all are requested.
     """
     selected = {c.strip().title() for c in counties if c}
     notices: list[NoticeData] = []
@@ -152,13 +180,31 @@ def fetch_tax_distress(
         notices.extend(_fetch_jefferson(
             individuals_only=individuals_only, min_balance=min_balance,
         ))
+    if "Marshall" in selected:
+        logger.info("Fetching Marshall tax-delinquent feed…")
+        notices.extend(_fetch_marshall(
+            individuals_only=individuals_only, min_balance=min_balance,
+        ))
 
-    unknown = selected - {"Madison", "Jefferson"}
+    unknown = selected - {"Madison", "Jefferson", "Marshall"}
     if unknown:
         logger.warning("Unknown counties skipped: %s", sorted(unknown))
 
     if stamp_auction_dates:
         apply_auction_dates(notices)
+
+    # Tier-ZIP filter
+    if tiers:
+        from target_zips import zip_tier
+        tier_set = set(tiers)
+        before = len(notices)
+        kept = [n for n in notices if zip_tier(n.zip) in tier_set]
+        dropped = before - len(kept)
+        logger.info(
+            "Tier filter (tiers=%s): %d → %d (dropped %d, incl. records w/ no ZIP)",
+            sorted(tier_set), before, len(kept), dropped,
+        )
+        notices = kept
 
     return notices
 
@@ -169,11 +215,11 @@ def fetch_tax_distress(
 def _build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="tax_distress_pipeline",
-        description="Unified Madison + Jefferson tax-delinquent / tax-sale pull.",
+        description="Unified Madison + Jefferson + Marshall tax-delinquent / tax-sale pull.",
     )
     p.add_argument(
-        "--counties", default="Madison,Jefferson",
-        help="Comma-separated counties (default: Madison,Jefferson).",
+        "--counties", default="Madison,Jefferson,Marshall",
+        help="Comma-separated counties (default: Madison,Jefferson,Marshall).",
     )
     p.add_argument(
         "--individuals-only", action="store_true",
@@ -186,6 +232,13 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--no-auction-stamp", action="store_true",
         help="Skip Phase 3 auction-date stamping.",
+    )
+    p.add_argument(
+        "--tiers", type=str, default="1,2",
+        help="Comma-separated ZIP tiers to keep (default '1,2'). 'all' "
+             "disables the filter. Note: Madison records lack ZIP at this "
+             "stage — use distress_proxy_pipeline for Smarty-anchored "
+             "Madison/Marshall tier filtering.",
     )
     p.add_argument(
         "--output-csv", type=Path, default=None,
@@ -233,11 +286,20 @@ def _main(argv: list[str]) -> int:
     args = _build_argparser().parse_args(argv)
 
     counties = tuple(c.strip() for c in args.counties.split(",") if c.strip())
+
+    tiers_arg = (args.tiers or "").lower()
+    tiers: tuple[int, ...] | None
+    if tiers_arg in ("", "all"):
+        tiers = None
+    else:
+        tiers = tuple(int(t) for t in args.tiers.split(",") if t.strip().isdigit())
+
     notices = fetch_tax_distress(
         counties=counties,
         individuals_only=args.individuals_only,
         min_balance=args.min_balance,
         stamp_auction_dates=not args.no_auction_stamp,
+        tiers=tiers,
     )
 
     _summarize(notices)

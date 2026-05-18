@@ -171,7 +171,7 @@ def _lookup_missing_heir_addresses(
         if addr and addr.get("street"):
             heir["street"] = addr.get("street", "")
             heir["city"] = addr.get("city", "") or city_hint
-            heir["state"] = addr.get("state", "") or "TN"
+            heir["state"] = addr.get("state", "") or notice.state or "TN"
             heir["zip"] = addr.get("zip", "")
             heir["address_source"] = addr.get("source", "")
             filled += 1
@@ -276,7 +276,7 @@ def batch_skip_trace(
     writer.writerow(["first_name", "last_name", "address", "city", "state",
                      "zip", "mail_address", "mail_city", "mail_state"])
     for notice_ref, first, last, address, city, zip_code, _ in lookup_map:
-        state = notice_ref.state or "TN"
+        state = notice_ref.state or "AL"
         writer.writerow([first, last, address, city, state, zip_code, "", "", ""])
     csv_content = csv_buffer.getvalue()
     csv_buffer.close()
@@ -323,9 +323,29 @@ def batch_skip_trace(
         est_wait = queue_data.get("estimated_wait_seconds", "unknown")
         logger.info("  Tracerfy batch job %s submitted (est. %ss)", queue_id, est_wait)
 
-        # Poll for results (up to 5 minutes)
+        # Poll for results (up to 5 minutes). Tracerfy returns two shapes:
+        #   * list — terminal state, an array of record dicts (may be empty if
+        #     no contacts matched). Treat as "complete" only after we've given
+        #     the job at least the estimated_wait_seconds to run; an EMPTY LIST
+        #     on the first poll typically means "still queued/processing", not
+        #     "complete with zero matches". This was the v4-sweep bug: poll #1
+        #     returned [] in 5s, we declared "0/325 matched", and the actual
+        #     records that landed seconds later were never read.
+        #   * dict with `status` — explicit status field; trust it directly.
+        try:
+            base = int(est_wait) if str(est_wait).isdigit() else 30
+        except Exception:
+            base = 30
+        # Use 2× the API's estimate as the floor before we'll accept an empty
+        # list as terminal — their estimated_wait_seconds is a hint, not a
+        # guarantee, and large batches routinely run past it. Min 60s so tiny
+        # batches don't pop too early; capped at 240s so we don't eat the full
+        # 5-min polling timeout on a genuine zero-match job.
+        min_wait_s = max(min(base * 2, 240), 60)
+
         for attempt in range(60):
             time.sleep(5)
+            elapsed_s = (attempt + 1) * 5
             result_resp = requests.get(
                 f"{TRACERFY_QUEUE_URL}{queue_id}",
                 headers={"Authorization": f"Bearer {cfg.TRACERFY_API_KEY}"},
@@ -337,6 +357,15 @@ def batch_skip_trace(
             # Handle both response formats
             if isinstance(result_data, list):
                 records = result_data
+                # Empty list before the job's estimated wait is up = still
+                # processing. Keep polling instead of treating as "complete".
+                if not records and elapsed_s < min_wait_s:
+                    if attempt % 6 == 5:
+                        logger.info(
+                            "  Tracerfy batch still processing (%ds, est. %ss)...",
+                            elapsed_s, est_wait,
+                        )
+                    continue
             elif isinstance(result_data, dict):
                 status = result_data.get("status", "")
                 if status == "failed":
@@ -345,7 +374,7 @@ def batch_skip_trace(
                 if status != "completed":
                     if attempt % 6 == 5:
                         logger.info("  Tracerfy batch still processing (%ds)...",
-                                    (attempt + 1) * 5)
+                                    elapsed_s)
                     continue
                 records = result_data.get("records", [])
             else:

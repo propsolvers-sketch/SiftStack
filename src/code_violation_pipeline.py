@@ -101,12 +101,37 @@ def _fetch_jefferson(
     return [to_notice_data(r, enrich_owner=enrich_owner) for r in records]
 
 
+def _fetch_hoover(
+    *,
+    days_back: int,
+    enrich_owner: bool,
+    target_zips_only: bool,
+) -> list[NoticeData]:
+    """Run the Hoover SeeClickFix code-enforcement adapter and convert to NoticeData.
+
+    Hoover is in Jefferson County but has its own platform (SeeClickFix 311
+    citizen-complaint feed) — separate from Birmingham Accela. Citizen-reported
+    violations land here within hours; we filter to the dedicated
+    "CODE ENFORCEMENT" request_type and (optionally) our Tier 1/Tier 2 ZIPs.
+    """
+    from hoover_code_enforcement_api import fetch_code_violations, to_notice_data
+    target_zips = None
+    if target_zips_only:
+        from target_zips import ALL_TARGET
+        target_zips = set(ALL_TARGET)
+    records = fetch_code_violations(
+        days_back=days_back,
+        target_zips=target_zips,
+    )
+    return [to_notice_data(r, enrich_owner=enrich_owner) for r in records]
+
+
 # ── Public API ───────────────────────────────────────────────────────
 
 
 def fetch_code_violations(
     *,
-    counties: tuple[str, ...] = ("Madison", "Jefferson"),
+    counties: tuple[str, ...] = ("Madison", "Jefferson", "Marshall"),
     # Birmingham (Jefferson) knobs
     categories: tuple[str, ...] = _DEFAULT_BIRM_CATEGORIES,
     days_back: int = 30,
@@ -115,33 +140,47 @@ def fetch_code_violations(
     headless: bool = True,
     # Huntsville (Madison) knobs
     min_age_years: int = 0,
+    # Hoover (Jefferson, separate platform) knobs
+    include_hoover: bool = True,
+    hoover_target_zips_only: bool = True,
     # Shared
     enrich_owner: bool = False,
+    tiers: tuple[int, ...] | None = (1, 2),
 ) -> list[NoticeData]:
     """Pull the full code-violation feed for the requested AL counties.
 
     Args:
         counties: Counties to query. Case-insensitive on input. Default both.
             ``"Madison"`` → Huntsville Unsafe Buildings;
-            ``"Jefferson"`` → Birmingham Accela.
+            ``"Jefferson"`` → Birmingham Accela + Hoover SeeClickFix
+            (Hoover is in Jefferson County but uses a separate platform).
         categories: Birmingham Accela record-type CLI keys to query
             (housing, vehicles, environmental, zoning, condemnation).
             Ignored when Jefferson is not selected.
-        days_back: Birmingham search window (default 30).
+        days_back: Window for Birmingham AND Hoover (both honor it).
         max_pages: Birmingham per-category pagination cap (default 5).
         enrich_details: Birmingham only — click each case detail page for
             fees + mailing address. Slow (~3s/case).
         headless: Birmingham only — set False for visible Playwright debug.
         min_age_years: Huntsville only — drop cases newer than N whole years
             (Phase 1 high-conversion subset uses 2).
-        enrich_owner: Both counties — opt-in tax-roll address-search to fill
-            owner of record (~0.3s/case, ~80% hit rate). When combined with
-            Birmingham ``enrich_details``, Jefferson tax-roll fires first;
-            Accela detail-page only runs for cases the tax-roll missed.
+        include_hoover: When Jefferson is selected, also pull Hoover
+            SeeClickFix issues (default True). Hoover citizen-complaints are
+            an early-distress signal class distinct from Birmingham Accela
+            formal cases.
+        hoover_target_zips_only: Filter Hoover output to our Tier 1+2 ZIPs
+            (default True — Hoover spans 35022 T1, 35226 T1, 35216 T2,
+            35244 T2 plus off-target spillover into Vestavia / Pelham).
+        enrich_owner: All cities — opt-in tax-roll address-search to fill
+            owner of record (~0.3s/case, ~80% hit rate). For Birmingham,
+            Jefferson tax-roll fires first; Accela detail-page only runs
+            for cases the tax-roll missed. For Hoover, Jefferson tax-roll
+            via E-Ring (same as Birmingham). For Huntsville, Madison
+            address-search.
 
     Returns:
-        Combined ``NoticeData`` list across all requested counties, in the
-        order Madison → Jefferson when both are requested.
+        Combined ``NoticeData`` list across all requested cities, in the
+        order Madison → Birmingham → Hoover.
     """
     selected = {c.strip().title() for c in counties if c}
     notices: list[NoticeData] = []
@@ -165,10 +204,52 @@ def fetch_code_violations(
             enrich_owner=enrich_owner,
             headless=headless,
         ))
+        if include_hoover:
+            logger.info(
+                "Fetching Hoover SeeClickFix code-enforcement issues — "
+                "days_back=%d, target_zips_only=%s",
+                days_back, hoover_target_zips_only,
+            )
+            notices.extend(_fetch_hoover(
+                days_back=days_back,
+                enrich_owner=enrich_owner,
+                target_zips_only=hoover_target_zips_only,
+            ))
 
-    unknown = selected - {"Madison", "Jefferson"}
+    if "Marshall" in selected:
+        # Marshall has NO dedicated online code-enforcement source — researched
+        # 2026-05-12: no Accela / SeeClickFix / municipal portal exposes
+        # citizen complaints or formal cases. Marshall code-violation coverage
+        # is APN-floor-only (the 3 SAVED_SEARCHES entries in config.py pick up
+        # statewide DEMOLITION/CONDEMNATION/NUISANCE-ABATEMENT publications,
+        # which include Marshall when they're filed). That path runs through
+        # the daily APN scraper, not through this pipeline — so the right
+        # behavior here is a no-op log, not an error.
+        logger.info(
+            "Marshall: no dedicated code-enforcement adapter — APN-floor "
+            "coverage runs via the daily APN scraper (SAVED_SEARCHES) "
+            "instead. Skipping in this orchestrator.",
+        )
+
+    unknown = selected - {"Madison", "Jefferson", "Marshall"}
     if unknown:
         logger.warning("Unknown counties skipped: %s", sorted(unknown))
+
+    # Tier-ZIP filter — drops Birmingham + Huntsville records outside our
+    # investor-target ZIPs. Hoover is already tier-filtered upstream when
+    # `hoover_target_zips_only=True`, but running the filter here is a
+    # cheap no-op safety net for that path too.
+    if tiers:
+        from target_zips import zip_tier
+        tier_set = set(tiers)
+        before = len(notices)
+        kept = [n for n in notices if zip_tier(n.zip) in tier_set]
+        dropped = before - len(kept)
+        logger.info(
+            "Tier filter (tiers=%s): %d → %d (dropped %d, incl. records w/ no ZIP)",
+            sorted(tier_set), before, len(kept), dropped,
+        )
+        notices = kept
 
     return notices
 
@@ -183,8 +264,10 @@ def _build_argparser() -> argparse.ArgumentParser:
                     "code-enforcement pull.",
     )
     p.add_argument(
-        "--counties", default="Madison,Jefferson",
-        help="Comma-separated counties (default: Madison,Jefferson).",
+        "--counties", default="Madison,Jefferson,Marshall",
+        help="Comma-separated counties (default: Madison,Jefferson,Marshall). "
+             "Marshall accepted but no-ops (APN-floor coverage only — runs via "
+             "the daily APN scraper, not this orchestrator).",
     )
     # Birmingham (Jefferson) knobs
     p.add_argument(
@@ -215,11 +298,28 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Huntsville only — drop cases newer than N whole years "
              "(Phase 1 high-conversion subset uses 2).",
     )
+    # Hoover (Jefferson, separate platform) knobs
+    p.add_argument(
+        "--no-hoover", action="store_true",
+        help="When Jefferson is selected, skip the Hoover SeeClickFix pull "
+             "(default: Hoover is included).",
+    )
+    p.add_argument(
+        "--hoover-all-zips", action="store_true",
+        help="Hoover only — pull ALL Hoover code-enforcement issues "
+             "(default: filter to our Tier 1+2 ZIPs only).",
+    )
     # Shared
     p.add_argument(
         "--enrich-owner", action="store_true",
-        help="Tax-roll owner enrichment for both counties (~80%% hit rate, "
+        help="Tax-roll owner enrichment for all cities (~80%% hit rate, "
              "~0.3s/case).",
+    )
+    p.add_argument(
+        "--tiers", type=str, default="1,2",
+        help="Comma-separated ZIP tiers to keep after pull (default '1,2'). "
+             "'all' disables the filter. Drops Birmingham/Huntsville records "
+             "outside our investor-target ZIPs.",
     )
     # Output
     p.add_argument(
@@ -270,6 +370,12 @@ def _main(argv: list[str]) -> int:
     counties = tuple(c.strip() for c in args.counties.split(",") if c.strip())
     categories = tuple(c.strip() for c in args.categories.split(",") if c.strip())
 
+    tiers_arg = (args.tiers or "").lower()
+    if tiers_arg in ("", "all"):
+        tiers: tuple[int, ...] | None = None
+    else:
+        tiers = tuple(int(t) for t in args.tiers.split(",") if t.strip().isdigit())
+
     notices = fetch_code_violations(
         counties=counties,
         categories=categories,
@@ -278,7 +384,10 @@ def _main(argv: list[str]) -> int:
         enrich_details=args.enrich_details,
         headless=not args.no_headless,
         min_age_years=args.min_age_years,
+        include_hoover=not args.no_hoover,
+        hoover_target_zips_only=not args.hoover_all_zips,
         enrich_owner=args.enrich_owner,
+        tiers=tiers,
     )
 
     _summarize(notices)

@@ -1,19 +1,19 @@
-"""Madison County, AL property search via AssuranceWeb (countygovservices.com).
+"""Marshall County, AL property search via AssuranceWeb (countygovservices.com).
 
 Wraps the public ASP.NET MVC search form at:
-  https://madisonproperty.countygovservices.com/Property/Property/Search
+  https://marshall.countygovservices.com/property/Property/Search
 
 The form is a Kendo Grid backed by an inline-data response: the POST body returns
 HTML containing the full result set as JSON-encoded record objects embedded in
 the Kendo Grid initialization script. No Playwright, no CAPTCHA, no login.
 
 Used by the probate enrichment pipeline to map a decedent (or PR) name to one
-or more parcels in Madison County. Caller searches by owner name, gets back
+or more parcels in Marshall County. Caller searches by owner name, gets back
 parcel ID, situs address, owner-of-record, total tax, and delinquency status.
 
 CLI usage:
-    python src/madison_property_api.py SMITH
-    python src/madison_property_api.py FULENWIDER ORVELENE
+    python src/marshall_property_api.py SMITH
+    python src/marshall_property_api.py FULENWIDER ORVELENE
 """
 from __future__ import annotations
 
@@ -30,8 +30,8 @@ from al_tax_year import current_al_tax_year
 
 logger = logging.getLogger(__name__)
 
-BASE_URL = "https://madisonproperty.countygovservices.com"
-SEARCH_FORM_URL = f"{BASE_URL}/Property/Property/Search"
+BASE_URL = "https://marshall.countygovservices.com/property"
+SEARCH_FORM_URL = f"{BASE_URL}/Property/Search"
 
 # ── Internal regexes ──────────────────────────────────────────────────
 
@@ -51,14 +51,14 @@ _RECORD_RE = re.compile(
 
 
 @dataclass(frozen=True)
-class MadisonPropertyRecord:
-    """One row from the Madison County property search."""
+class MarshallPropertyRecord:
+    """One row from the Marshall County property search."""
     parcel_number: str       # Formatted: "16-08-34-0-000-016.007"
     parcel_id: str           # Internal ParcelInfoID (use for cross-refs)
     pin: str                 # Short numeric PIN
     account: str             # Tax account number
     owner_name: str          # "SMITH, ELBERT D & KIM M" (LAST, FIRST format)
-    situs_address: str       # Property street address (no city/zip — Madison only fills street)
+    situs_address: str       # Property street address (no city/zip — Marshall only fills street)
     tax_year: int
     total_tax: float
     balance_due: float       # > 0 means delinquent
@@ -66,17 +66,17 @@ class MadisonPropertyRecord:
     property_type: str       # "Real" or "Personal"
     property_use: str        # Friendlier label for cross-county consistency ("Real Property" | "Personal")
     is_buildable: bool       # situs has a non-zero house # (filters out "0 STREET" vacant lots)
-    municipality: str        # Always "" for Madison — AssuranceWeb search response doesn't expose city/municipality (would require a per-parcel detail fetch). Kept for cross-county field parity with Jefferson.
+    municipality: str        # Always "" for Marshall — AssuranceWeb search response doesn't expose city/municipality (would require a per-parcel detail fetch). Kept for cross-county field parity with Jefferson.
 
     @classmethod
-    def from_kendo_record(cls, raw: dict) -> "MadisonPropertyRecord":
+    def from_kendo_record(cls, raw: dict) -> "MarshallPropertyRecord":
         balance = float(raw.get("BalanceDue") or 0)
         situs = (raw.get("PhysAddress") or "").strip()
-        # Madison records vacant lots with a leading "0 " in the address; anything
+        # Marshall records vacant lots with a leading "0 " in the address; anything
         # else has a real house number → likely buildable / has a structure.
         buildable = bool(situs) and not situs.startswith("0 ")
         ptype = (raw.get("PropertyType") or "").strip()
-        # Madison's search response only returns Real vs. Personal; map to a
+        # Marshall's search response only returns Real vs. Personal; map to a
         # friendly cross-county label. Real-property records will all read
         # "Real Property" — the residential/commercial distinction is on a
         # follow-up parcel-detail page we don't fetch in bulk.
@@ -185,8 +185,8 @@ def search_by_owner_name(
     year: int | None = None,
     use_contains: bool = False,
     real_property_only: bool = True,
-) -> list[MadisonPropertyRecord]:
-    """Search Madison County properties by owner name.
+) -> list[MarshallPropertyRecord]:
+    """Search Marshall County properties by owner name.
 
     Args:
         last_name: Required. Exact match by default; set ``use_contains`` for substring.
@@ -197,19 +197,16 @@ def search_by_owner_name(
         real_property_only: Drop personal-property records (typically what you want).
 
     Returns:
-        List of MadisonPropertyRecord. Empty list if no matches.
+        List of MarshallPropertyRecord. Empty list if no matches.
 
     Raises:
         httpx.HTTPError on network/server failures (after retries exhausted).
         RuntimeError if the form's CSRF token can't be located.
 
-    Retry behavior (added to fix non-determinism observed in live pipeline
-    runs — same name returning records on one call then nothing on the
-    next, due to transient HTTPError silently converted to []): retries
-    up to 2 times with backoff on any httpx.HTTPError or
-    json-parse-fails-on-everything. Legitimate "no matching parcels"
-    responses (200 OK with valid grid layout but empty records) are NOT
-    retried — that's a real signal.
+    Retries up to 2 times with backoff on transient HTTP/server flake.
+    Matches the Madison adapter pattern — see madison_property_api for
+    the full rationale (live runs showed same name returning records on
+    one call then nothing on the next due to silently-swallowed errors).
     """
     if not last_name or not last_name.strip():
         raise ValueError("last_name is required")
@@ -231,36 +228,31 @@ def search_by_owner_name(
                     year=year,
                     use_contains=use_contains,
                 )
-            # Sanity check: a valid empty-result page is ~5-15KB and contains
-            # the Kendo grid scaffolding. A body shorter than ~500 chars
-            # almost certainly means the request errored on the server side
-            # but came back with a 200 (rare but observed). Retry it.
             if len(body) < 500:
                 raise RuntimeError(
-                    f"Madison search returned suspiciously short body "
+                    f"Marshall search returned suspiciously short body "
                     f"({len(body)} chars) — treating as transient failure",
                 )
             break
         except (httpx.HTTPError, RuntimeError) as e:
             last_exc = e
             if attempt < 2:
-                # Backoff: 1s, 3s. Total worst case 4s of sleep.
                 sleep_s = 1.0 if attempt == 0 else 3.0
                 logger.warning(
-                    "Madison search attempt %d/3 failed for %r %r: %s — "
+                    "Marshall search attempt %d/3 failed for %r %r: %s — "
                     "retrying in %.1fs",
                     attempt + 1, last_name, first_name or "", e, sleep_s,
                 )
                 _time.sleep(sleep_s)
             else:
                 logger.error(
-                    "Madison search exhausted retries for %r %r: %s",
+                    "Marshall search exhausted retries for %r %r: %s",
                     last_name, first_name or "", e,
                 )
                 raise
 
     records = [
-        MadisonPropertyRecord.from_kendo_record(r)
+        MarshallPropertyRecord.from_kendo_record(r)
         for r in _iter_records(body)
     ]
     if real_property_only:
@@ -281,7 +273,7 @@ _STREET_TRAILER_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Madison's assessor stores numbered streets in digit-ordinal form ("10TH AVE",
+# Marshall's assessor stores numbered streets in digit-ordinal form ("10TH AVE",
 # "9TH AVE") but the unsafe-building PDF (and human-typed addresses) often use
 # spelled-out forms ("Tenth", "Ninth"). Normalize before searching.
 _ORDINAL_TO_DIGIT = {
@@ -300,8 +292,8 @@ def search_by_situs_address(
     *,
     year: int | None = None,
     real_property_only: bool = True,
-) -> list[MadisonPropertyRecord]:
-    """Search Madison County properties by situs (property) address.
+) -> list[MarshallPropertyRecord]:
+    """Search Marshall County properties by situs (property) address.
 
     AssuranceWeb's address mode takes the street number and street name as
     two separate criteria fields. The street name should be the *root* word
@@ -317,7 +309,7 @@ def search_by_situs_address(
         real_property_only: Drop personal-property records.
 
     Returns:
-        List of MadisonPropertyRecord. Empty if no matches.
+        List of MarshallPropertyRecord. Empty if no matches.
 
     Raises:
         ValueError if street_number or street_name is empty.
@@ -362,7 +354,7 @@ def search_by_situs_address(
         )
 
     records = [
-        MadisonPropertyRecord.from_kendo_record(r)
+        MarshallPropertyRecord.from_kendo_record(r)
         for r in _iter_records(body)
     ]
     if real_property_only:
@@ -376,13 +368,13 @@ def search_by_situs_address(
 def _main(argv: list[str]) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
     if not argv:
-        print("Usage: python madison_property_api.py LASTNAME [FIRSTNAME]", file=sys.stderr)
+        print("Usage: python marshall_property_api.py LASTNAME [FIRSTNAME]", file=sys.stderr)
         return 2
 
     last = argv[0]
     first = argv[1] if len(argv) > 1 else None
 
-    print(f"Searching Madison County for owner: {last}{f', {first}' if first else ''}")
+    print(f"Searching Marshall County for owner: {last}{f', {first}' if first else ''}")
     records = search_by_owner_name(last, first)
     print(f"Found {len(records)} real-property records.\n")
 

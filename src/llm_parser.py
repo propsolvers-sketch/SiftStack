@@ -197,9 +197,13 @@ async def extract_with_llm(
     # Truncate to ~8000 chars to stay within token limits while keeping cost low
     text = raw_text[:8000]
 
-    # Route to type-specific prompt
+    # Route to type-specific prompt. pre_probate (APN "Notice of Death"
+    # publications) reuses the probate prompt — the data shape is the same
+    # (decedent name, contact person, optional DOD), just without granted_date
+    # / case_number / judge fields filled in.
     prompt_map = {
         "probate": (PROBATE_PROMPT_TEMPLATE, _PROBATE_KEYS),
+        "pre_probate": (PROBATE_PROMPT_TEMPLATE, _PROBATE_KEYS),
         "eviction": (EVICTION_PROMPT_TEMPLATE, _EVICTION_KEYS),
         "code_violation": (CODE_VIOLATION_PROMPT_TEMPLATE, _CODE_VIOLATION_KEYS),
         "divorce": (DIVORCE_PROMPT_TEMPLATE, _DIVORCE_KEYS),

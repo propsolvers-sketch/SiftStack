@@ -1056,7 +1056,13 @@ def _filter_cbc_markdown(markdown: str) -> str:
 
 
 _firecrawl_credits_exhausted = False
-_firecrawl_budget_total = int(os.environ.get("FIRECRAWL_BUDGET", "3000"))
+# Per-process in-memory cap on Firecrawl calls. Matches the user's current
+# 1000-credit account plan; override via FIRECRAWL_BUDGET env var when on a
+# different plan. Below 50% remaining, medium-priority fetches are skipped;
+# below 25% remaining, low-priority fetches are skipped (high-priority always
+# runs). The cap is per-process, not per-account — each fresh pipeline run
+# resets the counter.
+_firecrawl_budget_total = int(os.environ.get("FIRECRAWL_BUDGET", "1000"))
 _firecrawl_calls_used = 0
 _firecrawl_lock = threading.Lock()
 
@@ -1101,12 +1107,45 @@ def _fetch_firecrawl(
             timeout=45,
         )
         if resp.status_code == 402:
-            with _firecrawl_lock:
-                _firecrawl_credits_exhausted = True
-            logger.warning(
-                "Firecrawl credits exhausted after %d calls — falling back to other methods",
-                _firecrawl_calls_used,
+            # Firecrawl returns 402 for both real credit exhaustion AND per-minute
+            # rate limits on lower-tier plans. Parse the body to tell them apart:
+            # only flip the in-process "exhausted" flag when the account is truly
+            # out of credits. Rate-limited responses get a transient retry path.
+            body_text = ""
+            try:
+                body_text = (resp.json().get("error") or resp.text or "").lower()
+            except Exception:
+                body_text = (resp.text or "").lower()
+
+            rate_limit_hit = (
+                "rate limit" in body_text
+                or "rate-limit" in body_text
+                or "too many requests" in body_text
             )
+            credits_out = (
+                "insufficient credit" in body_text
+                or "out of credits" in body_text
+                or "credits exhausted" in body_text
+                or "no credits" in body_text
+                or "payment required" in body_text
+            )
+
+            if credits_out or not rate_limit_hit:
+                # Treat ambiguous 402s as credit exhaustion (safer default — stop
+                # hammering an account that's truly out). Only the rate-limit
+                # branch leaves the flag unset so the next call can retry.
+                with _firecrawl_lock:
+                    _firecrawl_credits_exhausted = True
+                logger.warning(
+                    "Firecrawl 402 (credits): %s — disabling Firecrawl for this run after %d calls",
+                    body_text[:200] or "no body",
+                    _firecrawl_calls_used,
+                )
+            else:
+                logger.warning(
+                    "Firecrawl 402 (rate limit): %s — skipping this call, future calls will retry",
+                    body_text[:200] or "no body",
+                )
             return ""
         resp.raise_for_status()
         data = resp.json()
@@ -1389,7 +1428,7 @@ def _batch_tracerfy_lookup(notices: list) -> None:
                             and not notice.decision_maker_street):
                         notice.decision_maker_street = street
                         notice.decision_maker_city = (rec.get("mail_city") or "").strip()
-                        notice.decision_maker_state = (rec.get("mail_state") or "TN").strip()
+                        notice.decision_maker_state = (rec.get("mail_state") or notice.state or "TN").strip()
                         notice.decision_maker_zip = (rec.get("mail_zip") or "").strip()
                         matched += 1
                         logger.info(
@@ -1666,10 +1705,49 @@ def identify_decision_maker(survivors: list[dict]) -> tuple[str, str]:
 # ── Deep prospecting: ranked DMs, heir verification, error map ────────
 
 
+def _is_valid_dm_name(candidate: str, decedent_name: str = "") -> bool:
+    """Return False when a candidate "DM" name is actually a junk value the
+    upstream LLM extractor leaked in:
+      - A relationship word ("wife", "husband", "spouse", "son", ...) ended up
+        in the name field instead of the relationship field
+      - The candidate name matches the decedent (self-DM bug — happens when
+        the obit lists no separate survivor and the extractor records the
+        decedent as their own "DM")
+      - Empty / whitespace-only name
+    """
+    if not candidate or not candidate.strip():
+        return False
+    norm = candidate.strip().lower()
+    if norm in _RELATIONSHIP_WORDS:
+        return False
+    if decedent_name and norm == decedent_name.strip().lower():
+        return False
+    return True
+
+
+# Relationship / role words that the obit LLM occasionally puts in the NAME
+# field by mistake. Singular + plural variants. Used by rank_decision_makers
+# and other DM-promotion paths to reject them outright.
+_RELATIONSHIP_WORDS = frozenset({
+    "wife", "husband", "spouse", "partner", "widow", "widower",
+    "son", "daughter", "child", "children", "stepson", "stepdaughter",
+    "brother", "sister", "sibling", "siblings",
+    "mother", "father", "parent", "parents", "mom", "dad",
+    "grandson", "granddaughter", "grandchild", "grandchildren",
+    "niece", "nephew", "cousin", "cousins", "in-law", "in-laws",
+    "friend", "friends", "family", "family member",
+    "executor", "executrix", "administrator", "administratrix",
+    "personal representative", "pr",
+    "survivor", "survivors", "decedent", "deceased",
+    "the family", "loved one", "loved ones",
+})
+
+
 def rank_decision_makers(
     survivors: list[dict],
     executor_name: str = "",
     heir_statuses: dict[str, str] | None = None,
+    decedent_name: str = "",
 ) -> list[dict]:
     """Rank all survivors as potential decision-makers and classify signing authority.
 
@@ -1687,6 +1765,13 @@ def rank_decision_makers(
       - Parents: only if no living spouse AND no living children
       - Siblings: only if no living spouse, children, OR parents
       - In-laws, step-children, friends: never have signing authority
+
+    Args:
+        survivors: List of {name, relationship, city} dicts from obit LLM extract.
+        executor_name: Court-named executor (may not be in survivors list).
+        heir_statuses: Optional {name: "verified_living"/"unverified"/...} dict.
+        decedent_name: Decedent's full name — used to filter the self-DM bug
+            where the LLM extractor names the decedent as their own survivor.
     """
     if not survivors and not executor_name:
         return []
@@ -1705,8 +1790,13 @@ def rank_decision_makers(
     }
     parent_terms = {"mother", "father", "parent"}
     grandchild_terms = {"grandson", "granddaughter", "grandchild"}
-    # Spouses of relatives — non-inheriting (e.g., "grandchild's spouse", "grandson's wife")
-    spouse_of_patterns = {"'s spouse", "'s wife", "'s husband", "'s partner"}
+    # Spouses of relatives — non-inheriting (e.g., "grandchild's spouse",
+    # "grandson's wife", "spouse of son"). Two grammatical forms appear in
+    # obituary text: apostrophe-s ("son's wife") and prepositional ("wife of son").
+    spouse_of_patterns = {
+        "'s spouse", "'s wife", "'s husband", "'s partner",
+        "spouse of ", "wife of ", "husband of ", "partner of ",
+    }
 
     executors: list[dict] = []
     spouses: list[dict] = []
@@ -1716,8 +1806,9 @@ def rank_decision_makers(
     grandchildren: list[dict] = []
     others: list[dict] = []
 
-    # Named executor (may not be in survivors list)
-    if executor_name:
+    # Named executor (may not be in survivors list). Skip if the "executor"
+    # name is junk (role word OR matches the decedent — both have been seen).
+    if executor_name and _is_valid_dm_name(executor_name, decedent_name):
         status = statuses.get(executor_name, "unverified")
         executors.append({
             "name": executor_name,
@@ -1731,7 +1822,11 @@ def rank_decision_makers(
     for s in survivors:
         name = s.get("name", "").strip()
         rel = s.get("relationship", "").strip().lower()
-        if not name or name.lower() in seen_names:
+        # Reject junk names: role words leaked into the name field ("wife"),
+        # decedent's own name (self-DM bug), or empty / duplicate names.
+        if not _is_valid_dm_name(name, decedent_name):
+            continue
+        if name.lower() in seen_names:
             continue
         seen_names.add(name.lower())
 
@@ -2055,8 +2150,14 @@ def build_heir_map(
                 else:
                     error_info["heirs_unverified"] += 1
 
-    # Rank decision-makers with verified statuses
-    ranked = rank_decision_makers(survivors, executor, heir_statuses)
+    # Rank decision-makers with verified statuses. Pass the decedent name
+    # (from notice.decedent_name / tax_owner_name / owner_name, threaded in
+    # as `raw_name`) so the ranker filters role-word leaks AND the self-DM
+    # bug (extractor naming the decedent as their own survivor).
+    decedent_for_filter = parsed.get("full_name") or raw_name or ""
+    ranked = rank_decision_makers(
+        survivors, executor, heir_statuses, decedent_name=decedent_for_filter,
+    )
 
     # Set confidence
     living_dms = [r for r in ranked if r["status"] == "verified_living"]

@@ -778,7 +778,7 @@ def _run_csv_import(args) -> None:
     # DataSift upload (same logic as daily/historical mode)
     if getattr(args, "upload_datasift", False):
         from datasift_formatter import write_datasift_split_csvs
-        from datasift_uploader import upload_datasift_split, upload_to_datasift
+        from datasift_uploader import upload_to_datasift_per_distressor
 
         do_enrich = not getattr(args, "no_enrich", False)
         do_skip_trace = not getattr(args, "no_skip_trace", False)
@@ -787,22 +787,25 @@ def _run_csv_import(args) -> None:
         for info in csv_infos:
             logging.info("DataSift CSV (%s): %s", info["label"], info["path"])
 
-        if len(csv_infos) > 1:
-            upload_result = asyncio.run(
-                upload_datasift_split(
-                    csv_infos,
-                    enrich=do_enrich,
-                    skip_trace=do_skip_trace,
+        per_csv = []
+        for info in csv_infos:
+            r = asyncio.run(
+                upload_to_datasift_per_distressor(
+                    info["path"], enrich=do_enrich, skip_trace=do_skip_trace,
                 )
             )
-        else:
-            upload_result = asyncio.run(
-                upload_to_datasift(
-                    csv_infos[0]["path"],
-                    enrich=do_enrich,
-                    skip_trace=do_skip_trace,
-                )
-            )
+            r["label"] = info["label"]
+            per_csv.append(r)
+        all_ok = all(r.get("success") for r in per_csv)
+        upload_result = {
+            "success": all_ok,
+            "message": "; ".join(
+                f"{r['label']}: {r.get('message', '')}" for r in per_csv
+            ),
+            "csvs": per_csv,
+            "enrich_result": per_csv[0].get("enrich_result", {}) if per_csv else {},
+            "skip_trace_result": per_csv[0].get("skip_trace_result", {}) if per_csv else {},
+        }
 
         if upload_result.get("success"):
             logging.info("DataSift upload: %s", upload_result.get("message", "OK"))
@@ -991,6 +994,14 @@ def cli_main() -> None:
         help="Output separate CSV files per notice type",
     )
     parser.add_argument(
+        "--no-raw-csv",
+        action="store_true",
+        help="Skip the legacy raw `tn_notices_<ts>.csv` export. The DataSift "
+             "upload CSVs (datasift_upload_DMs_*.csv / _Heirs_*.csv) are "
+             "produced regardless. Use this flag for daily workflows where "
+             "you only need the DataSift uploads and want fewer output files.",
+    )
+    parser.add_argument(
         "--since",
         type=str,
         default=None,
@@ -1001,6 +1012,14 @@ def cli_main() -> None:
         type=int,
         default=0,
         help="Stop after scraping this many notices (0 = no limit)",
+    )
+    parser.add_argument(
+        "--tiers",
+        type=str,
+        default="1,2",
+        help="Comma-separated ZIP tiers to KEEP after enrichment "
+             "(default '1,2' — drop notices whose property ZIP isn't in our "
+             "Tier 1 or Tier 2 investor-target set). Use 'all' to disable.",
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -1689,6 +1708,38 @@ def _run_scrape_pipeline(args, searches) -> None:
         except Exception as e:
             logging.warning("Property lookup failed: %s -- continuing without lookups", e)
 
+    # ── Tier-ZIP filter ───────────────────────────────────────────
+    # Apply BEFORE the expensive run_full_pipeline (Zillow / Tracerfy / obit
+    # enrichment). At this point every notice that's going to have a ZIP
+    # already has one: foreclosure ZIPs come from the parsed notice text,
+    # probate ZIPs come from the property_lookup pass above. Records still
+    # missing a ZIP are off-target by definition for an investor-marketing
+    # workflow — we have no way to confirm they're in our target areas.
+    tiers_raw = getattr(args, "tiers", "1,2") or ""
+    if tiers_raw.lower() not in ("", "all"):
+        from target_zips import zip_tier
+        tier_set = {int(t) for t in tiers_raw.split(",") if t.strip().isdigit()}
+        if tier_set:
+            before = len(notices)
+            kept: list = []
+            dropped_off_tier = 0
+            dropped_no_zip = 0
+            for n in notices:
+                t = zip_tier(n.zip)
+                if t is None:
+                    dropped_no_zip += 1
+                    continue
+                if t not in tier_set:
+                    dropped_off_tier += 1
+                    continue
+                kept.append(n)
+            logging.info(
+                "Tier filter (--tiers %s): %d → %d "
+                "(dropped %d off-tier, %d no-ZIP)",
+                tiers_raw, before, len(kept), dropped_off_tier, dropped_no_zip,
+            )
+            notices = kept
+
     # ── Shared post-scrape pipeline ───────────────────────────────
     opts = PostScrapeOptions(
         skip_vacant_filter=getattr(args, "include_vacant", False),
@@ -1728,28 +1779,39 @@ def _run_scrape_pipeline(args, searches) -> None:
     if args.split:
         for p in write_csv_by_type(notices):
             logging.info("Output: %s", p)
-    else:
+    elif not getattr(args, "no_raw_csv", False):
         logging.info("Output: %s", write_csv(notices))
+    else:
+        logging.debug("Skipping raw tn_notices CSV (--no-raw-csv set)")
 
     # ── DataSift Playwright upload (CLI-only) ─────────────────────
     upload_result = None
     if getattr(args, "upload_datasift", False) and result.datasift_csv_infos:
-        from datasift_uploader import upload_to_datasift, upload_datasift_split
+        from datasift_uploader import upload_to_datasift_per_distressor
 
         do_enrich = not getattr(args, "no_enrich", False)
         do_skip_trace = not getattr(args, "no_skip_trace", False)
 
         csv_infos = result.datasift_csv_infos
-        if len(csv_infos) > 1:
-            upload_result = asyncio.run(
-                upload_datasift_split(csv_infos, enrich=do_enrich, skip_trace=do_skip_trace)
-            )
-        else:
-            upload_result = asyncio.run(
-                upload_to_datasift(
-                    csv_infos[0]["path"], enrich=do_enrich, skip_trace=do_skip_trace,
+        per_csv = []
+        for info in csv_infos:
+            r = asyncio.run(
+                upload_to_datasift_per_distressor(
+                    info["path"], enrich=do_enrich, skip_trace=do_skip_trace,
                 )
             )
+            r["label"] = info["label"]
+            per_csv.append(r)
+        all_ok = all(r.get("success") for r in per_csv)
+        upload_result = {
+            "success": all_ok,
+            "message": "; ".join(
+                f"{r['label']}: {r.get('message', '')}" for r in per_csv
+            ),
+            "csvs": per_csv,
+            "enrich_result": per_csv[0].get("enrich_result", {}) if per_csv else {},
+            "skip_trace_result": per_csv[0].get("skip_trace_result", {}) if per_csv else {},
+        }
 
         if upload_result.get("success"):
             logging.info("DataSift upload: %s", upload_result.get("message", "OK"))
