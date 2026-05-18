@@ -83,14 +83,19 @@ jobs:
           echo "ts=$(date +%Y%m%d_%H%M%S)" >> $GITHUB_OUTPUT
 
       # ── Pipeline 1: main.py daily (foreclosure + probate via APN) ──
+      # --since yesterday explicitly bounds the scrape window so a stale
+      # or missing last_run.json can't trigger a runaway scrape that
+      # blows past the job timeout (the first cloud run hit the 3hr cap
+      # at 3h 0m 15s because the runner started with empty seen_ids).
       # Output teed to logs/daily_main_<ts>.log so daily_finalize.py can
-      # parse it for funnel numbers (scraped, tier filter, Smarty, Tracerfy,
-      # Trestle, obit phase A, DM/Heir CSV counts). No --upload-datasift
-      # and no --notify-slack — the finalizer owns both at the end.
+      # parse it for funnel numbers.
       - name: Run main.py daily (foreclosure + probate)
         continue-on-error: true
         run: |
+          SINCE_DATE=$(date -d 'yesterday' '+%Y-%m-%d')
+          echo "Using --since ${SINCE_DATE}"
           python src/main.py daily \
+            --since "${SINCE_DATE}" \
             --counties Jefferson,Madison,Marshall \
             --types foreclosure,probate \
             --tiers 1,2 \
@@ -140,7 +145,7 @@ jobs:
 
       # ── Persistence + observability ──
 
-      - name: Archive output CSVs + logs as artifact
+      - name: Archive output CSVs + logs + state as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -149,17 +154,25 @@ jobs:
             output/datasift_upload*.csv
             output/tn_notices*.csv
             logs/*.log
+            seen_ids.json
+            last_run.json
           retention-days: 30
 
+      # Even on cancellation / partial failure, push the current seen_ids
+      # state back so we don't re-pay the cold-start cost on the next run.
+      # Uses `git add -f` because both files are gitignored locally — the
+      # bot still needs to track them on main for cross-run continuity.
       - name: Commit seen_ids.json + last_run.json back to repo
-        if: success()
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add seen_ids.json last_run.json 2>/dev/null || true
+          git add -f seen_ids.json last_run.json 2>/dev/null || true
           if ! git diff --cached --quiet; then
             git commit -m "chore(bot): update seen_ids + last_run after daily sweep"
-            git push
+            # Rebase-pull in case another commit landed during the run
+            git pull --rebase origin main || true
+            git push origin HEAD:main
           else
             echo "No changes to seen_ids/last_run — skipping commit"
           fi
