@@ -1,0 +1,172 @@
+name: SiftStack Daily Sweep
+
+# 11:00 UTC fires at 6 AM EDT (Mar-Nov) / 7 AM EST (Nov-Mar). One-hour drift
+# during EST is intentional — running two crons with `if:` guards is more
+# fragile than tolerating a 1-hour winter shift. Manual workflow_dispatch
+# lets you trigger ad-hoc runs from the GitHub Actions UI.
+on:
+  schedule:
+    - cron: '0 11 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write  # required so the job can commit seen_ids.json back
+
+jobs:
+  daily-sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180  # 3 pipelines + uploads; cap at 3hr for safety
+
+    # bash with -e (exit on error) and pipefail so that `cmd | tee` doesn't
+    # mask non-zero exits from the python pipeline. With continue-on-error
+    # on each pipeline step, a failure surfaces in the step status but
+    # subsequent pipelines still run.
+    defaults:
+      run:
+        shell: bash -eo pipefail {0}
+
+    env:
+      # ── Data acquisition + parsing ─────────────
+      APNA_EMAIL: ${{ secrets.APNA_EMAIL }}
+      APNA_PASSWORD: ${{ secrets.APNA_PASSWORD }}
+      CAPTCHA_API_KEY: ${{ secrets.CAPTCHA_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      # ── Enrichment APIs ─────────────────────────
+      SMARTY_AUTH_ID: ${{ secrets.SMARTY_AUTH_ID }}
+      SMARTY_AUTH_TOKEN: ${{ secrets.SMARTY_AUTH_TOKEN }}
+      OPENWEBNINJA_API_KEY: ${{ secrets.OPENWEBNINJA_API_KEY }}
+      FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
+      SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+
+      # ── Skip-trace + phone validation ──────────
+      TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
+      TRESTLE_API_KEY: ${{ secrets.TRESTLE_API_KEY }}
+
+      # ── CRM upload + notifications ─────────────
+      DATASIFT_EMAIL: ${{ secrets.DATASIFT_EMAIL }}
+      DATASIFT_PASSWORD: ${{ secrets.DATASIFT_PASSWORD }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      # ── LLM backend ─────────────────────────────
+      LLM_BACKEND: anthropic
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0  # full history so seen_ids commit-back doesn't conflict
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: playwright install chromium --with-deps
+
+      # Marker that daily_finalize.py uses to find CSVs created during this
+      # run + run-id shared across all pipeline-log filenames so the
+      # finalizer can pair them up.
+      - name: Mark run-start
+        id: run_start
+        run: |
+          mkdir -p output logs
+          touch output/.finalize_start
+          echo "ts=$(date +%Y%m%d_%H%M%S)" >> $GITHUB_OUTPUT
+
+      # ── Pipeline 1: main.py daily (foreclosure + probate via APN) ──
+      # Output teed to logs/daily_main_<ts>.log so daily_finalize.py can
+      # parse it for funnel numbers (scraped, tier filter, Smarty, Tracerfy,
+      # Trestle, obit phase A, DM/Heir CSV counts). No --upload-datasift
+      # and no --notify-slack — the finalizer owns both at the end.
+      - name: Run main.py daily (foreclosure + probate)
+        continue-on-error: true
+        run: |
+          python src/main.py daily \
+            --counties Jefferson,Madison,Marshall \
+            --types foreclosure,probate \
+            --tiers 1,2 \
+            --no-raw-csv \
+            -v 2>&1 | tee logs/daily_main_${{ steps.run_start.outputs.ts }}.log
+
+      # ── Pipeline 2: apn_probate (probate-dedicated post-probate path) ──
+      # Runs AFTER main.py because both write seen_ids.json — main.py adds
+      # today's IDs, apn_probate then skips them. Inverted order would
+      # cause duplicate detail-page CAPTCHA solves.
+      - name: Run apn_probate
+        continue-on-error: true
+        run: |
+          python src/apn_probate_pipeline_al.py \
+            --counties Jefferson,Madison,Marshall \
+            --days-back 2 \
+            --tiers 1,2 \
+            --max-notices 100 \
+            --datasift-csv \
+            --skip-trace \
+            -v 2>&1 | tee logs/daily_apn_${{ steps.run_start.outputs.ts }}.log
+
+      # ── Pipeline 3: pre_probate (legacy.com obit harvest) ──
+      # Independent of seen_ids.json (different data source — Firecrawl-rendered
+      # obituary listings). Can run last without ordering concerns.
+      - name: Run pre_probate
+        continue-on-error: true
+        run: |
+          python src/pre_probate_pipeline_al.py \
+            --markets Birmingham,Huntsville,Marshall \
+            --limit 50 \
+            --pages 2 \
+            --tiers 1,2 \
+            --datasift-csv \
+            --skip-trace \
+            -v 2>&1 | tee logs/daily_pre_${{ steps.run_start.outputs.ts }}.log
+
+      # ── Consolidated upload + single Slack post ──
+      # daily_finalize.py:
+      #   (1) parses each daily_<pipeline>_<ts>.log for funnel numbers
+      #   (2) globs every datasift_upload*.csv newer than .finalize_start
+      #   (3) routes each via upload_to_datasift_per_distressor
+      #   (4) posts ONE consolidated Slack with funnel blocks + upload results
+      # Exits non-zero if any upload fails so the job surfaces it.
+      - name: Upload to DataSift + post Slack
+        run: python scripts/daily_finalize.py
+
+      # ── Persistence + observability ──
+
+      - name: Archive output CSVs + logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: siftstack-output-${{ github.run_id }}
+          path: |
+            output/datasift_upload*.csv
+            output/tn_notices*.csv
+            logs/*.log
+          retention-days: 30
+
+      - name: Commit seen_ids.json + last_run.json back to repo
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add seen_ids.json last_run.json 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(bot): update seen_ids + last_run after daily sweep"
+            git push
+          else
+            echo "No changes to seen_ids/last_run — skipping commit"
+          fi
+
+      - name: Notify Slack on workflow failure
+        if: failure()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\":rotating_light: *SiftStack daily sweep FAILED* — workflow run <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|#${{ github.run_id }}>. Check logs in the Actions tab.\"}" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
