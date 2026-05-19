@@ -145,7 +145,7 @@ jobs:
 
       # ── Persistence + observability ──
 
-      - name: Archive output CSVs + logs + state as artifact
+      - name: Archive output CSVs + logs + state + DataSift screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -156,6 +156,7 @@ jobs:
             logs/*.log
             seen_ids.json
             last_run.json
+            datasift_*.png
           retention-days: 30
 
       # Even on cancellation / partial failure, push the current seen_ids
