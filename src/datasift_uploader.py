@@ -346,6 +346,12 @@ async def upload_csv(
     await _click_next_step(page, timeout=30000)
 
     # ── Wizard Step 2: Add tags ──
+    # Dismiss the Beamer/NPS modal that lazy-loads after login. This was the
+    # root cause of CI failures: the modal overlay intercepts pointer events,
+    # making the wizard's tag/file inputs appear "missing" because they're
+    # behind it. Local sessions warm cookies so the modal doesn't fire; CI
+    # gets it every time.
+    await _dismiss_popups(page)
     logger.info("Wizard Step 2: Adding 'Courthouse Data' tag...")
     await page.wait_for_timeout(1000)
     await _screenshot(page, "step2_tags")
@@ -416,6 +422,9 @@ async def upload_csv(
     await _click_next_step(page)
 
     # ── Wizard Step 3: Upload the file ──
+    # Re-dismiss popups before the file-input step — the Beamer modal can
+    # re-appear between wizard steps as the SPA navigates internally.
+    await _dismiss_popups(page)
     logger.info("Wizard Step 3: Uploading CSV file: %s", csv_path.name)
     await page.wait_for_timeout(3000)
     await _screenshot(page, "step3_before_upload")
@@ -448,6 +457,7 @@ async def upload_csv(
     await _click_next_step(page)
 
     # ── Wizard Step 4: Map the columns ──
+    await _dismiss_popups(page)
     logger.info("Wizard Step 4: Column mapping — mapping Tags and Lists...")
     await page.wait_for_timeout(3000)
     await _screenshot(page, "step4_column_mapping")
@@ -513,6 +523,7 @@ async def upload_csv(
     await _screenshot(page, "step4_mapping_done")
 
     # ── Wizard Step 5: Review ──
+    await _dismiss_popups(page)
     logger.info("Wizard Step 5: Review and finish upload...")
     await page.wait_for_timeout(2000)
     await _screenshot(page, "step5_review")
