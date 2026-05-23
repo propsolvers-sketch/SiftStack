@@ -1,0 +1,10 @@
+docs:
+  - path: CLAUDE.md
+    type: DOC
+    precedence: 0
+  - path: README.md
+    type: DOC
+    precedence: 1
+  - path: docs/foia/huntsville_code_enforcement_request.md
+    type: DOC
+    precedence: 2
