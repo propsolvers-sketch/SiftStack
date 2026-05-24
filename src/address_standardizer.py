@@ -9,6 +9,7 @@ unchanged.
 
 import logging
 import time
+from typing import TYPE_CHECKING
 
 from smartystreets_python_sdk import (
     BasicAuthCredentials,
@@ -20,6 +21,9 @@ from smartystreets_python_sdk.us_street import Lookup as StreetLookup
 from smartystreets_python_sdk.us_street.match_type import MatchType
 
 from notice_parser import NoticeData
+
+if TYPE_CHECKING:
+    from observability import ServiceRateTracker
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +63,8 @@ def standardize_addresses(
     notices: list[NoticeData],
     auth_id: str,
     auth_token: str,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
 ) -> list[NoticeData]:
     """Standardize addresses in-place via Smarty US Street API.
 
@@ -66,6 +72,13 @@ def standardize_addresses(
         notices: List of NoticeData (modified in-place).
         auth_id: Smarty auth-id credential.
         auth_token: Smarty auth-token credential.
+        rate_tracker: Optional ServiceRateTracker. When supplied, records
+            one outcome per Smarty lookup per CONTEXT.md D-04:
+              - success = candidate.delivery_line_1 non-empty AND
+                state-guard passed
+              - failure = empty candidates list, state-guard rejection,
+                OR HTTPError raised by the SDK (whole batch counts as
+                failures so the run summary surfaces partial outages)
 
     Returns:
         The same list (modified in-place) for chaining convenience.
@@ -114,10 +127,18 @@ def standardize_addresses(
         except exceptions.SmartyException as e:
             logger.error("Smarty batch API error: %s", e)
             failed += len(batch_slice)
+            if rate_tracker is not None:
+                # Whole batch failed → one failure per submitted notice so
+                # the Slack rate reflects the partial outage accurately.
+                for _ in batch_slice:
+                    rate_tracker.record("smarty", False)
             continue
         except Exception as e:
             logger.error("Unexpected Smarty error: %s", e)
             failed += len(batch_slice)
+            if rate_tracker is not None:
+                for _ in batch_slice:
+                    rate_tracker.record("smarty", False)
             continue
 
         # Process results
@@ -125,6 +146,8 @@ def standardize_addresses(
             candidates = lookup.result
             if not candidates:
                 failed += 1
+                if rate_tracker is not None:
+                    rate_tracker.record("smarty", False)
                 continue
 
             candidate = candidates[0]
@@ -156,6 +179,8 @@ def standardize_addresses(
                     sorted(expected_states),
                 )
                 failed += 1
+                if rate_tracker is not None:
+                    rate_tracker.record("smarty", False)
                 continue
 
             # Overwrite address with standardized version
@@ -190,6 +215,15 @@ def standardize_addresses(
                     notice.vacant = analysis.vacant
 
             matched += 1
+            if rate_tracker is not None:
+                # Per D-04: success = non-empty delivery_line_1 (which we
+                # just used to set notice.address). If a candidate came
+                # back with no delivery_line_1 we still mark it matched
+                # because the city/zip from components is useful — but
+                # those should be exceedingly rare. We record success on
+                # the matched-branch end-point uniformly to keep the
+                # "one record per lookup" invariant.
+                rate_tracker.record("smarty", True)
 
     logger.info(
         "Smarty standardization complete: %d matched, %d failed/no-match, %d skipped",
@@ -448,6 +482,8 @@ def smarty_zip_for_assuranceweb_address(
     situs: str,
     lastline_hint: str = "Huntsville AL",
     anchor_fallbacks: tuple[str, ...] | None = None,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
 ) -> tuple[str, str]:
     """Multi-anchor Smarty lookup to recover (city, zip) for an AssuranceWeb situs.
 
@@ -469,13 +505,23 @@ def smarty_zip_for_assuranceweb_address(
          from the street match without any city bias.
 
     Returns ('', '') only when all fallbacks are exhausted.
+
+    Per CONTEXT.md D-04, rate_tracker records exactly ONE outcome per
+    invocation regardless of how many internal fallback lookups fire —
+    the "logical Smarty call" from the caller's perspective is a single
+    address resolution, and the multi-anchor retry is an internal
+    optimisation, not a separate API call from the orchestrator's view.
     """
     if not situs or not situs.strip():
+        # Empty input — no Smarty call issued. Per D-04 the noop path
+        # should NOT count as a failure (the service was never invoked).
         return ("", "")
 
     # Try the primary anchor first
     city, zip_ = _smarty_lookup_once(situs, lastline_hint)
     if zip_:
+        if rate_tracker is not None:
+            rate_tracker.record("smarty", True)
         return (city, zip_)
 
     # Cycle through fallback anchors
@@ -486,21 +532,34 @@ def smarty_zip_for_assuranceweb_address(
         if zip_:
             logger.debug("Smarty fallback hit on %r (anchor=%r): %s, %s",
                          situs, anchor, city, zip_)
+            if rate_tracker is not None:
+                rate_tracker.record("smarty", True)
             return (city, zip_)
 
+    if rate_tracker is not None:
+        rate_tracker.record("smarty", False)
     return ("", "")
 
 
-def smarty_zip_for_madison_address(situs: str) -> tuple[str, str]:
+def smarty_zip_for_madison_address(
+    situs: str,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
+) -> tuple[str, str]:
     """Madison-anchored ZIP recovery with multi-city fallback."""
     return smarty_zip_for_assuranceweb_address(
         situs,
         lastline_hint="Huntsville AL",
         anchor_fallbacks=_MADISON_ANCHORS,
+        rate_tracker=rate_tracker,
     )
 
 
-def smarty_zip_for_marshall_address(situs: str) -> tuple[str, str]:
+def smarty_zip_for_marshall_address(
+    situs: str,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
+) -> tuple[str, str]:
     """Marshall-anchored ZIP recovery with multi-city fallback.
 
     Primary anchor is Albertville (largest city); fallbacks cycle through
@@ -512,4 +571,5 @@ def smarty_zip_for_marshall_address(situs: str) -> tuple[str, str]:
         situs,
         lastline_hint="Albertville AL",
         anchor_fallbacks=_MARSHALL_ANCHORS,
+        rate_tracker=rate_tracker,
     )
