@@ -524,3 +524,160 @@ def test_llm_noop_when_rate_tracker_is_none(monkeypatch):
     )
     assert result_explicit == {"x": 1}
     assert tracker.totals()["llm"] == {"success": 0, "total": 0}
+
+
+# ── Tracerfy ───────────────────────────────────────────────────────────
+
+
+def _build_tracerfy_notice(name: str = "JOHN DOE",
+                           address: str = "100 OAK ST",
+                           city: str = "BIRMINGHAM",
+                           zip_: str = "35215") -> "NoticeData":  # noqa: F821
+    """Build a minimal NoticeData that passes through Tracerfy contact extraction."""
+    from notice_parser import NoticeData
+    return NoticeData(
+        owner_name=name,
+        owner_deceased="no",  # living-owner path = 1 contact per notice
+        address=address,
+        city=city,
+        state="AL",
+        zip=zip_,
+    )
+
+
+def _patch_tracerfy_post(monkeypatch, *, queue_response: dict | None = None,
+                          poll_records: list | None = None,
+                          poll_status: str = "completed",
+                          raise_exc: Exception | None = None,
+                          post_status_code: int = 200):
+    """Patch requests.post / requests.get used by tracerfy_skip_tracer."""
+    import tracerfy_skip_tracer as t
+
+    # Force a fake API key so the "not configured" early return doesn't fire
+    monkeypatch.setattr(t.cfg, "TRACERFY_API_KEY", "fake-key", raising=False)
+
+    def fake_post(url, **kwargs):
+        if raise_exc is not None:
+            raise raise_exc
+        resp = MagicMock()
+        resp.status_code = post_status_code
+        resp.text = ""
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value=queue_response or {
+            "queue_id": "Q1", "estimated_wait_seconds": 0,
+        })
+        return resp
+
+    def fake_get(url, **kwargs):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.raise_for_status = MagicMock()
+        if poll_status == "completed":
+            resp.json = MagicMock(return_value={
+                "status": "completed", "records": poll_records or [],
+            })
+        else:
+            resp.json = MagicMock(return_value={"status": poll_status})
+        return resp
+
+    monkeypatch.setattr(t.requests, "post", fake_post)
+    monkeypatch.setattr(t.requests, "get", fake_get)
+    # Speed up polling — make sleep a no-op
+    monkeypatch.setattr(t.time, "sleep", lambda s: None)
+
+
+def test_tracerfy_records_matched_as_successes_and_unmatched_as_failures(monkeypatch):
+    """5 matched out of 12 submitted → 5 successes + 7 failures."""
+    import tracerfy_skip_tracer as t
+
+    notices = [
+        _build_tracerfy_notice(name=f"PERSON{i} TEST", address=f"{i} MAIN ST")
+        for i in range(12)
+    ]
+
+    # Build response records: 5 with phone data (matched), 7 with neither
+    records = []
+    for i in range(5):
+        records.append({
+            "first_name": f"PERSON{i}", "last_name": "TEST",
+            "primary_phone": f"205-555-000{i}",
+        })
+    for i in range(5, 12):
+        # Returned in payload but no phones/emails → not counted as matched
+        # by _match_results (which only counts when phones OR emails present).
+        # Better: just leave them out of the response entirely so the
+        # match loop skips them. Either way the batch-granularity record
+        # call sees matched=5 vs submitted=12.
+        pass
+
+    _patch_tracerfy_post(monkeypatch, poll_records=records)
+
+    tracker = ServiceRateTracker()
+    stats = t.batch_skip_trace(notices, lookup_heir_addresses=False,
+                                rate_tracker=tracker)
+
+    assert stats["submitted"] == 12
+    assert stats["matched"] == 5
+    assert tracker.totals()["tracerfy"] == {"success": 5, "total": 12}
+
+
+def test_tracerfy_records_all_failures_on_http_error(monkeypatch):
+    """requests.post raises → record submitted-many failures."""
+    import tracerfy_skip_tracer as t
+
+    notices = [
+        _build_tracerfy_notice(name=f"P{i} T", address=f"{i} S")
+        for i in range(8)
+    ]
+
+    _patch_tracerfy_post(
+        monkeypatch, raise_exc=RuntimeError("simulated 500"),
+    )
+
+    tracker = ServiceRateTracker()
+    stats = t.batch_skip_trace(notices, lookup_heir_addresses=False,
+                                rate_tracker=tracker)
+
+    # batch_skip_trace catches the exception, returns stats with submitted=8 set.
+    # All 8 must be recorded as failures.
+    assert stats["submitted"] == 8
+    assert tracker.totals()["tracerfy"] == {"success": 0, "total": 8}
+
+
+def test_tracerfy_zero_submitted_records_nothing(monkeypatch):
+    """Empty notice list → submitted=0 → no record() calls at all."""
+    import tracerfy_skip_tracer as t
+
+    _patch_tracerfy_post(monkeypatch, poll_records=[])
+
+    tracker = ServiceRateTracker()
+    stats = t.batch_skip_trace([], lookup_heir_addresses=False,
+                                rate_tracker=tracker)
+
+    assert stats["submitted"] == 0
+    assert tracker.totals()["tracerfy"] == {"success": 0, "total": 0}
+
+
+def test_tracerfy_noop_when_rate_tracker_is_none(monkeypatch):
+    """rate_tracker=None → no exception, no record() emitted."""
+    import tracerfy_skip_tracer as t
+
+    notices = [_build_tracerfy_notice()]
+    _patch_tracerfy_post(monkeypatch, poll_records=[{
+        "first_name": "JOHN", "last_name": "DOE",
+        "primary_phone": "205-555-1234",
+    }])
+
+    # No kwarg
+    stats_legacy = t.batch_skip_trace(notices, lookup_heir_addresses=False)
+    assert stats_legacy["submitted"] >= 0
+
+    # Reset notice state
+    for n in notices:
+        n.primary_phone = ""
+
+    # Explicit None
+    tracker = ServiceRateTracker()
+    t.batch_skip_trace(notices, lookup_heir_addresses=False,
+                        rate_tracker=None)
+    assert tracker.totals()["tracerfy"] == {"success": 0, "total": 0}
