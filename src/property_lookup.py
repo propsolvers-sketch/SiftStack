@@ -403,11 +403,11 @@ async def lookup_decedent_properties(notices: list) -> None:
         )
 
         try:
-            if notice.county.lower() in ("jefferson", "madison"):
+            if notice.county.lower() in ("jefferson", "madison", "marshall"):
                 # AL counties — delegate to the multi-parcel locator. It runs
                 # the decedent-name → PR-name waterfall against the county
-                # tax roll (Jefferson E-Ring or Madison AssuranceWeb) and
-                # writes address/city/state/zip/parcel_id/tax_owner_name/
+                # tax roll (Jefferson E-Ring or Madison/Marshall AssuranceWeb)
+                # and writes address/city/state/zip/parcel_id/tax_owner_name/
                 # is_homestead/secondary_addresses/total_estate_value/
                 # assessed_value/property_use directly onto the notice.
                 from probate_property_locator import enrich_notice_with_property
@@ -418,6 +418,36 @@ async def lookup_decedent_properties(notices: list) -> None:
                         notice.address, notice.parcel_id or "?",
                     )
                     found += 1
+
+                    # Madison + Marshall AssuranceWeb name-search responses return
+                    # only the street — city/zip aren't in the bulk payload. Without
+                    # this, downstream tier filtering drops the notice. Same fix the
+                    # apn_probate_pipeline_al + pre_probate_pipeline_al pipelines use.
+                    county_lc = notice.county.lower()
+                    if county_lc in ("madison", "marshall") and notice.address and not notice.zip:
+                        from address_standardizer import (
+                            smarty_zip_for_madison_address,
+                            smarty_zip_for_marshall_address,
+                        )
+                        helper = (
+                            smarty_zip_for_marshall_address
+                            if county_lc == "marshall"
+                            else smarty_zip_for_madison_address
+                        )
+                        city, zip_code = helper(notice.address)
+                        if zip_code:
+                            notice.zip = zip_code
+                            if not notice.city and city:
+                                notice.city = city
+                            logger.info(
+                                "  Smarty filled %s ZIP: %s -> %s, %s",
+                                notice.county, notice.address, city, zip_code,
+                            )
+                        else:
+                            logger.info(
+                                "  Smarty could not resolve ZIP for %s %s (kept address, no zip)",
+                                notice.county, notice.address,
+                            )
                 else:
                     logger.info("  No properties found for %s", search_name)
                     failed += 1
