@@ -50,8 +50,10 @@ from notice_parser import NoticeData
 from pre_probate_pipeline_al import (
     _normalize_decedent_key,
     _promote_heir_contacts_to_csv_slots,
-    _smarty_zip_for_madison_address,
-    _smarty_zip_for_marshall_address,
+)
+from address_standardizer import (
+    smarty_zip_for_madison_address,
+    smarty_zip_for_marshall_address,
 )
 from probate_property_locator import enrich_notice_with_property
 from scraper import scrape_all
@@ -213,9 +215,9 @@ async def run_pipeline(
         county_lc = n.county.lower()
         if not n.zip and n.address and county_lc in {"madison", "marshall"}:
             if county_lc == "marshall":
-                city, zip_code = _smarty_zip_for_marshall_address(n.address)
+                city, zip_code = smarty_zip_for_marshall_address(n.address)
             else:
-                city, zip_code = _smarty_zip_for_madison_address(n.address)
+                city, zip_code = smarty_zip_for_madison_address(n.address)
             if zip_code:
                 n.zip = zip_code
                 if not n.city and city:
