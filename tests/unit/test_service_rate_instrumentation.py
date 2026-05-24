@@ -344,3 +344,183 @@ def test_smarty_noop_when_rate_tracker_is_none(monkeypatch):
         notices, "auth-id", "auth-token", rate_tracker=None,
     )
     assert tracker.totals()["smarty"] == {"success": 0, "total": 0}
+
+
+# ── LLM ────────────────────────────────────────────────────────────────
+
+
+class _FakeAnthropicMessage:
+    """Stand-in for anthropic SDK's response.content[0].text shape."""
+    def __init__(self, text: str):
+        self.text = text
+
+
+class _FakeAnthropicResponse:
+    def __init__(self, text: str):
+        self.content = [_FakeAnthropicMessage(text)]
+
+
+def _patch_anthropic_sync(monkeypatch, *, return_text: str | None = None,
+                          raise_exc: Exception | None = None):
+    """Patch anthropic.Anthropic so chat_json doesn't issue real HTTP."""
+    import anthropic
+
+    class _FakeClient:
+        def __init__(self, api_key=None):
+            self.messages = self
+
+        def create(self, **kwargs):
+            if raise_exc is not None:
+                raise raise_exc
+            return _FakeAnthropicResponse(return_text or "")
+
+    monkeypatch.setattr(anthropic, "Anthropic", _FakeClient)
+
+
+def test_llm_records_success_when_required_keys_present(monkeypatch):
+    """JSON parses + all required_keys present → record success."""
+    import llm_client
+
+    _patch_anthropic_sync(
+        monkeypatch,
+        return_text='{"decedent_full_name": "Jane Doe", "is_obituary": true}',
+    )
+
+    tracker = ServiceRateTracker()
+    result = llm_client.chat_json(
+        prompt="...", api_key="fake",
+        rate_tracker=tracker,
+        required_keys=("decedent_full_name", "is_obituary"),
+    )
+
+    assert result == {"decedent_full_name": "Jane Doe", "is_obituary": True}
+    assert tracker.totals()["llm"] == {"success": 1, "total": 1}
+
+
+def test_llm_records_failure_when_required_keys_missing(monkeypatch):
+    """JSON parses but a required key is missing → record failure, return None."""
+    import llm_client
+
+    _patch_anthropic_sync(
+        monkeypatch,
+        return_text='{"some_other_key": "value"}',
+    )
+
+    tracker = ServiceRateTracker()
+    result = llm_client.chat_json(
+        prompt="...", api_key="fake",
+        rate_tracker=tracker,
+        required_keys=("decedent_full_name",),
+    )
+
+    assert result is None
+    assert tracker.totals()["llm"] == {"success": 0, "total": 1}
+
+
+def test_llm_records_failure_on_json_parse_error(monkeypatch):
+    """Response isn't valid JSON → record failure, return None."""
+    import llm_client
+
+    _patch_anthropic_sync(
+        monkeypatch,
+        return_text="this is not JSON at all, no braces",
+    )
+
+    tracker = ServiceRateTracker()
+    result = llm_client.chat_json(
+        prompt="...", api_key="fake", rate_tracker=tracker,
+    )
+
+    assert result is None
+    assert tracker.totals()["llm"] == {"success": 0, "total": 1}
+
+
+def test_llm_records_failure_on_http_error(monkeypatch):
+    """SDK raises → record failure, return None."""
+    import llm_client
+
+    _patch_anthropic_sync(
+        monkeypatch, raise_exc=RuntimeError("simulated 500"),
+    )
+
+    tracker = ServiceRateTracker()
+    result = llm_client.chat_json(
+        prompt="...", api_key="fake", rate_tracker=tracker,
+    )
+
+    assert result is None
+    assert tracker.totals()["llm"] == {"success": 0, "total": 1}
+
+
+def test_llm_extract_with_llm_uses_probate_required_keys(monkeypatch):
+    """extract_with_llm(notice_type='probate') passes _PROBATE_KEYS sorted-tuple."""
+    import llm_parser
+
+    captured: dict = {}
+
+    async def fake_chat_json_async(prompt, system="", max_tokens=1024, api_key=None,
+                                    rate_tracker=None, required_keys=None):
+        captured["required_keys"] = required_keys
+        captured["rate_tracker"] = rate_tracker
+        # Return a fully-populated probate payload so extract_with_llm
+        # doesn't reject it (downstream isn't under test here).
+        return {
+            k: "" for k in llm_parser._PROBATE_KEYS
+        } | {
+            "decedent_name": "JANE DOE",
+            "owner_name": "JOHN DOE",
+            "owner_street": "",
+            "owner_city": "",
+            "owner_state": "AL",
+            "owner_zip": "",
+            "address": "",
+            "city": "",
+            "state": "AL",
+            "zip": "",
+            "case_number": "PC2026-001",
+            "judge_name": "Smith",
+            "granted_date": "2026-01-01",
+        }
+
+    monkeypatch.setattr(llm_parser.llm_client, "chat_json_async", fake_chat_json_async)
+
+    tracker = ServiceRateTracker()
+    asyncio.run(llm_parser.extract_with_llm(
+        raw_text="some probate notice text",
+        notice_type="probate",
+        county="Jefferson",
+        api_key="fake",
+        rate_tracker=tracker,
+    ))
+
+    rk = captured.get("required_keys")
+    assert rk is not None, "required_keys must be passed to chat_json_async"
+    assert isinstance(rk, tuple), f"required_keys must be a tuple (got {type(rk).__name__})"
+    # Probate keys must include the structural anchors and EXCLUDE attorney_name
+    assert "decedent_name" in rk
+    assert "case_number" in rk
+    assert "attorney_name" not in rk, "attorney_name is intentionally optional"
+    # tracker plumbed through
+    assert captured["rate_tracker"] is tracker
+
+
+def test_llm_noop_when_rate_tracker_is_none(monkeypatch):
+    """rate_tracker=None on chat_json → no exception, behavior unchanged."""
+    import llm_client
+
+    _patch_anthropic_sync(
+        monkeypatch,
+        return_text='{"x": 1}',
+    )
+
+    # No rate_tracker kwarg at all
+    result_legacy = llm_client.chat_json(prompt="...", api_key="fake")
+    assert result_legacy == {"x": 1}
+
+    # Explicit None — tracker untouched
+    tracker = ServiceRateTracker()
+    result_explicit = llm_client.chat_json(
+        prompt="...", api_key="fake", rate_tracker=None,
+    )
+    assert result_explicit == {"x": 1}
+    assert tracker.totals()["llm"] == {"success": 0, "total": 0}
