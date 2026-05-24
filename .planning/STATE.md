@@ -10,9 +10,9 @@ See: .planning/PROJECT.md (updated 2026-05-23)
 ## Current Position
 
 Phase: 2 of 5 (Funnel Transparency)
-Plan: 0 of 5 in current phase
-Status: Planned + verified (ready to execute)
-Last activity: 2026-05-24 — Phase 2 planned: 5 plans, 3 waves after one revision round. Wave 1 = 02-01 (observability foundation: FunnelCounter + ServiceRateTracker + Slack block builders). Wave 2 = 02-02 (4 per-service instrumentation tasks). Wave 3 (parallel) = 02-03 (slack helper + apn_probate + pre_probate), 02-04 (main.py + full_pipeline + enrichment + benchmark), 02-05 (tax_distress + code_violation). Honors locked decisions D-01..D-04 from 02-CONTEXT.md.
+Plan: 1 of 5 in current phase (Wave 1 ✅)
+Status: Wave 1 done — ready to execute Wave 2 (`02-02`: instrument 4 services)
+Last activity: 2026-05-24 — Phase 2 Wave 1 complete: plan 02-01 shipped via 4 TDD commits (RED→GREEN pairs). `src/observability.py` (344 lines, 7 public symbols: FunnelCounter, ServiceRateTracker, load_rolling_rates, save_rolling_rates, rolling_rates_summary, ROLLING_RATES_PATH, ROLLING_DAYS_WINDOW). Slack helpers appended to `src/slack_notifier.py` (existing functions byte-identical). 38 tests pass in 0.13s. Downstream waves can now import the foundation.
 
 Phase 1 closeout summary: 4 plans, 35 tests pass + 1 documented skip, verification status: passed (5/5 success criteria), zero production source modified — fixes were already in place.
 
