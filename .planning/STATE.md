@@ -10,9 +10,9 @@ See: .planning/PROJECT.md (updated 2026-05-23)
 ## Current Position
 
 Phase: 2 of 5 (Funnel Transparency)
-Plan: 1 of 5 in current phase (Wave 1 ✅)
-Status: Wave 1 done — ready to execute Wave 2 (`02-02`: instrument 4 services)
-Last activity: 2026-05-24 — Phase 2 Wave 1 complete: plan 02-01 shipped via 4 TDD commits (RED→GREEN pairs). `src/observability.py` (344 lines, 7 public symbols: FunnelCounter, ServiceRateTracker, load_rolling_rates, save_rolling_rates, rolling_rates_summary, ROLLING_RATES_PATH, ROLLING_DAYS_WINDOW). Slack helpers appended to `src/slack_notifier.py` (existing functions byte-identical). 38 tests pass in 0.13s. Downstream waves can now import the foundation.
+Plan: 2 of 5 in current phase (Wave 1 + Wave 2 ✅)
+Status: Wave 2 done — ready to execute Wave 3 (parallel: 02-03, 02-04, 02-05)
+Last activity: 2026-05-24 — Phase 2 Wave 2 complete: plan 02-02 shipped via 8 TDD commits (4 RED → 4 GREEN pairs). 4 services instrumented additively via `rate_tracker: ServiceRateTracker | None = None` kwarg on each entry point — 2Captcha (captcha_solver), Smarty (address_standardizer + Madison/Marshall wrappers), LLM (llm_client + llm_parser, per-prompt required_keys), Tracerfy (tracerfy_skip_tracer batch). All failure semantics match CONTEXT.md D-04 verbatim. 91 tests pass (+18 new instrumentation tests), 1 documented skip. Bonus: stale TN → AL docstring fix in captcha_solver.py.
 
 Phase 1 closeout summary: 4 plans, 35 tests pass + 1 documented skip, verification status: passed (5/5 success criteria), zero production source modified — fixes were already in place.
 
