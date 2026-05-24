@@ -445,123 +445,22 @@ def _normalize_decedent_key(name: str, dod: str = "") -> str:
     return f"{first_prefix}|{last}|{dod or 'nodod'}"
 
 
-# Fallback anchor cities for AssuranceWeb ZIP recovery. The first attempt
-# uses the primary anchor (Huntsville for Madison, Albertville for Marshall);
-# if Smarty can't resolve the street there, we cycle through additional
-# anchor cities AND a city-less retry. Each ~$0.001 — three lookups worst
-# case for an address we'd otherwise drop, easily worth it.
-_MADISON_ANCHORS: tuple[str, ...] = (
-    "Huntsville AL", "Madison AL", "Athens AL", "Hazel Green AL",
-    "New Hope AL", "Gurley AL", "Owens Cross Roads AL", "New Market AL",
-    # Smaller Madison-area communities — each is a separate USPS catchment
-    # so Smarty can't infer them from larger anchors. Verified that real
-    # addresses (e.g. Carters Gin Rd) resolve under "Toney AL" but fail
-    # under "Huntsville AL".
-    "Toney AL", "Meridianville AL", "Harvest AL", "Triana AL",
-    "AL",  # Final fallback: let Smarty pick the city from the street match
+# ── Backward-compat re-exports ────────────────────────────────────
+# The AssuranceWeb (Madison + Marshall) Smarty ZIP-recovery helpers
+# moved to address_standardizer.py on 2026-05-23 so the legacy
+# main.py daily flow (via property_lookup.py) can share them too.
+# Aliases kept so external callers and any module that still imports
+# the underscore-prefixed names (distress_proxy_pipeline.py,
+# apn_probate_pipeline_al.py prior to its own update) keep working.
+# New code should import from address_standardizer directly.
+from address_standardizer import (
+    smarty_zip_for_assuranceweb_address,
+    smarty_zip_for_madison_address,
+    smarty_zip_for_marshall_address,
 )
-_MARSHALL_ANCHORS: tuple[str, ...] = (
-    "Albertville AL", "Boaz AL", "Guntersville AL", "Arab AL",
-    "Grant AL", "Horton AL", "Crossville AL",
-    "AL",
-)
-
-
-def _smarty_lookup_once(situs: str, lastline_hint: str) -> tuple[str, str]:
-    """Single Smarty lookup attempt. Returns ('','') on any failure."""
-    try:
-        import config as cfg
-        if not (cfg.SMARTY_AUTH_ID and cfg.SMARTY_AUTH_TOKEN):
-            return ("", "")
-        from smartystreets_python_sdk.us_street import Lookup as StreetLookup
-        from smartystreets_python_sdk.us_street.match_type import MatchType
-        from address_standardizer import _build_client
-        client = _build_client(cfg.SMARTY_AUTH_ID, cfg.SMARTY_AUTH_TOKEN)
-        lookup = StreetLookup()
-        lookup.street = situs.strip()
-        lookup.lastline = lastline_hint
-        lookup.candidates = 1
-        lookup.match = MatchType.INVALID
-        client.send_lookup(lookup)
-        if not lookup.result:
-            return ("", "")
-        comp = lookup.result[0].components
-        return (comp.city_name or "", comp.zipcode or "")
-    except Exception as e:
-        logger.debug("Smarty geocode failed for %r (lastline=%r): %s",
-                     situs, lastline_hint, e)
-        return ("", "")
-
-
-def _smarty_zip_for_assuranceweb_address(
-    situs: str,
-    lastline_hint: str = "Huntsville AL",
-    anchor_fallbacks: tuple[str, ...] | None = None,
-) -> tuple[str, str]:
-    """Multi-anchor Smarty lookup to recover (city, zip) for an AssuranceWeb situs.
-
-    Madison + Marshall both run on the AssuranceWeb platform, and both
-    `search_by_owner_name` responses return only the street — the city/zip
-    portion isn't in the bulk search payload. We need ZIP for the tier gate,
-    so geocode via Smarty's US Street API.
-
-    Strategy (added to fix P1 #4 — multiple rural addresses dropped with
-    zip=? in live runs: Lizotte ×3, Bell, M.Smith, Hudson, Manley, K.Floyd,
-    Dova Hay):
-
-      1. Try ``lastline_hint`` (e.g. "Huntsville AL") — handles the
-         common case where the street is in the anchor city's catchment.
-      2. If no match, cycle through ``anchor_fallbacks`` until one hits.
-         These cover rural / fringe addresses where the anchor isn't
-         geographically near the actual delivery city.
-      3. Final attempt: lastline = "AL" alone — lets Smarty pick the city
-         from the street match without any city bias.
-
-    Returns ('', '') only when all fallbacks are exhausted.
-    """
-    if not situs or not situs.strip():
-        return ("", "")
-
-    # Try the primary anchor first
-    city, zip_ = _smarty_lookup_once(situs, lastline_hint)
-    if zip_:
-        return (city, zip_)
-
-    # Cycle through fallback anchors
-    for anchor in (anchor_fallbacks or ()):
-        if anchor == lastline_hint:
-            continue  # Already tried the primary
-        city, zip_ = _smarty_lookup_once(situs, anchor)
-        if zip_:
-            logger.debug("Smarty fallback hit on %r (anchor=%r): %s, %s",
-                         situs, anchor, city, zip_)
-            return (city, zip_)
-
-    return ("", "")
-
-
-def _smarty_zip_for_madison_address(situs: str) -> tuple[str, str]:
-    """Madison-anchored ZIP recovery with multi-city fallback."""
-    return _smarty_zip_for_assuranceweb_address(
-        situs,
-        lastline_hint="Huntsville AL",
-        anchor_fallbacks=_MADISON_ANCHORS,
-    )
-
-
-def _smarty_zip_for_marshall_address(situs: str) -> tuple[str, str]:
-    """Marshall-anchored ZIP recovery with multi-city fallback.
-
-    Primary anchor is Albertville (largest city); fallbacks cycle through
-    Boaz, Guntersville, Arab, Grant, Horton, Crossville, then city-less
-    "AL" as the final attempt. Each retry ~$0.001 — cheap insurance for
-    addresses Smarty's primary-anchor lookup can't resolve.
-    """
-    return _smarty_zip_for_assuranceweb_address(
-        situs,
-        lastline_hint="Albertville AL",
-        anchor_fallbacks=_MARSHALL_ANCHORS,
-    )
+_smarty_zip_for_assuranceweb_address = smarty_zip_for_assuranceweb_address
+_smarty_zip_for_madison_address = smarty_zip_for_madison_address
+_smarty_zip_for_marshall_address = smarty_zip_for_marshall_address
 
 
 def _attach_property_for_decedent(
