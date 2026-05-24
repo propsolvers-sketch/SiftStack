@@ -441,3 +441,53 @@ def build_service_rates_block(
         "type": "section",
         "text": {"type": "mrkdwn", "text": "\n".join(lines)},
     }
+
+
+# ── Phase 2: Block-aware webhook send (OPS-03, OBS-01) ────────────────
+#
+# Pipelines call this DIRECTLY to post a Block Kit payload (text +
+# blocks) — bypassing send_slack_notification entirely so the existing
+# legacy `_send_webhook(text)` path stays byte-identical (plan 02-01's
+# additive-only contract). Each pipeline's notify_slack() builds its
+# own blocks list (existing summary section + build_funnel_block +
+# build_service_rates_block) and POSTs the full payload in one HTTP
+# call — no second Slack message, no thread (D-02: "one message, more
+# content"). Mirrors _send_webhook's return contract: True on 200/204,
+# False on anything else.
+
+
+def _send_blocks_webhook(
+    text: str,
+    blocks: list[dict],
+    webhook_url: str | None = None,
+) -> bool:
+    """Send {text, blocks} payload to the webhook (Phase 2: OPS-03, OBS-01).
+
+    Args:
+        text: Plain-text fallback. Slack renders this when the blocks
+            payload fails to render (legacy clients, mobile, push
+            notifications).
+        blocks: Slack Block Kit list — each entry is a section / divider
+            / etc. dict (typically built via ``build_funnel_block`` and
+            ``build_service_rates_block``).
+        webhook_url: Override the env-supplied SLACK_WEBHOOK_URL.
+
+    Returns:
+        True if the webhook returned HTTP 200 or 204. False on missing
+        URL, network error, or non-2xx status. Same contract as
+        ``_send_webhook`` so callers can treat them interchangeably for
+        success-tracking purposes.
+    """
+    webhook_url = webhook_url or os.environ.get("SLACK_WEBHOOK_URL", "")
+    if not webhook_url:
+        return False
+    try:
+        resp = requests.post(
+            webhook_url,
+            json={"text": text, "blocks": blocks},
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        return resp.status_code in (200, 204)
+    except Exception:
+        return False
