@@ -164,3 +164,183 @@ def test_captcha_noop_when_rate_tracker_is_none(monkeypatch):
         captcha_solver.solve_captcha_and_view(page2, rate_tracker=None)
     )
     assert result_explicit is True
+
+
+# ── Smarty ─────────────────────────────────────────────────────────────
+
+
+def _make_smarty_candidate(*, delivery_line_1: str, city: str = "HUNTSVILLE",
+                           state: str = "AL", zipcode: str = "35801") -> MagicMock:
+    """Build a Smarty Candidate mock with the fields standardize_addresses reads."""
+    components = SimpleNamespace(
+        city_name=city,
+        state_abbreviation=state,
+        zipcode=zipcode,
+        plus4_code="",
+    )
+    metadata = SimpleNamespace(latitude=None, longitude=None, rdi=None)
+    analysis = SimpleNamespace(dpv_match_code=None, vacant=None)
+    cand = MagicMock()
+    cand.delivery_line_1 = delivery_line_1
+    cand.components = components
+    cand.metadata = metadata
+    cand.analysis = analysis
+    return cand
+
+
+def _make_lookup_mock(input_id: str, candidates: list) -> MagicMock:
+    """Build a Lookup-like mock that iteration over the Smarty Batch yields."""
+    lookup = MagicMock()
+    lookup.input_id = input_id
+    lookup.result = candidates
+    return lookup
+
+
+def _patch_smarty_batch(monkeypatch, *, results_by_input_id: dict):
+    """Patch standardize_addresses' client + batch iteration to return mock lookups.
+
+    results_by_input_id maps "0", "1", ... → list of Candidate mocks (empty = no match).
+    """
+    import address_standardizer as az
+
+    class _FakeClient:
+        def send_batch(self, batch):
+            # Replace batch's iteration with our pre-built lookups
+            batch._lookups = [
+                _make_lookup_mock(iid, cands)
+                for iid, cands in results_by_input_id.items()
+            ]
+
+    class _FakeBatch:
+        def __init__(self):
+            self._lookups = []
+            self._added = []
+
+        def add(self, lookup):
+            self._added.append(lookup)
+            # If client.send_batch hasn't pre-populated, default to the added ones
+            # (used so iteration during the post-send loop works).
+
+        def __iter__(self):
+            return iter(self._lookups)
+
+    monkeypatch.setattr(az, "_build_client", lambda a, b: _FakeClient())
+    monkeypatch.setattr(az, "Batch", _FakeBatch)
+
+
+def test_smarty_records_one_success_per_resolved_address(monkeypatch):
+    """One notice resolves (delivery_line_1 populated), one doesn't → 1/2."""
+    from notice_parser import NoticeData
+    import address_standardizer as az
+
+    notices = [
+        NoticeData(address="123 MAIN ST", city="HUNTSVILLE", state="AL", zip="35801"),
+        NoticeData(address="999 GHOST RD", city="HUNTSVILLE", state="AL", zip="35801"),
+    ]
+
+    _patch_smarty_batch(monkeypatch, results_by_input_id={
+        "0": [_make_smarty_candidate(delivery_line_1="123 MAIN ST")],
+        "1": [],  # No candidates → failure
+    })
+
+    tracker = ServiceRateTracker()
+    az.standardize_addresses(notices, "auth-id", "auth-token", rate_tracker=tracker)
+
+    assert tracker.totals()["smarty"] == {"success": 1, "total": 2}
+
+
+def test_smarty_records_failure_on_http_error(monkeypatch):
+    """Batch send raises → every notice in the batch records a failure."""
+    from notice_parser import NoticeData
+    from smartystreets_python_sdk import exceptions
+    import address_standardizer as az
+
+    notices = [
+        NoticeData(address=f"{i} TEST ST", city="HUNTSVILLE", state="AL", zip="35801")
+        for i in range(3)
+    ]
+
+    class _RaisingClient:
+        def send_batch(self, batch):
+            raise exceptions.SmartyException("simulated 500")
+
+    class _FakeBatch:
+        def __init__(self):
+            self._added = []
+
+        def add(self, lookup):
+            self._added.append(lookup)
+
+        def __iter__(self):
+            return iter([])
+
+    monkeypatch.setattr(az, "_build_client", lambda a, b: _RaisingClient())
+    monkeypatch.setattr(az, "Batch", _FakeBatch)
+
+    tracker = ServiceRateTracker()
+    az.standardize_addresses(notices, "auth-id", "auth-token", rate_tracker=tracker)
+
+    assert tracker.totals()["smarty"] == {"success": 0, "total": 3}
+
+
+def test_smarty_zip_assuranceweb_records_success_when_zip_returned(monkeypatch):
+    """smarty_zip_for_assuranceweb_address records 1 success when (city, zip) returned."""
+    import address_standardizer as az
+
+    # Patch _smarty_lookup_once to return a clean (city, zip)
+    monkeypatch.setattr(
+        az, "_smarty_lookup_once",
+        lambda situs, hint: ("ALBERTVILLE", "35950"),
+    )
+
+    tracker = ServiceRateTracker()
+    city, zip_ = az.smarty_zip_for_assuranceweb_address(
+        "123 MAIN ST", "Albertville AL", rate_tracker=tracker,
+    )
+
+    assert (city, zip_) == ("ALBERTVILLE", "35950")
+    assert tracker.totals()["smarty"] == {"success": 1, "total": 1}
+
+
+def test_smarty_zip_assuranceweb_records_failure_when_no_match(monkeypatch):
+    """smarty_zip_for_assuranceweb_address records 1 failure when all fallbacks miss."""
+    import address_standardizer as az
+
+    # Every Smarty call returns empty
+    monkeypatch.setattr(az, "_smarty_lookup_once", lambda situs, hint: ("", ""))
+
+    tracker = ServiceRateTracker()
+    city, zip_ = az.smarty_zip_for_assuranceweb_address(
+        "999 GHOST RD", "Albertville AL",
+        anchor_fallbacks=("Boaz AL", "AL"),
+        rate_tracker=tracker,
+    )
+
+    assert (city, zip_) == ("", "")
+    assert tracker.totals()["smarty"] == {"success": 0, "total": 1}
+
+
+def test_smarty_noop_when_rate_tracker_is_none(monkeypatch):
+    """rate_tracker=None on standardize_addresses → no exception, no tracker mutation."""
+    from notice_parser import NoticeData
+    import address_standardizer as az
+
+    notices = [
+        NoticeData(address="123 MAIN ST", city="HUNTSVILLE", state="AL", zip="35801"),
+        NoticeData(address="456 OAK AVE", city="HUNTSVILLE", state="AL", zip="35801"),
+    ]
+
+    _patch_smarty_batch(monkeypatch, results_by_input_id={
+        "0": [_make_smarty_candidate(delivery_line_1="123 MAIN ST")],
+        "1": [_make_smarty_candidate(delivery_line_1="456 OAK AVE")],
+    })
+
+    # No tracker arg at all
+    az.standardize_addresses(notices, "auth-id", "auth-token")
+
+    # Explicit None
+    tracker = ServiceRateTracker()
+    az.standardize_addresses(
+        notices, "auth-id", "auth-token", rate_tracker=None,
+    )
+    assert tracker.totals()["smarty"] == {"success": 0, "total": 0}
