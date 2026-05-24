@@ -13,11 +13,15 @@ import io
 import json
 import logging
 import time
+from typing import TYPE_CHECKING
 
 import requests
 
 import config as cfg
 from notice_parser import NoticeData
+
+if TYPE_CHECKING:
+    from observability import ServiceRateTracker
 
 logger = logging.getLogger(__name__)
 
@@ -185,11 +189,41 @@ def _lookup_missing_heir_addresses(
     return filled
 
 
+def _record_tracerfy_outcomes(
+    rate_tracker: "ServiceRateTracker | None",
+    *,
+    submitted: int,
+    matched: int,
+) -> None:
+    """Emit per-contact record() calls for a Tracerfy batch outcome.
+
+    Per CONTEXT.md D-04 (Tracerfy batch granularity):
+      - Record `matched` successes
+      - Record `(submitted - matched)` failures
+      - When `submitted == 0` (no contacts went to Tracerfy at all), emit
+        NOTHING — empty batches shouldn't pollute the rate.
+
+    Used at every return path inside batch_skip_trace so the recording is
+    single-source: success-completion, HTTP-error, queue-fail, timeout.
+    """
+    if rate_tracker is None:
+        return
+    if submitted <= 0:
+        return
+    matched = max(0, min(matched, submitted))
+    for _ in range(matched):
+        rate_tracker.record("tracerfy", True)
+    for _ in range(submitted - matched):
+        rate_tracker.record("tracerfy", False)
+
+
 def batch_skip_trace(
     notices: list[NoticeData],
     max_signing_traces: int = 5,
     lookup_heir_addresses: bool = True,
     address_lookup_api_key: str | None = None,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
 ) -> dict:
     """Run Tracerfy batch skip trace on all records.
 
@@ -204,6 +238,13 @@ def batch_skip_trace(
     mailing address get one looked up (Knox Tax → people search) before the trace
     so Tracerfy has enough info to return phones. Uses ANTHROPIC_API_KEY (or the
     explicit override) for LLM-based extraction from people-search pages.
+
+    When ``rate_tracker`` is supplied, the batch outcome is recorded per
+    CONTEXT.md D-04 at BATCH granularity:
+      - record `matched` successes
+      - record `(submitted - matched)` failures
+      - HTTPError / queue-fail / timeout: record `submitted` failures
+      - Zero-submitted (empty batch / no eligible contacts): record nothing
 
     Returns stats dict: {total, submitted, matched, phones_found, emails_found,
                          cost, signing_heirs_traced, heir_addresses_filled}.
@@ -222,6 +263,7 @@ def batch_skip_trace(
 
     if not cfg.TRACERFY_API_KEY:
         logger.warning("Tracerfy API key not set — skipping batch skip trace")
+        # No Tracerfy call was made — no rate record (service never invoked)
         return stats
 
     # Fill missing heir addresses BEFORE building the trace batch — otherwise
@@ -309,6 +351,9 @@ def batch_skip_trace(
                 "Tracerfy batch 402 — INSUFFICIENT CREDITS. Response: %s",
                 resp.text[:500],
             )
+            _record_tracerfy_outcomes(
+                rate_tracker, submitted=stats["submitted"], matched=0,
+            )
             return stats
         if resp.status_code != 200:
             logger.warning("Tracerfy batch %d response: %s",
@@ -318,6 +363,9 @@ def batch_skip_trace(
         queue_id = queue_data.get("queue_id")
         if not queue_id:
             logger.warning("Tracerfy batch returned no queue_id")
+            _record_tracerfy_outcomes(
+                rate_tracker, submitted=stats["submitted"], matched=0,
+            )
             return stats
 
         est_wait = queue_data.get("estimated_wait_seconds", "unknown")
@@ -370,6 +418,9 @@ def batch_skip_trace(
                 status = result_data.get("status", "")
                 if status == "failed":
                     logger.warning("Tracerfy batch job %s failed", queue_id)
+                    _record_tracerfy_outcomes(
+                        rate_tracker, submitted=stats["submitted"], matched=0,
+                    )
                     return stats
                 if status != "completed":
                     if attempt % 6 == 5:
@@ -386,14 +437,25 @@ def batch_skip_trace(
             logger.info("  Tracerfy batch complete: %d/%d matched, %d phones, %d emails, $%.2f",
                         stats["matched"], stats["submitted"],
                         stats["phones_found"], stats["emails_found"], stats["cost"])
+            _record_tracerfy_outcomes(
+                rate_tracker,
+                submitted=stats["submitted"], matched=stats["matched"],
+            )
             return stats
 
         logger.warning("Tracerfy batch job %s timed out after 5 min", queue_id)
         stats["cost"] = stats["submitted"] * 0.02  # Still charged
+        # Timeout = whole batch failed (no records consumed)
+        _record_tracerfy_outcomes(
+            rate_tracker, submitted=stats["submitted"], matched=0,
+        )
         return stats
 
     except Exception as e:
         logger.warning("Tracerfy batch skip trace failed: %s", e)
+        _record_tracerfy_outcomes(
+            rate_tracker, submitted=stats["submitted"], matched=0,
+        )
         return stats
 
 
