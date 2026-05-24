@@ -10,9 +10,9 @@ See: .planning/PROJECT.md (updated 2026-05-23)
 ## Current Position
 
 Phase: 1 of 5 (Stabilize Production)
-Plan: 0 of TBD in current phase
-Status: Ready to plan
-Last activity: 2026-05-24 — Completed quick task 260523-uvu: Move Madison/Marshall Smarty-zip geocode helpers into shared address_standardizer.py and wire them into the legacy main.py probate flow via property_lookup.py
+Plan: 0 of 4 in current phase
+Status: Planned (Ready to execute)
+Last activity: 2026-05-24 — Phase 1 planned: 4 plans, 2 waves (BUGFIX-02 → BUGFIX-01 + BUGFIX-03 + PARSER-01). All 4 fixes already in production source per plan-checker spot-check — Phase 1 deliverable is the regression test net (golden tests in new `tests/unit/`).
 
 Progress: [░░░░░░░░░░] 0%
 

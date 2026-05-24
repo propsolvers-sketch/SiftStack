@@ -50,7 +50,7 @@ v1.0 is the operational baseline as of 2026-05-23. See `.planning/REQUIREMENTS.m
   3. Records that ship to DataSift always have a real letter-containing address (numeric-only addresses are rejected at validation, not at DataSift cleanup)
   4. AL probate notices with name-first signature blocks land in DataSift with PR mailing addresses populated even when ANTHROPIC_API_KEY is unset (`PR_ADDRESS_NAME_FIRST_RE` matches before falling through to LLM)
   5. A single `pytest tests/unit/` run covers all 4 fixes with golden tests that would have caught the original bug class
-**Plans**: TBD
+**Plans**: 4 — `01-bugfix-02` (Wave 1, ships `tests/unit/` scaffold), then parallel Wave 2: `01-bugfix-01`, `01-bugfix-03`, `01-parser-01`
 
 ### Phase 2: Funnel Transparency
 **Goal**: Make pipeline behavior observable on every run so quality regressions surface immediately, not 24-48h later when "fewer records produced today" gets noticed.
