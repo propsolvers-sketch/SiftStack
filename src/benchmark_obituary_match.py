@@ -23,7 +23,7 @@ import os
 import re
 import sys
 from dataclasses import asdict, dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from dotenv import load_dotenv
 
@@ -34,6 +34,21 @@ from obituary_enricher import (
     _fetch_page_text,
     _search_obituary,
     rank_decision_makers,
+)
+
+if TYPE_CHECKING:
+    from observability import ServiceRateTracker
+
+# Phase 2 (OBS-01 / WARNING 7): the two routing keys the caller uses to
+# grade confidence. `petitioner_match` ∈ {"exact","fuzzy","not_found"}
+# routes the petitioner-as-survivor branch; `is_decedent_match` ∈
+# {true,false} routes the right-decedent gate. Both MUST be present on
+# every successful LLM response — if either is missing, the response is
+# malformed and should count as an LLM failure (chat_json drops the
+# result + records a failure into the rate tracker).
+_OBIT_MATCH_REQUIRED_KEYS: tuple[str, ...] = (
+    "is_decedent_match",
+    "petitioner_match",
 )
 
 load_dotenv()
@@ -248,8 +263,17 @@ def _parse_obituary_for_petitioner(
     decedent_name: str,
     petitioner_name: str,
     api_key: str,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
 ) -> Optional[dict]:
-    """Send the obituary text to Claude Haiku and ask for a structured match."""
+    """Send the obituary text to Claude Haiku and ask for a structured match.
+
+    Phase 2 (OBS-01 / WARNING 7): records the LLM call into the supplied
+    rate_tracker via llm_client.chat_json's instrumentation, with
+    required_keys = ("is_decedent_match", "petitioner_match"). Both keys
+    must be present on the parsed JSON for chat_json to record success;
+    a malformed response (missing either key) counts as a failure.
+    """
     if not obituary_text.strip():
         return None
     prompt = SURVIVOR_PROMPT.format(
@@ -260,6 +284,8 @@ def _parse_obituary_for_petitioner(
     try:
         parsed = llm_client.chat_json(
             prompt, system=SYSTEM_PROMPT, max_tokens=LLM_MAX_TOKENS, api_key=api_key,
+            rate_tracker=rate_tracker,
+            required_keys=_OBIT_MATCH_REQUIRED_KEYS,
         )
     except Exception as e:
         logger.debug("LLM call failed: %s", e)
@@ -293,6 +319,8 @@ def match_petitioner_city(
     case: BenchmarkCase,
     api_key: str | None = None,
     max_obituaries: int = MAX_OBITUARIES_TO_TRY,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
 ) -> MatchResult:
     """Find the petitioner's city by cross-referencing the decedent's obituary.
 
@@ -355,6 +383,7 @@ def match_petitioner_city(
             continue
         parsed = _parse_obituary_for_petitioner(
             text, decedent_human, petitioner_human, api_key,
+            rate_tracker=rate_tracker,
         )
         if not parsed:
             logger.debug("  Not the right decedent: %s", url)
@@ -444,6 +473,8 @@ async def enrich_via_ancestry(
     existing: MatchResult,
     page,
     api_key: str | None = None,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
 ) -> MatchResult:
     """Fallback path: when DDG returned confidence=none, search Ancestry +
     Newspapers.com for the decedent's obituary, then run the SAME expanded
@@ -537,6 +568,7 @@ async def enrich_via_ancestry(
     # Run the SAME expanded LLM extraction the DDG path uses
     parsed = _parse_obituary_for_petitioner(
         obit_text, decedent_human, petitioner_human, api_key,
+        rate_tracker=rate_tracker,
     )
     if not parsed:
         existing.notes = (
@@ -591,6 +623,8 @@ async def enrich_via_ancestry(
 async def batch_ancestry_fallback(
     cases_and_results: list[tuple[BenchmarkCase, MatchResult]],
     api_key: str | None = None,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
 ) -> int:
     """Run a single Ancestry browser session and try to upgrade every
     confidence=none MatchResult.
@@ -622,7 +656,10 @@ async def batch_ancestry_fallback(
                 logger.warning("Ancestry: circuit/limit reached — stopping fallback")
                 break
             before_conf = result.confidence
-            await enrich_via_ancestry(case, result, page, api_key=api_key)
+            await enrich_via_ancestry(
+                case, result, page, api_key=api_key,
+                rate_tracker=rate_tracker,
+            )
             if result.confidence != before_conf:
                 upgrades += 1
                 logger.info("  Ancestry upgrade: %s now %s", case.case_number, result.confidence)

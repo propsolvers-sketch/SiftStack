@@ -45,12 +45,40 @@ from benchmark_obituary_match import (
 )
 from benchmark_web import BenchmarkCase, BenchmarkSession
 from notice_parser import NoticeData, _split_decedent_name, _split_owner_name
+from observability import (
+    FunnelCounter,
+    ServiceRateTracker,
+    load_rolling_rates,
+    rolling_rates_summary,
+    save_rolling_rates,
+)
 from probate_property_locator import _search_jefferson, _score
+from slack_notifier import (
+    _send_blocks_webhook,
+    build_funnel_block,
+    build_service_rates_block,
+)
 from target_zips import zip_tier_county
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+# ── Phase 2: benchmark pipeline gate sequence (D-01 additive scope) ──
+# Plan-checker W8: benchmark is NOT in CONTEXT.md D-01's 5-pipeline
+# list; it's documented in 02-04 must_haves so the addition stays
+# auditable. The 6-gate sequence mirrors the benchmark stage order
+# (Benchmark Web → property → tier → fiduciary detection → obituary →
+# Tracerfy → DataSift CSV).
+BENCHMARK_GATES: tuple[str, ...] = (
+    "pulled",
+    "tier_gated",
+    "fiduciary_filtered",
+    "obituary_confirmed",
+    "tracerfy_matched",
+    "datasift_uploaded",
+)
 
 
 # ── Result schema ─────────────────────────────────────────────────────
@@ -175,7 +203,10 @@ async def run_pipeline(
     enable_obituary: bool = True,
     enable_ancestry_fallback: bool = False,
     headless: bool = True,
-) -> list[CaseResult]:
+    *,
+    funnel: FunnelCounter | None = None,
+    rate_tracker: ServiceRateTracker | None = None,
+) -> tuple[list[CaseResult], FunnelCounter, ServiceRateTracker]:
     """End-to-end pipeline: Benchmark → property API → ZIP gate → obituary.
 
     Args:
@@ -188,11 +219,24 @@ async def run_pipeline(
             pass to upgrade any in-tier cases that DDG returned as confidence=none.
             Costs ancestry page-loads (100/day cap) and adds ~30s per fallback.
         headless: Pass-through to BenchmarkSession.
+        funnel: Phase 2 — optional caller-supplied counter. When omitted, a
+            fresh FunnelCounter("benchmark") is created with the 6-gate
+            sequence pre-seeded so the Slack block always renders all gates.
+        rate_tracker: Phase 2 — optional caller-supplied tracker. When omitted,
+            a fresh ServiceRateTracker is created. Threaded into the LLM
+            obituary-match call sites + batch_skip_trace so the 4-service
+            rates aggregate across the run.
 
     Returns:
-        List of CaseResult, one per pulled case (including dropped ones,
-        each tagged with its disposition).
+        ``(results, funnel, rate_tracker)`` — per-case results plus the
+        populated funnel + tracker so notify_slack can append the funnel
+        + service-rates blocks to the run summary (D-02).
     """
+    if funnel is None:
+        funnel = FunnelCounter("benchmark", gates=list(BENCHMARK_GATES))
+    if rate_tracker is None:
+        rate_tracker = ServiceRateTracker()
+
     end = date.today()
     start = end - timedelta(days=days_back)
     results: list[CaseResult] = []
@@ -209,6 +253,10 @@ async def run_pipeline(
             if not c.parties:
                 c = await bm.fetch_case_detail(c.case_url, c.case_number)
             hydrated.append(c)
+
+    # Phase 2 funnel: `pulled` gate — count of cases returned by
+    # Benchmark Web (post any internal trim, pre property-locator).
+    funnel.set("pulled", len(hydrated))
 
     case_by_num: dict[str, BenchmarkCase] = {c.case_number: c for c in hydrated}
 
@@ -294,7 +342,7 @@ async def run_pipeline(
         # Stage 4: Obituary cross-reference
         if enable_obituary:
             try:
-                m = match_petitioner_city(case)
+                m = match_petitioner_city(case, rate_tracker=rate_tracker)
                 result.obituary_match = m
                 result.obituary_run = True
             except Exception as e:
@@ -317,12 +365,40 @@ async def run_pipeline(
         if targets:
             logger.info("Triggering Ancestry batch fallback for %d case(s)", len(targets))
             try:
-                upgrades = await batch_ancestry_fallback(targets)
+                upgrades = await batch_ancestry_fallback(
+                    targets, rate_tracker=rate_tracker,
+                )
                 logger.info("Ancestry fallback: %d upgrade(s)", upgrades)
             except Exception as e:
                 logger.warning("Ancestry batch failed: %s", e)
 
-    return results
+    # ── Phase 2 funnel: stamp the disposition-derived gates ──────────
+    # tier_gated: cases that survived the Tier 1/2 ZIP filter.
+    # fiduciary_filtered: tier-surviving cases whose petitioner is NOT
+    #   a fiduciary (i.e. these proceed to obituary spend). Equal to
+    #   enriched + skipped_fiduciary-inverse → count of results with
+    #   status == "enriched" (since fiduciaries route to
+    #   "skipped_fiduciary" before the obit step).
+    # obituary_confirmed: count of enriched results whose obit match
+    #   landed at confidence in {high, medium}.
+    in_tier_count = sum(
+        1 for r in results
+        if r.status in ("enriched", "skipped_fiduciary")
+    )
+    funnel.set("tier_gated", in_tier_count)
+
+    enriched_count = sum(1 for r in results if r.status == "enriched")
+    funnel.set("fiduciary_filtered", enriched_count)
+
+    obit_confirmed_count = sum(
+        1 for r in results
+        if r.status == "enriched"
+        and r.obituary_match is not None
+        and r.obituary_match.confidence in ("high", "medium")
+    )
+    funnel.set("obituary_confirmed", obit_confirmed_count)
+
+    return (results, funnel, rate_tracker)
 
 
 # ── DataSift CSV conversion ──────────────────────────────────────────
@@ -581,14 +657,64 @@ def notify_slack(
     skip_trace_stats: dict | None = None,
     days_back: int = 7,
     webhook_url: str | None = None,
+    *,
+    funnel: FunnelCounter | None = None,
+    rate_tracker: ServiceRateTracker | None = None,
 ) -> bool:
-    """Post the post-probate run summary to Slack/Discord. Returns True on success."""
+    """Post the benchmark run summary to Slack/Discord. Returns True on success.
+
+    Phase 2 (OPS-03 / OBS-01): when ``funnel`` AND ``rate_tracker`` are
+    BOTH supplied (the new daily-ops path), this function:
+
+      1. Calls load_rolling_rates BEFORE the blocks build so today's
+         service-rates block shows the PRIOR-days baseline (D-03).
+      2. Builds a 3-block payload: legacy summary text + funnel block +
+         service-rates block.
+      3. POSTs via _send_blocks_webhook — one HTTP call, one message
+         (D-02).
+      4. AFTER a successful send, calls save_rolling_rates so today's
+         totals advance the window for tomorrow's baseline (D-03 / W6).
+
+    Legacy callers (no funnel + no tracker) get the byte-identical
+    plain-text path via _send_webhook (W5 preserved).
+    """
     import slack_notifier
     text = build_slack_message(
         results, csv_path=csv_path,
         skip_trace_stats=skip_trace_stats, days_back=days_back,
     )
-    sent = slack_notifier._send_webhook(text, webhook_url=webhook_url)
+
+    # Legacy path: no funnel + no tracker → plain text via _send_webhook,
+    # byte-identical to the pre-Phase-2 behaviour.
+    if funnel is None and rate_tracker is None:
+        sent = slack_notifier._send_webhook(text, webhook_url=webhook_url)
+        if sent:
+            logger.info("Slack notification sent (%d enriched leads)",
+                        sum(1 for r in results if r.status == "enriched"))
+        else:
+            logger.warning("Slack notification failed (no webhook or send error)")
+        return sent
+
+    # Phase 2 path: rolling-rates ordering (D-03) — load BEFORE the
+    # blocks build, save AFTER a successful send.
+    rolling = rolling_rates_summary(load_rolling_rates())
+    per_run = rate_tracker.per_run_rates() if rate_tracker else {}
+
+    blocks: list[dict] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+    ]
+    if funnel is not None:
+        blocks.append(
+            build_funnel_block(funnel.pipeline_name, funnel.as_ordered_dict())
+        )
+    blocks.append(build_service_rates_block(per_run, rolling))
+
+    sent = _send_blocks_webhook(text, blocks, webhook_url=webhook_url)
+    if sent and rate_tracker is not None:
+        # W6: save ONLY after a successful send so a failed Slack post
+        # leaves the rolling baseline untouched.
+        save_rolling_rates(rate_tracker.totals())
+
     if sent:
         logger.info("Slack notification sent (%d enriched leads)",
                     sum(1 for r in results if r.status == "enriched"))
@@ -658,11 +784,19 @@ def prepare_notices(
     results: list[CaseResult],
     enriched_only: bool = True,
     skip_trace: bool = False,
+    *,
+    funnel: FunnelCounter | None = None,
+    rate_tracker: ServiceRateTracker | None = None,
 ) -> tuple[list[NoticeData], dict | None]:
     """Convert pipeline results to NoticeData and optionally run skip-trace.
 
     Returns (notices, skip_trace_stats). ``skip_trace_stats`` is None when
     skip-trace wasn't requested.
+
+    Phase 2: when ``funnel`` is supplied, sets ``tracerfy_matched`` from
+    skip-trace stats. When ``rate_tracker`` is supplied, it's threaded
+    into ``batch_skip_trace`` so per-contact match/miss counts feed the
+    per-run + 7-day Tracerfy rates.
     """
     eligible = [r for r in results if not enriched_only or r.status == "enriched"]
     notices = [_to_notice_data(r) for r in eligible]
@@ -671,7 +805,9 @@ def prepare_notices(
     if skip_trace and notices:
         try:
             import tracerfy_skip_tracer
-            stats = tracerfy_skip_tracer.batch_skip_trace(notices)
+            stats = tracerfy_skip_tracer.batch_skip_trace(
+                notices, rate_tracker=rate_tracker,
+            )
             logger.info(
                 "Skip-trace stats: submitted=%d matched=%d phones=%d emails=%d cost=$%.2f",
                 stats.get("submitted", 0), stats.get("matched", 0),
@@ -684,9 +820,18 @@ def prepare_notices(
             # in the CSV columns DataSift filter presets read.
             for n in notices:
                 _promote_heir_contacts_to_csv_slots(n)
+            if funnel is not None:
+                funnel.set("tracerfy_matched", int(stats.get("matched", 0)))
         except Exception as e:
             logger.warning("Skip-trace failed (continuing without phones): %s", e)
             stats = {"error": str(e)}
+            # Zero-fill the gate so it always appears in the Slack block.
+            if funnel is not None:
+                funnel.set("tracerfy_matched", 0)
+    elif funnel is not None:
+        # skip-trace not requested (or no notices) → zero-fill so the
+        # gate still appears in the Slack block.
+        funnel.set("tracerfy_matched", 0)
 
     return notices, stats
 
@@ -842,7 +987,8 @@ def _cli() -> int:
             print(f"Invalid --tiers value: {args.tiers!r}", file=sys.stderr)
             return 2
 
-    results = asyncio.run(run_pipeline(
+    # Phase 2: run_pipeline now returns (results, funnel, rate_tracker).
+    results, funnel, rate_tracker = asyncio.run(run_pipeline(
         days_back=args.days_back,
         max_cases=args.max_cases,
         tier_filter=tier_filter,
@@ -862,19 +1008,32 @@ def _cli() -> int:
     if args.datasift_csv:
         notices, skip_trace_stats = prepare_notices(
             results, skip_trace=args.skip_trace,
+            funnel=funnel, rate_tracker=rate_tracker,
         )
         if notices:
             csv_path = datasift_formatter.write_datasift_csv(notices)
+            # Phase 2 funnel: datasift_uploaded gate stamps from the
+            # surviving notice count after CSV write.
+            funnel.set("datasift_uploaded", len(notices))
             print(f"\n✓ DataSift CSV written: {csv_path}")
         else:
+            funnel.set("datasift_uploaded", 0)
             print("\n· DataSift CSV: 0 eligible records (no enriched cases).")
     elif args.skip_trace:
         print("\n· --skip-trace ignored (requires --datasift-csv).")
+
+    # D-04 — terminal mirrors Slack: log the funnel at end-of-run
+    # regardless of whether --notify-slack is set.
+    logger.info(
+        "Funnel (%s): %s",
+        funnel.pipeline_name, dict(funnel.as_ordered_dict()),
+    )
 
     if args.notify_slack:
         sent = notify_slack(
             results, csv_path=csv_path,
             skip_trace_stats=skip_trace_stats, days_back=args.days_back,
+            funnel=funnel, rate_tracker=rate_tracker,
         )
         if sent:
             print(f"✓ Slack notification posted")
