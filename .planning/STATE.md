@@ -12,7 +12,7 @@ See: .planning/PROJECT.md (updated 2026-05-23)
 Phase: 1 of 5 (Stabilize Production)
 Plan: 0 of TBD in current phase
 Status: Ready to plan
-Last activity: 2026-05-23 — Bootstrapped `.planning/` from doc-ingest (CLAUDE.md + README.md + Huntsville FOIA)
+Last activity: 2026-05-24 — Completed quick task 260523-uvu: Move Madison/Marshall Smarty-zip geocode helpers into shared address_standardizer.py and wire them into the legacy main.py probate flow via property_lookup.py
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -59,6 +59,12 @@ None yet.
 - Tier ZIP defs in 2 places (`src/target_zips.py` + REI Skill Library MD analysis docs) — manual sync risk; carry forward as recurring hygiene concern.
 - 4,246-line `datasift_uploader.py` + 1,905-line `main.py` are tech-debt monoliths deferred to v2 (REFAC-03 / REFAC-05).
 - Tesseract is not in Dockerfile; `photo-import` / `pdf-import` will fail on Apify. Daily scrape unaffected; v2 fix (REFAC-06).
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 260523-uvu | Move Madison/Marshall Smarty-zip geocode helpers into shared address_standardizer.py and wire them into the legacy main.py probate flow via property_lookup.py | 2026-05-24 | 07a48fa | [260523-uvu-move-madison-marshall-smarty-zip-geocode](./quick/260523-uvu-move-madison-marshall-smarty-zip-geocode/) |
 
 ## Deferred Items
 
