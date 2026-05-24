@@ -54,7 +54,6 @@ Thumbs.db
 
 # Claude Code / planning
 .claude/
-.planning/
 .playwright-mcp/
 
 # Misc
