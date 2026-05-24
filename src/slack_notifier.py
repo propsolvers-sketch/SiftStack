@@ -328,3 +328,116 @@ def send_slack_notification(
     else:
         logger.error("Failed to send Slack notification")
     return sent
+
+
+# ── Phase 2: Funnel + Service Rate Blocks (OPS-03, OBS-01) ────────────
+#
+# These two helpers build Slack Block Kit "section" dicts that each
+# pipeline's notify_slack() appends to its existing blocks list before
+# invoking the webhook sender. Pure functions — they construct dicts and
+# return them; no HTTP, no I/O.
+#
+# Dependency direction is strictly one-way: this module does NOT import
+# from src/observability.py. Callers build the per-run-rates and
+# rolling-rates dicts using ServiceRateTracker + load_rolling_rates +
+# rolling_rates_summary, then pass the resulting dicts in here. Keeping
+# the dependency one-way means observability stays a pure data module
+# and the Slack layer can be swapped (e.g. for Discord or a logger) with
+# zero changes upstream.
+#
+# Block shape (Slack docs):
+#     {"type": "section",
+#      "text": {"type": "mrkdwn", "text": "..."}}
+# The caller appends the returned dict to its `blocks` list. Wave 3
+# (plan 02-03) adds the _send_blocks_webhook helper that posts a full
+# blocks-array payload — _send_webhook above stays text-only.
+
+# Display order for the service-rate block. Keys are the lowercase
+# canonical names used by observability.TRACKED_SERVICES; the second
+# tuple element is the Slack-rendered label (preserved casing). Order
+# is fixed (2Captcha → Smarty → Tracerfy → LLM) per the plan spec — do
+# NOT sort by per-run value or alphabetize, callers expect a stable
+# visual scan-order across runs.
+_RATE_DISPLAY_ORDER: tuple[tuple[str, str], ...] = (
+    ("2captcha", "2Captcha"),
+    ("smarty", "Smarty"),
+    ("tracerfy", "Tracerfy"),
+    ("llm", "LLM"),
+)
+
+
+def build_funnel_block(
+    pipeline_name: str,
+    gate_counts: dict,
+) -> dict:
+    """Build a Slack Block Kit section for a single pipeline's funnel.
+
+    Renders the gate sequence as a bulleted list with per-gate counts.
+    Iteration order matches the input dict's insertion order — both
+    plain ``dict`` (Python 3.7+ guaranteed) and ``OrderedDict`` work.
+    Pre-seeded zero-count gates render so the operator can tell "all
+    dropped at obit-match" apart from "stage never ran".
+
+    Args:
+        pipeline_name: Human-readable identifier surfaced in the
+            section header (e.g. ``"apn_probate"``, ``"benchmark"``).
+        gate_counts: Mapping of gate name → count. Insertion order
+            preserved in the rendered output (D-01 — per-pipeline gate
+            sequence is sacred).
+
+    Returns:
+        A plain JSON-serialisable dict ready to be appended to a Slack
+        ``blocks`` list. Shape:
+            ``{"type": "section", "text": {"type": "mrkdwn", "text": "..."}}``
+    """
+    lines = [f"*Funnel — {pipeline_name}*"]
+    for gate, count in gate_counts.items():
+        lines.append(f"• {gate}: {count}")
+    return {
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": "\n".join(lines)},
+    }
+
+
+def build_service_rates_block(
+    per_run_rates: dict,
+    rolling_rates: dict,
+) -> dict:
+    """Build a Slack Block Kit section for the 4-service rate panel.
+
+    Renders one line per service in fixed display order (see
+    ``_RATE_DISPLAY_ORDER``) with today's rate and the 7-day rolling
+    rate side-by-side per D-03 ("Smarty: 86% today | 92% 7-day"). A
+    ``None`` per-run rate renders as ``"n/a today"`` (no calls made);
+    a ``None`` rolling rate renders as ``"— 7-day"`` (no historical
+    baseline yet) — both visually distinct from a real 0% rate.
+
+    Args:
+        per_run_rates: Mapping of lowercase service name → float in
+            [0.0, 1.0] OR None. Typically the output of
+            ``ServiceRateTracker.per_run_rates()``.
+        rolling_rates: Same shape as ``per_run_rates``. Typically the
+            output of ``rolling_rates_summary(load_rolling_rates())``.
+
+    Returns:
+        A plain JSON-serialisable dict ready to be appended to a Slack
+        ``blocks`` list.
+    """
+    lines = ["*Service Rates*"]
+    for key, label in _RATE_DISPLAY_ORDER:
+        per_run = per_run_rates.get(key)
+        rolling = rolling_rates.get(key)
+
+        per_run_str = (
+            f"{round(per_run * 100)}% today" if per_run is not None else "n/a today"
+        )
+        rolling_str = (
+            f"{round(rolling * 100)}% 7-day" if rolling is not None else "— 7-day"
+        )
+
+        lines.append(f"• {label}: {per_run_str} | {rolling_str}")
+
+    return {
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": "\n".join(lines)},
+    }
