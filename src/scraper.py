@@ -5,11 +5,15 @@ import logging
 import random
 import re
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 from playwright.async_api import Page, TimeoutError as PwTimeout, async_playwright
 
 from captcha_solver import solve_captcha_and_view
 import config
+
+if TYPE_CHECKING:
+    from observability import ServiceRateTracker
 from config import (
     BASE_URL,
     CAPTCHA_FAILED_IDS_FILE,
@@ -271,6 +275,8 @@ async def _scrape_notice(
     llm_api_key: str | None,
     seen_ids: dict[str, str] | None,
     captcha_failed_ids: dict[str, dict] | None,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
 ) -> NoticeData | None:
     """Navigate to a single DetailsPrint.aspx, solve CAPTCHA, parse notice."""
     # Date cutoff check
@@ -292,7 +298,7 @@ async def _scrape_notice(
             await page.goto(detail_url, wait_until="domcontentloaded", timeout=30_000)
             await delay()
 
-            if not await solve_captcha_and_view(page):
+            if not await solve_captcha_and_view(page, rate_tracker=rate_tracker):
                 logger.warning("  CAPTCHA solve failed for notice %s (attempt %d)", notice_id, attempt)
                 if attempt >= MAX_RETRIES and captcha_failed_ids is not None:
                     captcha_failed_ids[notice_id] = {
@@ -357,6 +363,8 @@ async def run_search(
     seen_ids: dict[str, str] | None = None,
     captcha_failed_ids: dict[str, dict] | None = None,  # reserved: CAPTCHA fallback queue
     snippet_dropped_ids: set[str] | None = None,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
 ) -> list[NoticeData]:
     """Submit search form, paginate through all result pages, scrape each notice."""
     days_back = search.days_back
@@ -458,6 +466,7 @@ async def run_search(
                 llm_api_key,
                 seen_ids,
                 captcha_failed_ids,
+                rate_tracker=rate_tracker,
             )
             if notice is None:
                 continue
@@ -589,6 +598,8 @@ async def scrape_all(
     seen_ids: dict[str, str] | None = None,
     captcha_failed_ids: dict[str, dict] | None = None,
     on_search_complete=None,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
 ) -> list[NoticeData]:
     """Main entry point for scraping Alabama Public Notices.
 
@@ -665,6 +676,7 @@ async def scrape_all(
                     max_notices=remaining, seen_ids=seen_ids,
                     captcha_failed_ids=captcha_failed_ids,
                     snippet_dropped_ids=snippet_dropped_ids,
+                    rate_tracker=rate_tracker,
                 )
                 all_notices.extend(search_notices)
             except Exception:
