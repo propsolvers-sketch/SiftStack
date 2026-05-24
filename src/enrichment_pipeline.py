@@ -16,9 +16,13 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 import config
 from notice_parser import NoticeData
+
+if TYPE_CHECKING:
+    from observability import FunnelCounter, ServiceRateTracker
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +62,16 @@ class PipelineOptions:
 
     # Context label for summary logging
     source_label: str = ""
+
+    # ── Phase 2 observability (OPS-03 / OBS-01) ───────────────────
+    # FunnelCounter is instantiated upstream (main.py for the legacy
+    # daily flow); this pipeline mutates the 6 enrichment-stage gates
+    # (county_filtered → zillow_enriched) AND threads the rate_tracker
+    # into Smarty / LLM call sites added in Wave 2 (plan 02-02).
+    # Defaults None → legacy callers (pdf-import / photo-import /
+    # csv-import) stay byte-identical.
+    funnel: "FunnelCounter | None" = None
+    rate_tracker: "ServiceRateTracker | None" = None
 
 
 # ── Smart detection ──────────────────────────────────────────────────
@@ -375,12 +389,32 @@ def run_enrichment_pipeline(
         f" (removed {removed})" if removed else "",
     )
 
+    # Phase 2 funnel: `county_filtered` gate. The legacy `main.py daily`
+    # flow runs scraper.is_target_county() at scrape time (snippet +
+    # post-CAPTCHA passes), so by the time records reach this pipeline
+    # they're already county-filtered. Stamp the gate from the post-dedup
+    # count so it always appears in the Slack block.
+    if opts.funnel is not None:
+        opts.funnel.set("county_filtered", len(notices))
+
     # ── Step 3: Vacant Land Filter ───────────────────────────────────
     if not opts.skip_vacant_filter:
         logger.info("── Step 3: Vacant Land Filter ──")
         before = len(notices)
         notices = _filter_vacant_land(notices)
         logger.info("  %d records after filter", len(notices))
+
+    # Phase 2 funnel: `parsed` gate — count records that have a
+    # non-empty owner_name after parse/dedup/vacant-filter. The scraper
+    # populates owner_name via regex + LLM; missing values indicate a
+    # parse failure (snippet noise, OCR garbage). Set BEFORE the early
+    # return so the gate always appears.
+    if opts.funnel is not None:
+        opts.funnel.set(
+            "parsed",
+            sum(1 for n in notices if (n.owner_name or "").strip()),
+        )
+
     if not notices:
         logger.warning("No records remaining after filtering")
         return notices
@@ -409,6 +443,16 @@ def run_enrichment_pipeline(
         logger.info("  %d records after filter", len(notices))
     else:
         logger.info("── Step 3b: Entity Owner Filter (skipped) ──")
+
+    # Phase 2 funnel: `tier_gated` gate. The Tier-1/Tier-2 ZIP filter
+    # runs UPSTREAM of this pipeline (in _run_scrape_pipeline before
+    # run_full_pipeline calls in), so survivors here are already
+    # tier-gated. Stamp from current count so the gate appears in the
+    # Slack block. CSV / pdf / photo-import paths typically don't tier-
+    # gate and still get this gate at the post-entity-filter count.
+    if opts.funnel is not None:
+        opts.funnel.set("tier_gated", len(notices))
+
     if not notices:
         logger.warning("No records remaining after filtering")
         return notices
@@ -471,6 +515,18 @@ def run_enrichment_pipeline(
         except Exception as e:
             logger.warning("  AL property enrichment failed: %s", e)
 
+    # Phase 2 funnel: `al_property_enriched` gate — count where the
+    # parcel_id field is non-empty. Fires regardless of whether the
+    # AL enrichment step actually ran (Knox/Blount records won't have
+    # an al_candidates set; their parcel_ids come from the upstream
+    # tax-enricher path). Pass-through preserves the "every gate
+    # always appears" invariant.
+    if opts.funnel is not None:
+        opts.funnel.set(
+            "al_property_enriched",
+            sum(1 for n in notices if (n.parcel_id or "").strip()),
+        )
+
     # ── Step 5: Tax Delinquency ──────────────────────────────────────
     if not opts.skip_tax and not opts.has_tax:
         logger.info("── Step 5: Tax Delinquency Enrichment ──")
@@ -497,7 +553,8 @@ def run_enrichment_pipeline(
                 from address_standardizer import standardize_addresses
 
                 standardize_addresses(
-                    notices, config.SMARTY_AUTH_ID, config.SMARTY_AUTH_TOKEN
+                    notices, config.SMARTY_AUTH_ID, config.SMARTY_AUTH_TOKEN,
+                    rate_tracker=opts.rate_tracker,
                 )
                 confirmed = sum(
                     1 for n in notices if n.dpv_match_code == "Y"
@@ -519,6 +576,15 @@ def run_enrichment_pipeline(
         )
     elif opts.skip_smarty:
         logger.info("── Step 6: Smarty (skipped) ──")
+
+    # Phase 2 funnel: `smarty_standardized` gate — count where Smarty
+    # populated dpv_match_code (any value, indicating USPS responded).
+    # Pass-through when skipped/preserved so the gate always appears.
+    if opts.funnel is not None:
+        opts.funnel.set(
+            "smarty_standardized",
+            sum(1 for n in notices if (n.dpv_match_code or "").strip()),
+        )
 
     # ── Step 6a: Commercial Property Filter ─────────────────────────
     if not opts.skip_commercial_filter:
@@ -543,11 +609,25 @@ def run_enrichment_pipeline(
             try:
                 from address_standardizer import retry_with_geocoded_city
 
-                retry_with_geocoded_city(
-                    notices,
-                    config.SMARTY_AUTH_ID,
-                    config.SMARTY_AUTH_TOKEN,
-                )
+                # retry_with_geocoded_city wraps a re-run of standardize_addresses
+                # internally; whether it accepts rate_tracker depends on the
+                # build. Try the kwarg first, fall back to legacy positional
+                # signature so this stays backward-compatible with older
+                # address_standardizer builds during the Phase 2 rollout.
+                try:
+                    retry_with_geocoded_city(
+                        notices,
+                        config.SMARTY_AUTH_ID,
+                        config.SMARTY_AUTH_TOKEN,
+                        rate_tracker=opts.rate_tracker,
+                    )
+                except TypeError:
+                    # Older builds without the rate_tracker kwarg.
+                    retry_with_geocoded_city(
+                        notices,
+                        config.SMARTY_AUTH_ID,
+                        config.SMARTY_AUTH_TOKEN,
+                    )
             except ImportError:
                 pass  # Function may not exist in older builds
             except Exception as e:
@@ -586,6 +666,15 @@ def run_enrichment_pipeline(
         )
     elif opts.skip_zillow:
         logger.info("── Step 8: Zillow (skipped) ──")
+
+    # Phase 2 funnel: `zillow_enriched` gate — count where Zillow
+    # populated estimated_value. Pass-through when skipped/preserved
+    # so the gate always appears in the Slack block.
+    if opts.funnel is not None:
+        opts.funnel.set(
+            "zillow_enriched",
+            sum(1 for n in notices if (n.estimated_value or "").strip()),
+        )
 
     # ── Step 9: Obituary Enrichment ──────────────────────────────────
     if not opts.skip_obituary and not opts.has_obituary:

@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from notice_parser import NoticeData
+    from observability import FunnelCounter, ServiceRateTracker
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,16 @@ class PostScrapeOptions:
 
     # ── Labels ────────────────────────────────────────────────────
     source_label: str = ""
+
+    # ── Phase 2 observability (OPS-03 / OBS-01) ───────────────────
+    # FunnelCounter + ServiceRateTracker are instantiated by the caller
+    # (main.py for the legacy daily flow) and threaded down so the same
+    # instances are mutated across full_pipeline (tracerfy_matched) and
+    # enrichment_pipeline (county_filtered → zillow_enriched). Defaults
+    # are None → legacy callers (csv-import, pdf-import, photo-import)
+    # remain byte-identical.
+    funnel: "FunnelCounter | None" = None
+    rate_tracker: "ServiceRateTracker | None" = None
 
 
 @dataclass
@@ -152,6 +163,12 @@ def run_full_pipeline(
         skip_dm_address=opts.skip_dm_address,
         tracerfy_tier1=opts.tracerfy_tier1,
         source_label=opts.source_label,
+        # Phase 2: forward FunnelCounter + ServiceRateTracker so
+        # run_enrichment_pipeline can stamp the 6 enrichment-stage gates
+        # (county_filtered → zillow_enriched) AND thread the tracker
+        # into Smarty / LLM call sites.
+        funnel=opts.funnel,
+        rate_tracker=opts.rate_tracker,
     )
     notices = run_enrichment_pipeline(notices, pipeline_opts)
     result.notices = notices
@@ -172,7 +189,7 @@ def run_full_pipeline(
     if not opts.skip_tracerfy and cfg.TRACERFY_API_KEY and tracerfy_target:
         try:
             from tracerfy_skip_tracer import batch_skip_trace
-            stats = batch_skip_trace(tracerfy_target)
+            stats = batch_skip_trace(tracerfy_target, rate_tracker=opts.rate_tracker)
             result.tracerfy_stats = stats
             if stats.get("credits_exhausted"):
                 logger.error(
@@ -185,10 +202,22 @@ def run_full_pipeline(
                 stats.get("phones_found", 0), stats.get("emails_found", 0),
                 stats.get("cost", 0.0),
             )
+            if opts.funnel is not None:
+                opts.funnel.set("tracerfy_matched", int(stats.get("matched", 0)))
         except Exception as e:
             logger.warning("Tracerfy skip trace failed: %s — continuing", e)
+            # Stage exception → zero-fill the gate so it always appears
+            # in the Slack block (D-01 invariant).
+            if opts.funnel is not None:
+                opts.funnel.set("tracerfy_matched", 0)
     elif not opts.skip_tracerfy and not cfg.TRACERFY_API_KEY:
         logger.info("Tracerfy skipped — TRACERFY_API_KEY not configured")
+        if opts.funnel is not None:
+            opts.funnel.set("tracerfy_matched", 0)
+    elif opts.skip_tracerfy or not tracerfy_target:
+        # skip_tracerfy=True OR no eligible candidates → zero-fill the gate.
+        if opts.funnel is not None:
+            opts.funnel.set("tracerfy_matched", 0)
 
     # DP candidates kept for downstream report generator only (it generates
     # deep-prospecting PDFs for deceased / heir / DM records specifically).
