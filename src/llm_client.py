@@ -10,10 +10,53 @@ Backend selection: LLM_BACKEND env var or config.LLM_BACKEND.
 import json
 import logging
 import re
+from typing import TYPE_CHECKING
 
 import config as cfg
 
+if TYPE_CHECKING:
+    from observability import ServiceRateTracker
+
 logger = logging.getLogger(__name__)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────
+
+
+def _record_and_validate(
+    parsed: dict | None,
+    *,
+    rate_tracker: "ServiceRateTracker | None",
+    required_keys: tuple[str, ...] | None,
+) -> dict | None:
+    """Emit exactly ONE record() call per LLM invocation and validate keys.
+
+    Per CONTEXT.md D-04 (LLM success semantics):
+      - success = parsed is not None AND (required_keys is None OR every
+        required key is present in parsed)
+      - failure = parsed is None (parse error / HTTP error already turned
+        the backend's return into None) OR a required key is missing
+
+    Returns the original parsed dict when valid, OR None when invalid
+    (so callers see the same return-None contract as the legacy code).
+    """
+    if parsed is None:
+        if rate_tracker is not None:
+            rate_tracker.record("llm", False)
+        return None
+
+    if required_keys is not None:
+        missing = [k for k in required_keys if k not in parsed]
+        if missing:
+            if rate_tracker is not None:
+                rate_tracker.record("llm", False)
+            logger.warning("LLM response missing required keys: %s", missing)
+            return None
+
+    if rate_tracker is not None:
+        rate_tracker.record("llm", True)
+    return parsed
+
 
 # ── Backend dispatch ──────────────────────────────────────────────────
 
@@ -23,18 +66,32 @@ def chat_json(
     system: str = "",
     max_tokens: int = 1024,
     api_key: str | None = None,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
+    required_keys: tuple[str, ...] | None = None,
 ) -> dict | None:
     """Send prompt, get parsed JSON response. Routes to configured backend.
 
-    Returns parsed dict on success, None on failure.
+    Per CONTEXT.md D-04, when ``rate_tracker`` is supplied this records
+    exactly ONE outcome per call (success if parsed AND all required_keys
+    present, failure otherwise). ``required_keys`` is per-call-site —
+    callers (e.g. ``llm_parser.extract_with_llm``) pass the per-prompt
+    expected-keys tuple so the rate reflects "extraction returned what we
+    asked for" rather than "raw HTTP 200".
+
+    Returns parsed dict on success, None on failure (parse error, HTTP
+    error, or missing required key).
     """
     backend = getattr(cfg, "LLM_BACKEND", "anthropic")
     if backend == "ollama":
-        return _chat_ollama(prompt, system, max_tokens)
+        parsed = _chat_ollama(prompt, system, max_tokens)
     elif backend == "openrouter":
-        return _chat_openrouter(prompt, system, max_tokens)
+        parsed = _chat_openrouter(prompt, system, max_tokens)
     else:
-        return _chat_anthropic(prompt, system, max_tokens, api_key)
+        parsed = _chat_anthropic(prompt, system, max_tokens, api_key)
+    return _record_and_validate(
+        parsed, rate_tracker=rate_tracker, required_keys=required_keys,
+    )
 
 
 def chat_json_async(
@@ -42,16 +99,29 @@ def chat_json_async(
     system: str = "",
     max_tokens: int = 1024,
     api_key: str | None = None,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
+    required_keys: tuple[str, ...] | None = None,
 ):
-    """Async version — returns a coroutine. For llm_parser.py compatibility."""
-    import asyncio
+    """Async version — returns a coroutine. For llm_parser.py compatibility.
+
+    Identical instrumentation semantics to ``chat_json`` (see docstring).
+    """
     backend = getattr(cfg, "LLM_BACKEND", "anthropic")
     if backend == "ollama":
-        return _chat_ollama_async(prompt, system, max_tokens)
+        coro = _chat_ollama_async(prompt, system, max_tokens)
     elif backend == "openrouter":
-        return _chat_openrouter_async(prompt, system, max_tokens)
+        coro = _chat_openrouter_async(prompt, system, max_tokens)
     else:
-        return _chat_anthropic_async(prompt, system, max_tokens, api_key)
+        coro = _chat_anthropic_async(prompt, system, max_tokens, api_key)
+
+    async def _wrap():
+        parsed = await coro
+        return _record_and_validate(
+            parsed, rate_tracker=rate_tracker, required_keys=required_keys,
+        )
+
+    return _wrap()
 
 
 # ── Anthropic backend ────────────────────────────────────────────────
