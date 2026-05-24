@@ -9,10 +9,10 @@ See: .planning/PROJECT.md (updated 2026-05-23)
 
 ## Current Position
 
-Phase: 2 of 5 (Funnel Transparency)
-Plan: 2 of 5 in current phase (Wave 1 + Wave 2 ✅)
-Status: Wave 2 done — ready to execute Wave 3 (parallel: 02-03, 02-04, 02-05)
-Last activity: 2026-05-24 — Phase 2 Wave 2 complete: plan 02-02 shipped via 8 TDD commits (4 RED → 4 GREEN pairs). 4 services instrumented additively via `rate_tracker: ServiceRateTracker | None = None` kwarg on each entry point — 2Captcha (captcha_solver), Smarty (address_standardizer + Madison/Marshall wrappers), LLM (llm_client + llm_parser, per-prompt required_keys), Tracerfy (tracerfy_skip_tracer batch). All failure semantics match CONTEXT.md D-04 verbatim. 91 tests pass (+18 new instrumentation tests), 1 documented skip. Bonus: stale TN → AL docstring fix in captcha_solver.py.
+Phase: 2 of 5 (Funnel Transparency) — ✅ Complete (status: partial — 3/4 SCs + 1 documented deferral)
+Plan: 5 of 5 in current phase
+Status: Verified (ready for Phase 3)
+Last activity: 2026-05-24 — Phase 2 complete: 5 plans executed across 3 waves, 110 tests pass + 1 documented skip. All 6 pipelines (main_daily 10g, apn_probate 6g, pre_probate 9g, benchmark 6g, tax_distress 5g, code_violation 3g) wired with FunnelCounter + ServiceRateTracker via additive kwargs. Each pipeline emits one Slack message (summary + funnel block + service-rates block) per CONTEXT.md D-02. Today's per-run rate + 7-day rolling baseline rendered side-by-side per D-03. SC-4 (yellow-warning alert thresholds) intentionally deferred per CONTEXT.md D-04 ("Phase 2 emits numbers; humans decide what's bad") — substrate is in place, threshold logic is a Phase 5+ enhancement.
 
 Phase 1 closeout summary: 4 plans, 35 tests pass + 1 documented skip, verification status: passed (5/5 success criteria), zero production source modified — fixes were already in place.
 
@@ -30,7 +30,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 1. Stabilize Production | 4/4 ✅ | ~25 min | ~6 min |
-| 2. Funnel Transparency | 0/5 (planned) | — | — |
+| 2. Funnel Transparency | 5/5 ✅ | ~3h | ~36 min |
 
 **Recent Trend:**
 - Last 5 plans: (none yet — v1.1 milestone just initialized)
@@ -62,6 +62,8 @@ None yet.
 - Tier ZIP defs in 2 places (`src/target_zips.py` + REI Skill Library MD analysis docs) — manual sync risk; carry forward as recurring hygiene concern.
 - 4,246-line `datasift_uploader.py` + 1,905-line `main.py` are tech-debt monoliths deferred to v2 (REFAC-03 / REFAC-05).
 - Tesseract is not in Dockerfile; `photo-import` / `pdf-import` will fail on Apify. Daily scrape unaffected; v2 fix (REFAC-06).
+- Phase 2 deferred to Phase 3: `apn_probate_pipeline_al.run_pipeline` doesn't yet pass `rate_tracker` into `scrape_all` (stale inline TODO); `code_violation_pipeline.py` has no rate_tracker threads (adapters use internal property API paths, not the instrumented `address_standardizer`). Pure-single-pipeline CLI runs render "n/a today" for affected services. main.py daily path is wired correctly. Resolve when Phase 3 consolidates.
+- Phase 3 service-rate merge must sum `tracker.totals()` across pipelines BEFORE deriving per-run rate (don't average per-pipeline rates). `save_rolling_rates` should be called once per day, not 6 times.
 
 ### Quick Tasks Completed
 

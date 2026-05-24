@@ -19,7 +19,7 @@ The v1.1 milestone resolves three coupled problems: (1) Apify daily runs are dea
 - Decimal phases (2.1, 2.2): Urgent insertions
 
 - [x] **Phase 1: Stabilize Production** - Fix the 3 silent bugs + parser gap blocking quality and Apify cold-start ✅ Verified 2026-05-24 (35 tests, 1 skip)
-- [ ] **Phase 2: Funnel Transparency** - Per-gate drop counts on every run + per-service success-rate metric on Slack
+- [x] **Phase 2: Funnel Transparency** - Per-gate drop counts on every run + per-service success-rate metric on Slack ✅ Verified 2026-05-24 (110 tests, 1 skip; SC-4 alert thresholds deferred to Phase 5+ per CONTEXT.md D-04)
 - [ ] **Phase 3: Unified Daily Scheduler** - One scheduled invocation runs all 5 pipelines + emits one consolidated Slack post
 - [ ] **Phase 4: Close Known Coverage Gaps** - Madison probate bonds, pre-probate partner-site fetch, Huntsville FOIA adapter, Marshall tax back-fill
 - [ ] **Phase 5: Verify Coverage Quality** - Ground-truth precision check + vacancy enrichment to tighten lead score
