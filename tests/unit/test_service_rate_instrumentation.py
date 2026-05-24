@@ -27,6 +27,17 @@ from observability import ServiceRateTracker
 # ── 2Captcha ───────────────────────────────────────────────────────────
 
 
+def _make_awaitable_button() -> MagicMock:
+    """Build a view-button mock whose ``click()`` is an awaitable coroutine."""
+    btn = MagicMock()
+
+    async def _click():
+        return None
+
+    btn.click = _click
+    return btn
+
+
 def _build_mock_captcha_page(
     *,
     has_view_button: bool = True,
@@ -34,41 +45,42 @@ def _build_mock_captcha_page(
 ) -> MagicMock:
     """Build a Playwright Page mock for the captcha solve flow.
 
-    The flow inside ``solve_captcha_and_view``:
-      1. Check for IP block (None → not blocked)
-      2. Check for already-visible content (None → still needs solve)
-      3. wait_for_selector(view button) → returns truthy on success
-      4. After solve + click, query_selector('Notice Content') → truthy
+    The captcha_solver flow makes these calls per attempt (in order):
+      1. query_selector('not permitted') — IP-block check → None
+      2. query_selector('Notice Content') — pre-solve check → None
+      3. wait_for_selector(view button, timeout=15000) — confirm detail page
+      4. solver.recaptcha() — issued via patched TwoCaptcha (not on page)
+      5. page.evaluate(injection JS) → None
+      6. query_selector(view button) — re-find for click → truthy
+      7. view_btn.click() — must be awaitable
+      8. page.wait_for_load_state('networkidle') → None
+      9. query_selector('Notice Content') — post-solve check → truthy on success
+     10. (only on failure) query_selector('complete the reCAPTCHA') → None
     """
     page = MagicMock()
     page.url = "https://alabamapublicnotices.com/Details.aspx?id=1"
+    page._content_query_count = 0
 
     async def query_selector(sel):
         if "not permitted" in sel:
             return None
         if "Notice Content" in sel:
-            # First pre-solve check: not visible; after solve: visible.
-            page._content_query_count = getattr(page, "_content_query_count", 0) + 1
+            # First call: pre-solve check (always None — we need a solve).
+            # Subsequent calls: per-attempt post-solve check (truthy when
+            # the solve succeeded, None when it failed).
+            page._content_query_count += 1
             if page._content_query_count == 1:
-                return None  # pre-solve check
-            if content_visible_after_solve:
-                return MagicMock()
-            return None
+                return None
+            return _make_awaitable_button() if content_visible_after_solve else None
         if "complete the reCAPTCHA" in sel:
             return None
-        # View Notice button on re-query (after token inject)
-        return MagicMock() if has_view_button else None
+        # SEL_VIEW_NOTICE_BUTTON re-query after token inject — return an
+        # awaitable-click button so the post-inject click() works.
+        return _make_awaitable_button() if has_view_button else None
 
     async def wait_for_selector(sel, timeout=15000):
         if has_view_button:
-            btn = MagicMock()
-
-            async def click():
-                return None
-
-            btn.click = click
-            return btn
-        # Simulate timeout
+            return _make_awaitable_button()
         from playwright.async_api import TimeoutError as PwTimeout
         raise PwTimeout("View Notice button not found")
 
