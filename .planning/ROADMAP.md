@@ -61,7 +61,7 @@ v1.0 is the operational baseline as of 2026-05-23. See `.planning/REQUIREMENTS.m
   2. User can audit any per-run conversion drop visually in the Slack summary without re-running anything
   3. Per-service success-rate metric appears in the daily Slack report for 2Captcha solve rate, Smarty hit rate, Tracerfy match rate, and LLM extraction success rate
   4. When 2Captcha drops from 99% → 80% solve rate (or any service degrades), the daily Slack post surfaces it as a yellow warning before the next run silently breaks
-**Plans**: TBD
+**Plans**: 5 — `02-01-PLAN.md` (Wave 1, observability foundation), `02-02-PLAN.md` (Wave 2, per-service instrumentation), then parallel Wave 3: `02-03-PLAN.md` (apn_probate + pre_probate + _send_blocks_webhook), `02-04-PLAN.md` (main.py + full_pipeline + enrichment + benchmark), `02-05-PLAN.md` (tax_distress + code_violation)
 
 ### Phase 3: Unified Daily Scheduler
 **Goal**: Replace per-pipeline manual invocation with a single scheduled daily entry point that runs all 5 pipelines + Marshall coverage and emits one consolidated Slack post for all DataSift leads.
