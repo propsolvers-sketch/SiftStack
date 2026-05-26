@@ -1,0 +1,32 @@
+{
+  "source_path": "/Users/shanismith/Desktop/SiftStack/README.md",
+  "type": "DOC",
+  "confidence": "high",
+  "manifest_override": true,
+  "title": "SiftStack",
+  "summary": "Project README for SiftStack — full-stack REI operations platform integrating multi-source data acquisition, 10-step enrichment pipeline, and DataSift.ai CRM automation.",
+  "scope": [
+    "SiftStack platform overview",
+    "DataSift.ai integration",
+    "Data intake methods (web scrape, PDF, photo, Dropbox, CSV)",
+    "10-step enrichment pipeline",
+    "Deal analysis CLI tools",
+    "Buy box configuration flags",
+    "API configuration and cost estimates",
+    "Apify cloud deployment",
+    "Architecture (src/ module map)",
+    "Notice types supported",
+    "REI Skill Library distribution"
+  ],
+  "cross_refs": [
+    "LICENSE",
+    ".env.example",
+    "src/main.py",
+    "src/config.py",
+    "src/tax_enricher.py",
+    "src/notice_parser.py"
+  ],
+  "locked": false,
+  "precedence": 1,
+  "notes": ""
+}

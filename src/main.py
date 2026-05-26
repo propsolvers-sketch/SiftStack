@@ -20,9 +20,91 @@ from config import (
     SavedSearch,
 )
 from data_formatter import write_csv, write_csv_by_type
+from observability import (
+    FunnelCounter,
+    ServiceRateTracker,
+    load_rolling_rates,
+    rolling_rates_summary,
+    save_rolling_rates,
+)
 from scraper import scrape_all
+from slack_notifier import (
+    _send_blocks_webhook,
+    build_funnel_block,
+    build_service_rates_block,
+    build_summary,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# ── Phase 2: daily-flow gate sequence (CONTEXT.md D-01) ─────────────
+# Single source of truth so the Apify Actor and CLI paths instantiate
+# the same 10-gate sequence in the same order. Each owning file in
+# the daily pipeline mutates a subset of these — see the 02-04 plan's
+# ownership map for which file stamps which gate.
+MAIN_DAILY_GATES: tuple[str, ...] = (
+    "scraped",
+    "seen_ids_deduped",
+    "county_filtered",
+    "parsed",
+    "tier_gated",
+    "al_property_enriched",
+    "smarty_standardized",
+    "zillow_enriched",
+    "tracerfy_matched",
+    "datasift_uploaded",
+)
+
+
+def _post_daily_slack_with_funnel(
+    notices: list,
+    funnel: FunnelCounter,
+    rate_tracker: ServiceRateTracker,
+    *,
+    elapsed_min: float = 0,
+    cost_breakdown: dict | None = None,
+    upload_result: dict | None = None,
+    webhook_url: str | None = None,
+) -> bool:
+    """Phase 2: post the legacy daily summary + funnel + service-rates blocks.
+
+    Honours the Wave 3 contract:
+      - D-02 (one message): a single _send_blocks_webhook POST carrying
+        the existing summary text + funnel block + service-rates block.
+      - D-03 (rolling-rates ordering): load_rolling_rates BEFORE the
+        blocks build (so today's post shows the PRIOR-days baseline),
+        save_rolling_rates AFTER a successful send (so today's totals
+        advance the window for tomorrow).
+      - W6 (failed sends don't pollute the baseline): save_rolling_rates
+        is guarded behind ``if sent``.
+      - W5 (legacy text path stays byte-identical): send_slack_notification
+        is NOT called from this path — the existing daily summary text
+        is built via slack_notifier.build_summary and posted via
+        _send_blocks_webhook directly.
+
+    Returns True on a successful Slack POST. False on any error (the
+    caller already swallows exceptions further up).
+    """
+    text = build_summary(
+        notices,
+        upload_result=upload_result,
+        elapsed_min=elapsed_min,
+        cost_breakdown=cost_breakdown,
+    )
+
+    rolling = rolling_rates_summary(load_rolling_rates())
+    per_run = rate_tracker.per_run_rates()
+
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+        build_funnel_block(funnel.pipeline_name, funnel.as_ordered_dict()),
+        build_service_rates_block(per_run, rolling),
+    ]
+    sent = _send_blocks_webhook(text, blocks, webhook_url=webhook_url)
+    if sent:
+        save_rolling_rates(rate_tracker.totals())
+    return sent
 
 
 # ── Shared helpers ────────────────────────────────────────────────────
@@ -311,6 +393,12 @@ async def actor_main() -> None:
                 except Exception as e:
                     Actor.log.warning("Failed to persist seen_notice_ids to KVS: %s", e)
 
+            # ── Phase 2: instantiate FunnelCounter + ServiceRateTracker
+            # ── before scrape so all 4 services route through the same
+            # ── tracker, and all 10 gates stamp into the same funnel.
+            funnel = FunnelCounter("main_daily", gates=list(MAIN_DAILY_GATES))
+            rate_tracker = ServiceRateTracker()
+
             # ── Scrape ────────────────────────────────────────────────
             notices = await scrape_all(
                 mode=mode, searches=searches, proxy_url=proxy_url, on_batch=push_batch,
@@ -319,7 +407,15 @@ async def actor_main() -> None:
                 start_page=start_page,
                 seen_ids=seen_ids,
                 on_search_complete=persist_seen_ids,
+                rate_tracker=rate_tracker,
             )
+            # Phase 2 funnel: scraped + seen_ids_deduped both take the
+            # same count because the scraper applies seen_ids dedup
+            # internally — the returned list is the post-dedup survivor
+            # set. If a pre-dedup count becomes accessible from scrape_all
+            # stats in a future build, swap "scraped" to that value.
+            funnel.set("scraped", len(notices))
+            funnel.set("seen_ids_deduped", len(notices))
             # Handle async probate lookup before pipeline (requires await)
             probate_notices = [n for n in notices if n.notice_type == "probate" and n.decedent_name and not n.address]
             if probate_notices:
@@ -346,6 +442,11 @@ async def actor_main() -> None:
                 skip_tracerfy=not do_tracerfy,
                 tracerfy_dp_only=True,    # Apify: cost control — DP candidates only
                 source_label="Apify Actor",
+                # Phase 2: thread funnel + rate_tracker so
+                # full_pipeline / enrichment_pipeline stamp gates and
+                # service callers route into the same tracker.
+                funnel=funnel,
+                rate_tracker=rate_tracker,
             )
             result = run_full_pipeline(notices, opts)
             notices = result.notices
@@ -375,6 +476,9 @@ async def actor_main() -> None:
 
             # ── Write master CSV + upload to KVS ──────────────────────
             csv_path = write_csv(notices)
+            # Phase 2 funnel: datasift_uploaded gate fires after CSV write
+            # so the Slack block reflects the count actually written.
+            funnel.set("datasift_uploaded", len(notices))
             if not kvs:
                 kvs = await Actor.open_key_value_store()
             with open(csv_path, "rb") as f:
@@ -453,11 +557,19 @@ async def actor_main() -> None:
 
             if do_notify_slack and config.SLACK_WEBHOOK_URL:
                 try:
-                    from slack_notifier import send_slack_notification, _send_webhook
+                    from slack_notifier import _send_webhook
 
-                    # Send standard run summary with cost breakdown
-                    send_slack_notification(
+                    # Phase 2: post the daily summary + funnel block +
+                    # service-rates block in ONE Block Kit message (D-02:
+                    # one message, more content). Rolling-rates ordering
+                    # (D-03) and save-on-success-only (W6) are enforced
+                    # inside the helper. The legacy text-only
+                    # send_slack_notification path stays byte-identical
+                    # for any caller that still uses it (W5).
+                    _post_daily_slack_with_funnel(
                         notices,
+                        funnel,
+                        rate_tracker,
                         elapsed_min=elapsed_min,
                         cost_breakdown=cost_breakdown,
                     )
@@ -492,6 +604,13 @@ async def actor_main() -> None:
             Actor.log.info(
                 "Saved last_run_date + %d seen_notice_ids to KVS for next daily run",
                 len(seen_ids),
+            )
+
+            # D-04 — terminal mirrors Slack: always log the funnel at
+            # end-of-run regardless of whether --notify-slack was set.
+            logger.info(
+                "Funnel (%s): %s",
+                funnel.pipeline_name, dict(funnel.as_ordered_dict()),
             )
 
             Actor.log.info("Done — %d notices exported (%.1f min)", total, elapsed_min)
@@ -996,7 +1115,7 @@ def cli_main() -> None:
     parser.add_argument(
         "--no-raw-csv",
         action="store_true",
-        help="Skip the legacy raw `tn_notices_<ts>.csv` export. The DataSift "
+        help="Skip the legacy raw `al_notices_<ts>.csv` export. The DataSift "
              "upload CSVs (datasift_upload_DMs_*.csv / _Heirs_*.csv) are "
              "produced regardless. Use this flag for daily workflows where "
              "you only need the DataSift uploads and want fewer output files.",
@@ -1685,13 +1804,26 @@ def _run_scrape_pipeline(args, searches) -> None:
     """
     from full_pipeline import PostScrapeOptions, run_full_pipeline
 
+    # ── Phase 2: instantiate FunnelCounter + ServiceRateTracker
+    # ── BEFORE scrape so the captcha rate (and downstream Smarty /
+    # ── LLM / Tracerfy rates) route into the same tracker, and all
+    # ── 10 gates stamp into the same funnel.
+    funnel = FunnelCounter("main_daily", gates=list(MAIN_DAILY_GATES))
+    rate_tracker = ServiceRateTracker()
+
     # ── Scrape ────────────────────────────────────────────────────
     notices = asyncio.run(scrape_all(
         mode=args.mode, searches=searches,
         llm_api_key=config.ANTHROPIC_API_KEY or None,
         since_date_override=args.since,
         max_notices=args.max_notices,
+        rate_tracker=rate_tracker,
     ))
+    # Phase 2 funnel: scraped + seen_ids_deduped both take the same
+    # count — the scraper's internal seen_ids dedup is already applied
+    # to the returned list.
+    funnel.set("scraped", len(notices))
+    funnel.set("seen_ids_deduped", len(notices))
 
     # ── Probate property lookup (async; CLI uses asyncio.run) ─────
     probate_notices = [
@@ -1759,6 +1891,12 @@ def _run_scrape_pipeline(args, searches) -> None:
         tracerfy_dp_only=False,    # CLI: trace ALL records (not just DP candidates)
         tracerfy_tier1=getattr(args, "tracerfy_tier1", False),
         source_label=f"CLI {args.mode}",
+        # Phase 2: thread funnel + rate_tracker so the shared post-
+        # scrape pipeline stamps the 6 enrichment-stage gates +
+        # tracerfy_matched and instruments the Smarty / LLM / Tracerfy
+        # call sites.
+        funnel=funnel,
+        rate_tracker=rate_tracker,
     )
     result = run_full_pipeline(notices, opts)
     notices = result.notices
@@ -1782,7 +1920,11 @@ def _run_scrape_pipeline(args, searches) -> None:
     elif not getattr(args, "no_raw_csv", False):
         logging.info("Output: %s", write_csv(notices))
     else:
-        logging.debug("Skipping raw tn_notices CSV (--no-raw-csv set)")
+        logging.debug("Skipping raw al_notices CSV (--no-raw-csv set)")
+    # Phase 2 funnel: datasift_uploaded gate stamps from the surviving
+    # notice count after CSV write. CLI mode is symmetric with Apify on
+    # this gate — both stamp from len(notices) post-CSV.
+    funnel.set("datasift_uploaded", len(notices))
 
     # ── DataSift Playwright upload (CLI-only) ─────────────────────
     upload_result = None
@@ -1822,10 +1964,25 @@ def _run_scrape_pipeline(args, searches) -> None:
         else:
             logging.error("DataSift upload failed: %s", upload_result.get("message"))
 
-    # ── Slack/Discord notification ────────────────────────────────
+    # ── Slack/Discord notification (Phase 2: blocks-aware) ────────
+    # Posts the legacy summary + funnel block + service-rates block in
+    # a single Block Kit message per D-02. send_slack_notification is
+    # NOT called from this path; the legacy text helper stays
+    # byte-identical for callers that still use it directly (W5).
     if getattr(args, "notify_slack", False):
-        from slack_notifier import send_slack_notification
-        send_slack_notification(notices, upload_result=upload_result)
+        _post_daily_slack_with_funnel(
+            notices,
+            funnel,
+            rate_tracker,
+            upload_result=upload_result,
+        )
+
+    # D-04 — terminal mirrors Slack: always log the funnel at end-of-run
+    # regardless of whether --notify-slack is set.
+    logger.info(
+        "Funnel (%s): %s",
+        funnel.pipeline_name, dict(funnel.as_ordered_dict()),
+    )
 
     # Audit DataSift for incomplete records (future daily check)
     if getattr(args, "audit_records", False):

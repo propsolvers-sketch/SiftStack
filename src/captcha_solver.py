@@ -1,7 +1,8 @@
-"""2Captcha integration for solving reCAPTCHA v2 on tnpublicnotice.com.
+"""2Captcha integration for solving reCAPTCHA v2 on alabamapublicnotices.com.
 
-Every notice detail page (Details.aspx) requires solving a reCAPTCHA v2
-checkbox before the full notice text is revealed.  Flow:
+Every notice detail page (Details.aspx) on alabamapublicnotices.com (Jefferson,
+Madison, Marshall — the active AL pipelines) requires solving a reCAPTCHA v2
+checkbox before the full notice text is revealed. Flow:
   1. Verify we're on the detail page (View Notice button exists)
   2. Send websiteURL + sitekey to 2Captcha API
   3. 2Captcha returns a g-recaptcha-response token (~10-30s)
@@ -12,6 +13,7 @@ checkbox before the full notice text is revealed.  Flow:
 
 import asyncio
 import logging
+from typing import TYPE_CHECKING
 
 from playwright.async_api import Page, TimeoutError as PwTimeout
 from twocaptcha import TwoCaptcha
@@ -19,14 +21,29 @@ from twocaptcha import TwoCaptcha
 import config
 from config import MAX_RETRIES, RECAPTCHA_SITEKEY, SEL_VIEW_NOTICE_BUTTON
 
+if TYPE_CHECKING:
+    from observability import ServiceRateTracker
+
 logger = logging.getLogger(__name__)
 
 
-async def solve_captcha_and_view(page: Page) -> bool:
+async def solve_captcha_and_view(
+    page: Page,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
+) -> bool:
     """Solve reCAPTCHA v2 and click View Notice to reveal the full text.
 
     Retries up to MAX_RETRIES times on failure.
     Returns True if the notice text is now visible, False otherwise.
+
+    Per CONTEXT.md D-04 (2Captcha success semantics):
+      - success = solved on any of the 3 attempts (View Notice button cleared
+        the gate)
+      - failure = exhausted MAX_RETRIES without clearing the gate
+      - IP-block bailout is NOT a 2Captcha failure (no record() call)
+      - "Content already visible — no CAPTCHA needed" path is NOT a 2Captcha
+        call either (no record() call) — the service was never invoked
     """
     if not config.CAPTCHA_API_KEY:
         logger.error("CAPTCHA_API_KEY not set — cannot solve CAPTCHA")
@@ -124,6 +141,8 @@ async def solve_captcha_and_view(page: Page) -> bool:
                 content_el = await page.query_selector("text='Notice Content'")
                 if content_el:
                     logger.warning("CAPTCHA solved — callback auto-submitted form")
+                    if rate_tracker is not None:
+                        rate_tracker.record("2captcha", True)
                     return True
                 logger.warning("View Notice button gone after token inject (attempt %d)", attempt)
                 continue
@@ -135,6 +154,8 @@ async def solve_captcha_and_view(page: Page) -> bool:
             content_el = await page.query_selector("text='Notice Content'")
             if content_el:
                 logger.warning("CAPTCHA solved — notice text visible")
+                if rate_tracker is not None:
+                    rate_tracker.record("2captcha", True)
                 return True
 
             # Fallback: check if CAPTCHA message is gone
@@ -143,6 +164,8 @@ async def solve_captcha_and_view(page: Page) -> bool:
             )
             if not captcha_msg:
                 logger.warning("CAPTCHA solved — gate cleared")
+                if rate_tracker is not None:
+                    rate_tracker.record("2captcha", True)
                 return True
 
             logger.warning("CAPTCHA still present after attempt %d", attempt)
@@ -151,4 +174,6 @@ async def solve_captcha_and_view(page: Page) -> bool:
             logger.exception("CAPTCHA solve error (attempt %d/%d)", attempt, MAX_RETRIES)
 
     logger.error("All %d CAPTCHA attempts failed for %s", MAX_RETRIES, page_url)
+    if rate_tracker is not None:
+        rate_tracker.record("2captcha", False)
     return False

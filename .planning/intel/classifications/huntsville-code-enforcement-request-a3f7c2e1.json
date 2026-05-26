@@ -1,0 +1,27 @@
+{
+  "source_path": "/Users/shanismith/Desktop/SiftStack/docs/foia/huntsville_code_enforcement_request.md",
+  "type": "DOC",
+  "confidence": "high",
+  "manifest_override": true,
+  "title": "Huntsville Code Enforcement — Public Records Request",
+  "summary": "Copy-paste-ready Alabama Open Records Act request letter for monthly Huntsville code-enforcement case exports to close the Madison soft-violation coverage gap.",
+  "scope": [
+    "Huntsville Community Development",
+    "Huntsville Code Enforcement Division",
+    "Alabama Open Records Act FOIA template",
+    "Madison County code-violation pipeline gap-closure",
+    "huntsville_code_violations_api adapter integration plan",
+    "DataSift early_distress tag strategy"
+  ],
+  "cross_refs": [
+    "birmingham_code_enforcement_api.py",
+    "huntsville_code_violations_api.py",
+    "dropbox_watcher.py",
+    "code_violation_pipeline.py",
+    "madison_property_api.search_by_situs_address()",
+    "BirminghamEnforcementRecord"
+  ],
+  "locked": false,
+  "precedence": 2,
+  "notes": ""
+}

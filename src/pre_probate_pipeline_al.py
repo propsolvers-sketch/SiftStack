@@ -52,6 +52,13 @@ from benchmark_obituary_match import (
 )
 from benchmark_pipeline_al import _promote_heir_contacts_to_csv_slots
 from notice_parser import NoticeData, _split_decedent_name, _split_owner_name
+from observability import (
+    FunnelCounter,
+    ServiceRateTracker,
+    load_rolling_rates,
+    rolling_rates_summary,
+    save_rolling_rates,
+)
 from obituary_enricher import (
     SYSTEM_PROMPT,
     _fetch_page_text,
@@ -68,6 +75,11 @@ from probate_property_locator import (
     _search_jefferson,
     _search_madison,
     _search_marshall,
+)
+from slack_notifier import (
+    _send_blocks_webhook,
+    build_funnel_block,
+    build_service_rates_block,
 )
 from target_zips import zip_tier_county
 
@@ -312,15 +324,29 @@ class DecedentExtraction:
 def _extract_decedent_with_llm(
     obituary_text: str,
     api_key: str | None = None,
+    *,
+    rate_tracker: ServiceRateTracker | None = None,
 ) -> Optional[DecedentExtraction]:
-    """Call Claude Haiku on a single obituary page and return parsed result."""
+    """Call Claude Haiku on a single obituary page and return parsed result.
+
+    The ``rate_tracker`` kwarg threads through to ``llm_client.chat_json``
+    (Wave 2 contract) so LLM extraction outcomes feed the per-run + 7-day
+    rolling rates. Required keys for this prompt's success contract:
+    ``is_obituary`` + ``decedent_full_name`` — chat_json records success
+    only when BOTH are present in the parsed response.
+    """
     api_key = api_key or os.getenv("ANTHROPIC_API_KEY", "")
     if not api_key or not obituary_text or not obituary_text.strip():
         return None
     prompt = DECEDENT_PROMPT.format(obituary_text=obituary_text[:MAX_OBITUARY_TEXT])
     try:
         parsed = llm_client.chat_json(
-            prompt, system=SYSTEM_PROMPT, max_tokens=LLM_MAX_TOKENS, api_key=api_key,
+            prompt,
+            system=SYSTEM_PROMPT,
+            max_tokens=LLM_MAX_TOKENS,
+            api_key=api_key,
+            rate_tracker=rate_tracker,
+            required_keys=("is_obituary", "decedent_full_name"),
         )
     except Exception as e:
         logger.debug("LLM call failed: %s", e)
@@ -445,123 +471,22 @@ def _normalize_decedent_key(name: str, dod: str = "") -> str:
     return f"{first_prefix}|{last}|{dod or 'nodod'}"
 
 
-# Fallback anchor cities for AssuranceWeb ZIP recovery. The first attempt
-# uses the primary anchor (Huntsville for Madison, Albertville for Marshall);
-# if Smarty can't resolve the street there, we cycle through additional
-# anchor cities AND a city-less retry. Each ~$0.001 — three lookups worst
-# case for an address we'd otherwise drop, easily worth it.
-_MADISON_ANCHORS: tuple[str, ...] = (
-    "Huntsville AL", "Madison AL", "Athens AL", "Hazel Green AL",
-    "New Hope AL", "Gurley AL", "Owens Cross Roads AL", "New Market AL",
-    # Smaller Madison-area communities — each is a separate USPS catchment
-    # so Smarty can't infer them from larger anchors. Verified that real
-    # addresses (e.g. Carters Gin Rd) resolve under "Toney AL" but fail
-    # under "Huntsville AL".
-    "Toney AL", "Meridianville AL", "Harvest AL", "Triana AL",
-    "AL",  # Final fallback: let Smarty pick the city from the street match
+# ── Backward-compat re-exports ────────────────────────────────────
+# The AssuranceWeb (Madison + Marshall) Smarty ZIP-recovery helpers
+# moved to address_standardizer.py on 2026-05-23 so the legacy
+# main.py daily flow (via property_lookup.py) can share them too.
+# Aliases kept so external callers and any module that still imports
+# the underscore-prefixed names (distress_proxy_pipeline.py,
+# apn_probate_pipeline_al.py prior to its own update) keep working.
+# New code should import from address_standardizer directly.
+from address_standardizer import (
+    smarty_zip_for_assuranceweb_address,
+    smarty_zip_for_madison_address,
+    smarty_zip_for_marshall_address,
 )
-_MARSHALL_ANCHORS: tuple[str, ...] = (
-    "Albertville AL", "Boaz AL", "Guntersville AL", "Arab AL",
-    "Grant AL", "Horton AL", "Crossville AL",
-    "AL",
-)
-
-
-def _smarty_lookup_once(situs: str, lastline_hint: str) -> tuple[str, str]:
-    """Single Smarty lookup attempt. Returns ('','') on any failure."""
-    try:
-        import config as cfg
-        if not (cfg.SMARTY_AUTH_ID and cfg.SMARTY_AUTH_TOKEN):
-            return ("", "")
-        from smartystreets_python_sdk.us_street import Lookup as StreetLookup
-        from smartystreets_python_sdk.us_street.match_type import MatchType
-        from address_standardizer import _build_client
-        client = _build_client(cfg.SMARTY_AUTH_ID, cfg.SMARTY_AUTH_TOKEN)
-        lookup = StreetLookup()
-        lookup.street = situs.strip()
-        lookup.lastline = lastline_hint
-        lookup.candidates = 1
-        lookup.match = MatchType.INVALID
-        client.send_lookup(lookup)
-        if not lookup.result:
-            return ("", "")
-        comp = lookup.result[0].components
-        return (comp.city_name or "", comp.zipcode or "")
-    except Exception as e:
-        logger.debug("Smarty geocode failed for %r (lastline=%r): %s",
-                     situs, lastline_hint, e)
-        return ("", "")
-
-
-def _smarty_zip_for_assuranceweb_address(
-    situs: str,
-    lastline_hint: str = "Huntsville AL",
-    anchor_fallbacks: tuple[str, ...] | None = None,
-) -> tuple[str, str]:
-    """Multi-anchor Smarty lookup to recover (city, zip) for an AssuranceWeb situs.
-
-    Madison + Marshall both run on the AssuranceWeb platform, and both
-    `search_by_owner_name` responses return only the street — the city/zip
-    portion isn't in the bulk search payload. We need ZIP for the tier gate,
-    so geocode via Smarty's US Street API.
-
-    Strategy (added to fix P1 #4 — multiple rural addresses dropped with
-    zip=? in live runs: Lizotte ×3, Bell, M.Smith, Hudson, Manley, K.Floyd,
-    Dova Hay):
-
-      1. Try ``lastline_hint`` (e.g. "Huntsville AL") — handles the
-         common case where the street is in the anchor city's catchment.
-      2. If no match, cycle through ``anchor_fallbacks`` until one hits.
-         These cover rural / fringe addresses where the anchor isn't
-         geographically near the actual delivery city.
-      3. Final attempt: lastline = "AL" alone — lets Smarty pick the city
-         from the street match without any city bias.
-
-    Returns ('', '') only when all fallbacks are exhausted.
-    """
-    if not situs or not situs.strip():
-        return ("", "")
-
-    # Try the primary anchor first
-    city, zip_ = _smarty_lookup_once(situs, lastline_hint)
-    if zip_:
-        return (city, zip_)
-
-    # Cycle through fallback anchors
-    for anchor in (anchor_fallbacks or ()):
-        if anchor == lastline_hint:
-            continue  # Already tried the primary
-        city, zip_ = _smarty_lookup_once(situs, anchor)
-        if zip_:
-            logger.debug("Smarty fallback hit on %r (anchor=%r): %s, %s",
-                         situs, anchor, city, zip_)
-            return (city, zip_)
-
-    return ("", "")
-
-
-def _smarty_zip_for_madison_address(situs: str) -> tuple[str, str]:
-    """Madison-anchored ZIP recovery with multi-city fallback."""
-    return _smarty_zip_for_assuranceweb_address(
-        situs,
-        lastline_hint="Huntsville AL",
-        anchor_fallbacks=_MADISON_ANCHORS,
-    )
-
-
-def _smarty_zip_for_marshall_address(situs: str) -> tuple[str, str]:
-    """Marshall-anchored ZIP recovery with multi-city fallback.
-
-    Primary anchor is Albertville (largest city); fallbacks cycle through
-    Boaz, Guntersville, Arab, Grant, Horton, Crossville, then city-less
-    "AL" as the final attempt. Each retry ~$0.001 — cheap insurance for
-    addresses Smarty's primary-anchor lookup can't resolve.
-    """
-    return _smarty_zip_for_assuranceweb_address(
-        situs,
-        lastline_hint="Albertville AL",
-        anchor_fallbacks=_MARSHALL_ANCHORS,
-    )
+_smarty_zip_for_assuranceweb_address = smarty_zip_for_assuranceweb_address
+_smarty_zip_for_madison_address = smarty_zip_for_madison_address
+_smarty_zip_for_marshall_address = smarty_zip_for_marshall_address
 
 
 def _attach_property_for_decedent(
@@ -721,7 +646,10 @@ def run_pipeline(
     pages: int = 1,
     tier_filter: tuple[int, ...] = (1, 2),
     markets: tuple[str, ...] = ("Birmingham", "Huntsville"),
-) -> list[PreProbateResult]:
+    *,
+    funnel: FunnelCounter | None = None,
+    rate_tracker: ServiceRateTracker | None = None,
+) -> tuple[list[PreProbateResult], FunnelCounter, ServiceRateTracker]:
     """End-to-end pre-probate pipeline.
 
     Args:
@@ -730,12 +658,34 @@ def run_pipeline(
         tier_filter: ZIP tiers to keep. (1, 2) = Tier 1 ∪ Tier 2. () = all.
         markets: Which Alabama markets to harvest. Default: both Birmingham
             (→ Jefferson property API) and Huntsville (→ Madison property API).
+        funnel: Optional caller-supplied counter. When omitted, a fresh
+            FunnelCounter("pre_probate", gates=...) is constructed per
+            CONTEXT.md D-01 (9-gate sequence).
+        rate_tracker: Optional caller-supplied tracker. Threaded through
+            ``_extract_decedent_with_llm`` (LLM), ``_smarty_zip_for_*``
+            (Smarty), and ``batch_skip_trace`` (Tracerfy) — all Wave 2
+            entry points that accept the kwarg.
 
-    Returns one PreProbateResult per harvested obituary, including dropped
-    ones (each tagged with disposition).
+    Returns:
+        ``(results, funnel, rate_tracker)`` — results + populated funnel
+        + tracker so notify_slack can append funnel + rates blocks.
     """
+    # CONTEXT.md D-01: pre_probate gate sequence (9 gates), pre-seeded so
+    # the Slack block ALWAYS renders all 9 even when a stage emitted zero
+    # records (zero-count gates are signal — "all dropped at llm_extracted"
+    # must be visible).
+    if funnel is None:
+        funnel = FunnelCounter("pre_probate", gates=[
+            "obits_harvested", "cross_source_deduped", "fetched",
+            "llm_extracted", "dod_gated", "property_matched",
+            "tier_gated", "tracerfy_matched", "datasift_uploaded",
+        ])
+    if rate_tracker is None:
+        rate_tracker = ServiceRateTracker()
+
     obits = harvest_alabama(markets=markets, limit_per_market=limit, pages=pages)
     logger.info("Harvested %d obituary URL(s) across markets %s", len(obits), markets)
+    funnel.set("obits_harvested", len(obits))
 
     results: list[PreProbateResult] = []
     # Cross-source dedupe: legacy.com person URLs upgrade to obits.al.com
@@ -804,8 +754,9 @@ def run_pipeline(
             if "obits.al.com" in effective_url:
                 result.obituary_source = "obits.al.com"
 
-        # Stage 2: LLM extract decedent + family graph
-        ext = _extract_decedent_with_llm(text)
+        # Stage 2: LLM extract decedent + family graph (rate_tracker
+        # threads through to llm_client.chat_json — Wave 2 contract).
+        ext = _extract_decedent_with_llm(text, rate_tracker=rate_tracker)
         if not ext or not ext.decedent_full_name:
             result.status = "dropped_not_obituary"
             result.notes = "LLM rejected (not a single-decedent obituary)"
@@ -897,10 +848,14 @@ def run_pipeline(
         # rural addresses to the correct delivery city.
         if not result.situs_zip and result.situs_address:
             if matched_county == "Marshall":
-                city, zip_code = _smarty_zip_for_marshall_address(result.situs_address)
+                city, zip_code = _smarty_zip_for_marshall_address(
+                    result.situs_address, rate_tracker=rate_tracker,
+                )
                 anchor = "Marshall"
             elif matched_county == "Madison":
-                city, zip_code = _smarty_zip_for_madison_address(result.situs_address)
+                city, zip_code = _smarty_zip_for_madison_address(
+                    result.situs_address, rate_tracker=rate_tracker,
+                )
                 anchor = "Madison"
             else:
                 city, zip_code = ("", "")
@@ -958,7 +913,40 @@ def run_pipeline(
                     ext.decedent_full_name, result.situs_address)
         results.append(result)
 
-    return results
+    # Funnel: end-of-loop gate counts (D-01 — 9 gates total).
+    # obits_harvested already set above (line ~668). The remaining 7
+    # gates are derived from the result list, walking each stage's
+    # disposition:
+    #
+    #   cross_source_deduped  = obits_harvested - dropped_duplicate
+    #   fetched               = obit_fetched True
+    #   llm_extracted         = extraction is not None
+    #   dod_gated             = status != dropped_stale_dod (within fetched+
+    #                           llm-extracted survivors)
+    #   property_matched      = property_found True
+    #   tier_gated            = status == enriched
+    #
+    # tracerfy_matched + datasift_uploaded are populated downstream by
+    # prepare_notices() and the CSV writer (pre-seeded to 0).
+    dup_count = sum(1 for r in results if r.status == "dropped_duplicate")
+    fetched_count = sum(1 for r in results if r.obit_fetched)
+    llm_count = sum(1 for r in results if r.extraction is not None)
+    # dod_gated is the count of LLM-extracted survivors that passed the
+    # 2-year DoD freshness check. Anything that hit the dod_gated drop
+    # subtracts; everything else with extraction survives the gate.
+    stale_dod = sum(1 for r in results if r.status == "dropped_stale_dod")
+    dod_gated_count = llm_count - stale_dod
+    property_count = sum(1 for r in results if r.property_found)
+    in_tier_count = sum(1 for r in results if r.status == "enriched")
+
+    funnel.set("cross_source_deduped", len(results) - dup_count)
+    funnel.set("fetched", fetched_count)
+    funnel.set("llm_extracted", llm_count)
+    funnel.set("dod_gated", dod_gated_count)
+    funnel.set("property_matched", property_count)
+    funnel.set("tier_gated", in_tier_count)
+
+    return (results, funnel, rate_tracker)
 
 
 # ── DataSift CSV conversion ──────────────────────────────────────────
@@ -1054,8 +1042,16 @@ def prepare_notices(
     results: list[PreProbateResult],
     enriched_only: bool = True,
     skip_trace: bool = False,
+    *,
+    funnel: FunnelCounter | None = None,
+    rate_tracker: ServiceRateTracker | None = None,
 ) -> tuple[list[NoticeData], dict | None]:
-    """Convert pipeline results to NoticeData and optionally run skip-trace."""
+    """Convert pipeline results to NoticeData and optionally run skip-trace.
+
+    When ``funnel`` is supplied, sets ``tracerfy_matched`` from skip-trace
+    stats. When ``rate_tracker`` is supplied, it's threaded into
+    ``batch_skip_trace`` (Wave 2 contract).
+    """
     eligible = [r for r in results if not enriched_only or r.status == "enriched"]
     notices = [_to_notice_data(r) for r in eligible]
     stats: dict | None = None
@@ -1063,7 +1059,9 @@ def prepare_notices(
     if skip_trace and notices:
         try:
             import tracerfy_skip_tracer
-            stats = tracerfy_skip_tracer.batch_skip_trace(notices)
+            stats = tracerfy_skip_tracer.batch_skip_trace(
+                notices, rate_tracker=rate_tracker,
+            )
             logger.info(
                 "Skip-trace stats: submitted=%d matched=%d phones=%d emails=%d cost=$%.2f",
                 stats.get("submitted", 0), stats.get("matched", 0),
@@ -1072,6 +1070,8 @@ def prepare_notices(
             )
             for n in notices:
                 _promote_heir_contacts_to_csv_slots(n)
+            if funnel is not None:
+                funnel.set("tracerfy_matched", stats.get("matched", 0))
         except Exception as e:
             logger.warning("Skip-trace failed (continuing without phones): %s", e)
             stats = {"error": str(e)}
@@ -1179,18 +1179,71 @@ def notify_slack(
     csv_path: Optional[Path] = None,
     skip_trace_stats: dict | None = None,
     webhook_url: str | None = None,
+    *,
+    funnel: FunnelCounter | None = None,
+    rate_tracker: ServiceRateTracker | None = None,
 ) -> bool:
-    """Post the pre-probate run summary to Slack/Discord."""
-    import slack_notifier
+    """Post the pre-probate run summary to Slack/Discord.
+
+    When ``funnel`` and ``rate_tracker`` are BOTH provided (Phase 2
+    block-aware path):
+
+      1. load_rolling_rates() FIRST — today's post shows the baseline
+         from yesterday-and-prior days.
+      2. Build 3-block payload: existing summary text + funnel block +
+         service-rates block.
+      3. POST via _send_blocks_webhook (single HTTP call, D-02).
+      4. save_rolling_rates AFTER successful send so today's totals
+         advance the window for tomorrow's baseline. A failed send
+         leaves the rolling baseline untouched.
+
+    Legacy callers (no funnel + no tracker) get the byte-identical
+    plain-text-only path through _send_webhook.
+    """
     text = build_slack_message(
         results, csv_path=csv_path, skip_trace_stats=skip_trace_stats,
     )
-    sent = slack_notifier._send_webhook(text, webhook_url=webhook_url)
-    if sent:
-        logger.info("Slack notification sent (%d enriched leads)",
-                    sum(1 for r in results if r.status == "enriched"))
+
+    # Legacy text-only path — backwards compat.
+    if funnel is None and rate_tracker is None:
+        import slack_notifier
+        sent = slack_notifier._send_webhook(text, webhook_url=webhook_url)
+        if sent:
+            logger.info("Slack notification sent (%d enriched, legacy text-only)",
+                        sum(1 for r in results if r.status == "enriched"))
+        else:
+            logger.warning("Slack notification failed (no webhook or send error)")
+        return sent
+
+    # Phase 2 block-aware path. Rolling-rates ordering (D-03 / W6):
+    # load FIRST, save AFTER successful send.
+    rolling = rolling_rates_summary(load_rolling_rates())
+    per_run = rate_tracker.per_run_rates() if rate_tracker else {}
+
+    blocks: list[dict] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+    ]
+    if funnel is not None:
+        blocks.append(
+            build_funnel_block(funnel.pipeline_name, funnel.as_ordered_dict())
+        )
+    blocks.append(build_service_rates_block(per_run, rolling))
+
+    sent = _send_blocks_webhook(text, blocks, webhook_url=webhook_url)
+    if sent and rate_tracker is not None:
+        save_rolling_rates(rate_tracker.totals())
+        logger.info(
+            "Slack notification sent (%d enriched, blocks payload + rolling saved)",
+            sum(1 for r in results if r.status == "enriched"),
+        )
+    elif sent:
+        logger.info(
+            "Slack notification sent (%d enriched, blocks payload)",
+            sum(1 for r in results if r.status == "enriched"),
+        )
     else:
         logger.warning("Slack notification failed (no webhook or send error)")
+
     return sent
 
 
@@ -1276,7 +1329,7 @@ def _cli() -> int:
 
     markets = tuple(m.strip() for m in args.markets.split(",") if m.strip())
 
-    results = run_pipeline(
+    results, funnel, rate_tracker = run_pipeline(
         limit=args.limit, pages=args.pages, tier_filter=tier_filter,
         markets=markets,
     )
@@ -1291,19 +1344,35 @@ def _cli() -> int:
 
     if args.datasift_csv:
         notices, skip_trace_stats = prepare_notices(
-            results, skip_trace=args.skip_trace,
+            results,
+            skip_trace=args.skip_trace,
+            funnel=funnel,
+            rate_tracker=rate_tracker,
         )
         if notices:
             csv_path = datasift_formatter.write_datasift_csv(notices)
+            # Funnel: datasift_uploaded gate — D-01 final stage.
+            funnel.set("datasift_uploaded", len(notices))
             print(f"\n✓ DataSift CSV written: {csv_path}")
         else:
             print("\n· DataSift CSV: 0 eligible records.")
     elif args.skip_trace:
         print("\n· --skip-trace ignored (requires --datasift-csv).")
 
+    # D-04 — terminal mirrors Slack: always log the funnel at end-of-run.
+    logger.info(
+        "Funnel (%s): %s",
+        funnel.pipeline_name,
+        dict(funnel.as_ordered_dict()),
+    )
+
     if args.notify_slack:
         sent = notify_slack(
-            results, csv_path=csv_path, skip_trace_stats=skip_trace_stats,
+            results,
+            csv_path=csv_path,
+            skip_trace_stats=skip_trace_stats,
+            funnel=funnel,
+            rate_tracker=rate_tracker,
         )
         if sent:
             print(f"✓ Slack notification posted")

@@ -47,14 +47,28 @@ from dotenv import load_dotenv
 import config as cfg
 import datasift_formatter
 from notice_parser import NoticeData
+from observability import (
+    FunnelCounter,
+    ServiceRateTracker,
+    load_rolling_rates,
+    rolling_rates_summary,
+    save_rolling_rates,
+)
 from pre_probate_pipeline_al import (
     _normalize_decedent_key,
     _promote_heir_contacts_to_csv_slots,
-    _smarty_zip_for_madison_address,
-    _smarty_zip_for_marshall_address,
+)
+from address_standardizer import (
+    smarty_zip_for_madison_address,
+    smarty_zip_for_marshall_address,
 )
 from probate_property_locator import enrich_notice_with_property
 from scraper import scrape_all
+from slack_notifier import (
+    _send_blocks_webhook,
+    build_funnel_block,
+    build_service_rates_block,
+)
 from target_zips import zip_tier_county
 
 load_dotenv(dotenv_path=Path.home() / "Desktop/SiftStack/.env")
@@ -116,7 +130,10 @@ async def run_pipeline(
     days_back: int = 7,
     tier_filter: tuple[int, ...] = (1, 2),
     max_notices: int = 100,
-) -> list[APNProbateResult]:
+    *,
+    funnel: FunnelCounter | None = None,
+    rate_tracker: ServiceRateTracker | None = None,
+) -> tuple[list[APNProbateResult], FunnelCounter, ServiceRateTracker]:
     """End-to-end APN post-probate pipeline.
 
     Args:
@@ -124,18 +141,45 @@ async def run_pipeline(
         days_back: Lookback window for the APN scrape.
         tier_filter: ZIP tiers to keep. (1, 2) = Tier 1 ∪ Tier 2. () = all.
         max_notices: Hard cap on notices processed per run.
+        funnel: Optional caller-supplied counter. When omitted, a fresh
+            FunnelCounter("apn_probate", gates=...) is constructed
+            internally per CONTEXT.md D-01 gate sequence.
+        rate_tracker: Optional caller-supplied tracker. When omitted, a
+            fresh ServiceRateTracker is constructed. Threaded into
+            ``scrape_all`` (NOTE: deferred to plan 02-04 — scraper.py
+            doesn't yet accept ``rate_tracker``, so captcha rate may
+            read 0/0 in this plan's runs).
 
-    Returns one APNProbateResult per scraped notice (including dropped ones,
-    each tagged with disposition).
+    Returns:
+        ``(results, funnel, rate_tracker)`` — the per-notice results
+        plus the populated funnel + tracker, so notify_slack can append
+        the funnel + rates blocks to the run summary.
     """
+    # Per CONTEXT.md D-01: apn_probate gate sequence is pre-seeded so the
+    # Slack block always renders all 6 gates (zero-count gates are a real
+    # signal — "all dropped at decedent-name-searched" must be visible).
+    if funnel is None:
+        funnel = FunnelCounter("apn_probate", gates=[
+            "scraped", "seen_ids_deduped", "decedent_name_searched",
+            "tier_gated", "tracerfy_matched", "datasift_uploaded",
+        ])
+    if rate_tracker is None:
+        rate_tracker = ServiceRateTracker()
+
     searches = _filter_probate_searches(cfg.SAVED_SEARCHES, counties=counties)
     if not searches:
         logger.warning("No probate searches matching counties=%s", counties)
-        return []
+        return ([], funnel, rate_tracker)
 
     logger.info("APN probate scrape: %d search(es) for counties=%s",
                 len(searches), counties)
     since_date = (date.today() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    # NOTE: scraper.scrape_all does not yet accept rate_tracker (per the
+    # 02-03 plan instructions — that wiring is deferred to plan 02-04,
+    # which owns full_pipeline.py and may need scraper.py changes).
+    # 2Captcha solve rate will therefore read 0/0 in pure-apn_probate
+    # runs until 02-04 lands. Once it does, add `rate_tracker=rate_tracker`
+    # to this call.
     notices = await scrape_all(
         mode="custom",
         searches=searches,
@@ -143,6 +187,15 @@ async def run_pipeline(
         max_notices=max_notices,
     )
     logger.info("Scraped %d probate notice(s) from APN", len(notices))
+
+    # Funnel: scraped + seen_ids_deduped.
+    # scrape_all handles seen_ids.json dedup internally (only NEW notices
+    # are returned), so the count returned is already post-dedup. Same
+    # value for both gates — the plan explicitly accepts this pattern
+    # (per the Task 1 action note: "If scrape_all already returns
+    # post-dedup count, use the same value for both...").
+    funnel.set("scraped", len(notices))
+    funnel.set("seen_ids_deduped", len(notices))
 
     results: list[APNProbateResult] = []
     # Same-person dedupe (P0 #2): APN occasionally publishes the same
@@ -213,9 +266,9 @@ async def run_pipeline(
         county_lc = n.county.lower()
         if not n.zip and n.address and county_lc in {"madison", "marshall"}:
             if county_lc == "marshall":
-                city, zip_code = _smarty_zip_for_marshall_address(n.address)
+                city, zip_code = smarty_zip_for_marshall_address(n.address)
             else:
-                city, zip_code = _smarty_zip_for_madison_address(n.address)
+                city, zip_code = smarty_zip_for_madison_address(n.address)
             if zip_code:
                 n.zip = zip_code
                 if not n.city and city:
@@ -264,7 +317,25 @@ async def run_pipeline(
                     n.decedent_name, n.address)
         results.append(result)
 
-    return results
+    # Funnel: post-loop gate counts (D-01 per-pipeline sequence).
+    # - decedent_name_searched: notices whose property locator returned a
+    #   parcel (parcel_id populated). Drops where the locator returned
+    #   nothing roll up as the implicit drop between this gate and the
+    #   tier_gated one above.
+    # - tier_gated: notices that survived the tier_filter (status==enriched).
+    # tracerfy_matched and datasift_uploaded are populated downstream by
+    # prepare_notices() and the CSV writer respectively — they default to
+    # 0 (pre-seeded) and update if/when those stages run.
+    funnel.set(
+        "decedent_name_searched",
+        sum(1 for r in results if r.notice.parcel_id),
+    )
+    funnel.set(
+        "tier_gated",
+        sum(1 for r in results if r.status == "enriched"),
+    )
+
+    return (results, funnel, rate_tracker)
 
 
 # ── DataSift CSV + skip-trace ────────────────────────────────────────
@@ -274,6 +345,9 @@ def prepare_notices(
     results: list[APNProbateResult],
     enriched_only: bool = True,
     skip_trace: bool = False,
+    *,
+    funnel: FunnelCounter | None = None,
+    rate_tracker: ServiceRateTracker | None = None,
 ) -> tuple[list[NoticeData], dict | None]:
     """Pull NoticeData from enriched results and optionally run skip-trace.
 
@@ -281,6 +355,11 @@ def prepare_notices(
     in NoticeData shape (the APN scraper produces them directly), so we
     don't need a CaseResult→NoticeData converter. Just filter, optionally
     skip-trace, optionally promote heir contacts.
+
+    When ``funnel`` is supplied, sets ``tracerfy_matched`` from skip-trace
+    stats. When ``rate_tracker`` is supplied, it's threaded into
+    ``batch_skip_trace`` (Wave 2 contract) so Tracerfy success rates feed
+    into the per-run + 7-day rolling rates.
     """
     eligible = [r for r in results if not enriched_only or r.status == "enriched"]
     notices = [r.notice for r in eligible]
@@ -289,7 +368,9 @@ def prepare_notices(
     if skip_trace and notices:
         try:
             import tracerfy_skip_tracer
-            stats = tracerfy_skip_tracer.batch_skip_trace(notices)
+            stats = tracerfy_skip_tracer.batch_skip_trace(
+                notices, rate_tracker=rate_tracker,
+            )
             logger.info(
                 "Skip-trace stats: submitted=%d matched=%d phones=%d emails=%d cost=$%.2f",
                 stats.get("submitted", 0), stats.get("matched", 0),
@@ -298,6 +379,8 @@ def prepare_notices(
             )
             for n in notices:
                 _promote_heir_contacts_to_csv_slots(n)
+            if funnel is not None:
+                funnel.set("tracerfy_matched", stats.get("matched", 0))
         except Exception as e:
             logger.warning("Skip-trace failed: %s", e)
             stats = {"error": str(e)}
@@ -404,18 +487,77 @@ def notify_slack(
     skip_trace_stats: dict | None = None,
     days_back: int = 7,
     webhook_url: str | None = None,
+    *,
+    funnel: FunnelCounter | None = None,
+    rate_tracker: ServiceRateTracker | None = None,
 ) -> bool:
-    """Post the APN post-probate run summary to Slack/Discord."""
-    import slack_notifier
+    """Post the APN post-probate run summary to Slack/Discord.
+
+    When ``funnel`` and ``rate_tracker`` are BOTH provided (Phase 2
+    block-aware path), this function:
+
+      1. Loads the 7-day rolling baseline FIRST (so today's post reflects
+         the rolling rate computed from yesterday-and-prior days — NOT
+         today's totals).
+      2. Builds a 3-block payload: existing summary text + funnel block +
+         service-rates block.
+      3. POSTs via ``_send_blocks_webhook`` (one HTTP call, one message —
+         D-02 honored: "one message, more content").
+      4. AFTER a successful send, calls ``save_rolling_rates`` so today's
+         totals become tomorrow's baseline. A failed send leaves the
+         rolling baseline untouched so the bad run doesn't pollute the
+         window.
+
+    Legacy callers (no funnel + no rate_tracker) get the byte-identical
+    plain-text-only path through ``_send_webhook`` for backward compat.
+    """
     text = build_slack_message(
         results, csv_path=csv_path, skip_trace_stats=skip_trace_stats, days_back=days_back,
     )
-    sent = slack_notifier._send_webhook(text, webhook_url=webhook_url)
-    if sent:
-        logger.info("Slack notification sent (%d enriched)",
-                    sum(1 for r in results if r.status == "enriched"))
+
+    # Legacy path: no funnel + no tracker → plain text via _send_webhook,
+    # byte-identical to the pre-Phase-2 behaviour.
+    if funnel is None and rate_tracker is None:
+        import slack_notifier
+        sent = slack_notifier._send_webhook(text, webhook_url=webhook_url)
+        if sent:
+            logger.info("Slack notification sent (%d enriched, legacy text-only)",
+                        sum(1 for r in results if r.status == "enriched"))
+        else:
+            logger.warning("Slack notification failed (no webhook or send error)")
+        return sent
+
+    # Phase 2 block-aware path. Per CONTEXT.md D-03 + plan-checker W6:
+    # rolling-rates ordering is mandatory — load FIRST (yesterday's
+    # baseline shows on today's post), save AFTER successful send (today's
+    # totals advance the window for tomorrow's baseline).
+    rolling = rolling_rates_summary(load_rolling_rates())
+    per_run = rate_tracker.per_run_rates() if rate_tracker else {}
+
+    blocks: list[dict] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+    ]
+    if funnel is not None:
+        blocks.append(
+            build_funnel_block(funnel.pipeline_name, funnel.as_ordered_dict())
+        )
+    blocks.append(build_service_rates_block(per_run, rolling))
+
+    sent = _send_blocks_webhook(text, blocks, webhook_url=webhook_url)
+    if sent and rate_tracker is not None:
+        save_rolling_rates(rate_tracker.totals())
+        logger.info(
+            "Slack notification sent (%d enriched, blocks payload + rolling saved)",
+            sum(1 for r in results if r.status == "enriched"),
+        )
+    elif sent:
+        logger.info(
+            "Slack notification sent (%d enriched, blocks payload)",
+            sum(1 for r in results if r.status == "enriched"),
+        )
     else:
         logger.warning("Slack notification failed (no webhook or send error)")
+
     return sent
 
 
@@ -500,7 +642,7 @@ def _cli() -> int:
             return 2
     counties = tuple(c.strip() for c in args.counties.split(",") if c.strip())
 
-    results = asyncio.run(run_pipeline(
+    results, funnel, rate_tracker = asyncio.run(run_pipeline(
         counties=counties,
         days_back=args.days_back,
         tier_filter=tier_filter,
@@ -528,18 +670,39 @@ def _cli() -> int:
     skip_trace_stats: dict | None = None
 
     if args.datasift_csv:
-        notices, skip_trace_stats = prepare_notices(results, skip_trace=args.skip_trace)
+        notices, skip_trace_stats = prepare_notices(
+            results,
+            skip_trace=args.skip_trace,
+            funnel=funnel,
+            rate_tracker=rate_tracker,
+        )
         if notices:
             csv_path = datasift_formatter.write_datasift_csv(notices)
+            # Funnel: datasift_uploaded gate — D-01 final stage.
+            funnel.set("datasift_uploaded", len(notices))
             print(f"\n✓ DataSift CSV written: {csv_path}")
         else:
             print("\n· DataSift CSV: 0 eligible records.")
     elif args.skip_trace:
         print("\n· --skip-trace ignored (requires --datasift-csv).")
 
+    # D-04 — terminal mirrors Slack: always log the funnel at end-of-run
+    # so the operator sees drop counts even when --notify-slack isn't set.
+    logger.info(
+        "Funnel (%s): %s",
+        funnel.pipeline_name,
+        dict(funnel.as_ordered_dict()),
+    )
+
     if args.notify_slack:
-        sent = notify_slack(results, csv_path=csv_path,
-                            skip_trace_stats=skip_trace_stats, days_back=args.days_back)
+        sent = notify_slack(
+            results,
+            csv_path=csv_path,
+            skip_trace_stats=skip_trace_stats,
+            days_back=args.days_back,
+            funnel=funnel,
+            rate_tracker=rate_tracker,
+        )
         if sent:
             print(f"✓ Slack notification posted")
         else:

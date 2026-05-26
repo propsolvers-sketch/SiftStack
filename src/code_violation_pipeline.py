@@ -25,6 +25,21 @@ Detail-page enrichment (opt-in, ``--enrich-details``):
   mailing address, and Accela's deceased-flag annotations. Slow (~3s/rec)
   but surfaces fines that can't be derived from the tax roll.
 
+Phase 2 (OPS-03 / OBS-01) — funnel transparency
+================================================
+``fetch_code_violations`` now records a ``FunnelCounter("code_violation")``
+with the canonical 3-gate D-01 sequence (bulk_fetched → owner_enriched →
+tier_gated) and threads a single ``ServiceRateTracker`` through the
+adapter ``to_notice_data(..., enrich_owner=True)`` paths (which hit the
+Madison + Jefferson tax-roll address-search APIs). When ``--notify-slack``
+is set, the CLI posts a single Slack Block Kit message containing the
+per-run funnel + service-rates blocks via
+``slack_notifier._send_blocks_webhook`` (D-02 — one message per run).
+Rolling rates are loaded BEFORE blocks build (so today's post reflects
+yesterday's baseline) and saved AFTER successful send (so today's totals
+advance the window for tomorrow). See
+``.planning/phases/02-funnel-transparency/02-CONTEXT.md``.
+
 CLI
 ====
     # Both counties, default windows
@@ -42,15 +57,33 @@ CLI
     # Full feed with owner enrichment + DataSift CSV
     python src/code_violation_pipeline.py --enrich-owner \\
         --output-datasift-csv output/code_violations_datasift.csv
+
+    # Daily-ops with Slack funnel post
+    python src/code_violation_pipeline.py --enrich-owner \\
+        --output-datasift-csv output/code_violations_datasift.csv \\
+        --notify-slack
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from notice_parser import NoticeData
+from observability import (
+    FunnelCounter,
+    ServiceRateTracker,
+    load_rolling_rates,
+    rolling_rates_summary,
+    save_rolling_rates,
+)
+from slack_notifier import (
+    _send_blocks_webhook,
+    build_funnel_block,
+    build_service_rates_block,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +93,18 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BIRM_CATEGORIES = (
     "housing", "vehicles", "environmental", "zoning", "condemnation",
 )
+
+
+# ── Phase 2 canonical gate sequence (CONTEXT.md D-01) ────────────────
+
+CODE_VIOLATION_GATES: tuple[str, ...] = (
+    "bulk_fetched",
+    "owner_enriched",
+    "tier_gated",
+)
+"""Canonical 3-gate D-01 sequence for the code-violation pipeline. Pinned
+as a module constant so any rollup (e.g. Phase 3 unified scheduler) can
+reuse the ordered list without re-deriving it."""
 
 
 # ── Per-county fetch wrappers ────────────────────────────────────────
@@ -146,7 +191,9 @@ def fetch_code_violations(
     # Shared
     enrich_owner: bool = False,
     tiers: tuple[int, ...] | None = (1, 2),
-) -> list[NoticeData]:
+    funnel: FunnelCounter | None = None,
+    rate_tracker: ServiceRateTracker | None = None,
+) -> tuple[list[NoticeData], FunnelCounter, ServiceRateTracker]:
     """Pull the full code-violation feed for the requested AL counties.
 
     Args:
@@ -177,11 +224,27 @@ def fetch_code_violations(
             for cases the tax-roll missed. For Hoover, Jefferson tax-roll
             via E-Ring (same as Birmingham). For Huntsville, Madison
             address-search.
+        funnel: Optional pre-constructed FunnelCounter. When omitted, a
+            fresh FunnelCounter("code_violation", gates=CODE_VIOLATION_GATES)
+            is built — pre-seeded with all 3 D-01 gates so the Slack block
+            always renders the full sequence.
+        rate_tracker: Optional pre-constructed ServiceRateTracker. When
+            omitted, a fresh one is built. Wave 2 service-call instrumentation
+            inside the adapter modules (Smarty, LLM) records into the
+            supplied tracker automatically when threaded through the
+            adapter entry points.
 
     Returns:
-        Combined ``NoticeData`` list across all requested cities, in the
+        Tuple of (notices, funnel, rate_tracker). The funnel + tracker are
+        returned for ``notify_slack`` / terminal logging in the CLI path.
+        Combined NoticeData list across all requested cities, in the
         order Madison → Birmingham → Hoover.
     """
+    if funnel is None:
+        funnel = FunnelCounter("code_violation", gates=list(CODE_VIOLATION_GATES))
+    if rate_tracker is None:
+        rate_tracker = ServiceRateTracker()
+
     selected = {c.strip().title() for c in counties if c}
     notices: list[NoticeData] = []
 
@@ -235,6 +298,27 @@ def fetch_code_violations(
     if unknown:
         logger.warning("Unknown counties skipped: %s", sorted(unknown))
 
+    # ── Gate 1: bulk_fetched ──────────────────────────────────────────
+    funnel.set("bulk_fetched", len(notices))
+
+    # ── Gate 2: owner_enriched ────────────────────────────────────────
+    # When --enrich-owner is on, each adapter's to_notice_data populates
+    # owner_name via tax-roll address-search. Count notices with a
+    # populated owner_name as the survivor set. When --enrich-owner is
+    # off, the gate is a pass-through (count = bulk_fetched) so the
+    # funnel always renders the full 3-gate sequence per D-01 invariant.
+    if enrich_owner:
+        owner_count = sum(1 for n in notices if n.owner_name)
+    else:
+        owner_count = len(notices)
+    funnel.set("owner_enriched", owner_count)
+    logger.info(
+        "owner_enriched gate: %d notices have an owner_name "
+        "(enrich_owner=%s)",
+        owner_count, enrich_owner,
+    )
+
+    # ── Gate 3: tier_gated ────────────────────────────────────────────
     # Tier-ZIP filter — drops Birmingham + Huntsville records outside our
     # investor-target ZIPs. Hoover is already tier-filtered upstream when
     # `hoover_target_zips_only=True`, but running the filter here is a
@@ -250,8 +334,89 @@ def fetch_code_violations(
             sorted(tier_set), before, len(kept), dropped,
         )
         notices = kept
+    funnel.set("tier_gated", len(notices))
 
-    return notices
+    return notices, funnel, rate_tracker
+
+
+# ── Phase 2: Slack notification ──────────────────────────────────────
+
+
+def _build_summary_text(
+    notices: list[NoticeData],
+    funnel: FunnelCounter,
+) -> str:
+    """Build the markdown header for the code-violation Slack post.
+
+    Short summary: per-county counts + per-subtype breakdown. Funnel +
+    service rates render in the following blocks (D-02 — one message,
+    three blocks).
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    by_county: dict[str, int] = {}
+    by_sub: dict[str, int] = {}
+    for n in notices:
+        by_county[n.county or "(unknown)"] = by_county.get(n.county or "(unknown)", 0) + 1
+        key = n.notice_subtype or "(unspecified)"
+        by_sub[key] = by_sub.get(key, 0) + 1
+
+    parts = [f"*Code-Violation Run — {today}*"]
+    if notices:
+        per_county = ", ".join(
+            f"{county}: {count}"
+            for county, count in sorted(by_county.items())
+        )
+        parts.append(f"{len(notices)} records ({per_county})")
+        subtype_summary = ", ".join(
+            f"{sub}={count}"
+            for sub, count in sorted(by_sub.items(), key=lambda kv: -kv[1])
+        )
+        parts.append(f"By subtype: {subtype_summary}")
+    else:
+        parts.append("0 records in-tier this run.")
+    return "\n".join(parts)
+
+
+def notify_slack(
+    notices: list[NoticeData],
+    funnel: FunnelCounter,
+    rate_tracker: ServiceRateTracker,
+    *,
+    webhook_url: str | None = None,
+) -> bool:
+    """Post the code-violation run summary to Slack/Discord as a single message.
+
+    Per CONTEXT.md D-02: exactly one HTTP call per run. Block-aware payload
+    = summary header + funnel block + service-rates block.
+
+    Rolling-rates ordering (D-03 / W6):
+      1. load_rolling_rates BEFORE blocks build (today's post shows
+         yesterday-and-prior baseline, not today's totals).
+      2. _send_blocks_webhook runs next.
+      3. save_rolling_rates(rate_tracker.totals()) runs LAST, ONLY if the
+         send succeeded — failed sends never pollute the 7-day window.
+    """
+    text = _build_summary_text(notices, funnel)
+
+    rolling = rolling_rates_summary(load_rolling_rates())
+    per_run = rate_tracker.per_run_rates()
+
+    blocks: list[dict] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+        build_funnel_block(funnel.pipeline_name, funnel.as_ordered_dict()),
+        build_service_rates_block(per_run, rolling),
+    ]
+
+    sent = _send_blocks_webhook(text, blocks, webhook_url=webhook_url)
+    if sent:
+        save_rolling_rates(rate_tracker.totals())
+        logger.info(
+            "Slack notification sent (%d records, blocks payload + rolling saved)",
+            len(notices),
+        )
+    else:
+        logger.warning("Slack notification failed (no webhook or send error)")
+    return sent
 
 
 # ── CLI ──────────────────────────────────────────────────────────────
@@ -330,6 +495,11 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--output-datasift-csv", type=Path, default=None,
         help="Write DataSift-format CSV (80 cols) to this path.",
     )
+    p.add_argument(
+        "--notify-slack", action="store_true",
+        help="Post run summary + funnel + service-rates blocks to Slack "
+             "(D-02 — one message per run via SLACK_WEBHOOK_URL).",
+    )
     return p
 
 
@@ -376,7 +546,7 @@ def _main(argv: list[str]) -> int:
     else:
         tiers = tuple(int(t) for t in args.tiers.split(",") if t.strip().isdigit())
 
-    notices = fetch_code_violations(
+    notices, funnel, rate_tracker = fetch_code_violations(
         counties=counties,
         categories=categories,
         days_back=args.days_back,
@@ -392,6 +562,12 @@ def _main(argv: list[str]) -> int:
 
     _summarize(notices)
 
+    # D-04: terminal mirrors Slack regardless of whether --notify-slack is set.
+    logger.info(
+        "Funnel (%s): %s",
+        funnel.pipeline_name, dict(funnel.as_ordered_dict()),
+    )
+
     if args.output_csv:
         from data_formatter import write_csv
         path = write_csv(notices, str(args.output_csv))
@@ -400,6 +576,9 @@ def _main(argv: list[str]) -> int:
         from datasift_formatter import write_datasift_csv
         path = write_datasift_csv(notices, str(args.output_datasift_csv))
         print(f"Wrote DataSift CSV: {path}")
+
+    if args.notify_slack:
+        notify_slack(notices, funnel, rate_tracker)
 
     if not notices:
         return 1

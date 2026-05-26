@@ -5,8 +5,12 @@ this module sends the raw notice text to Claude Haiku for structured extraction.
 """
 
 import logging
+from typing import TYPE_CHECKING
 
 import llm_client
+
+if TYPE_CHECKING:
+    from observability import ServiceRateTracker
 
 logger = logging.getLogger(__name__)
 
@@ -176,16 +180,55 @@ _DIVORCE_KEYS = {
 _AUTO_DETECT_KEYS = {"notice_type", "confidence"}
 
 
+# Sorted-tuple versions of the per-prompt expected-keys sets. Tuples are
+# what llm_client.chat_json_async accepts as `required_keys`; sorting at
+# module load time guarantees deterministic iteration order in the
+# missing-keys warning log and in tests that introspect the kwargs.
+_FORECLOSURE_REQUIRED: tuple[str, ...] = tuple(sorted(_FORECLOSURE_KEYS))
+_PROBATE_REQUIRED: tuple[str, ...] = tuple(sorted(_PROBATE_KEYS))
+_EVICTION_REQUIRED: tuple[str, ...] = tuple(sorted(_EVICTION_KEYS))
+_CODE_VIOLATION_REQUIRED: tuple[str, ...] = tuple(sorted(_CODE_VIOLATION_KEYS))
+_DIVORCE_REQUIRED: tuple[str, ...] = tuple(sorted(_DIVORCE_KEYS))
+_AUTO_DETECT_REQUIRED: tuple[str, ...] = tuple(sorted(_AUTO_DETECT_KEYS))
+
+
+def _required_keys_for(notice_type: str) -> tuple[str, ...]:
+    """Map a notice_type string to its per-prompt required-keys tuple.
+
+    Covers all 8 routed notice types from extract_with_llm's prompt_map plus
+    the foreclosure default. Used as the `required_keys` kwarg to
+    `llm_client.chat_json_async` so the LLM rate reflects "structured
+    fields actually returned" rather than "raw HTTP 200" per D-04.
+    """
+    return {
+        "foreclosure": _FORECLOSURE_REQUIRED,
+        "tax_sale": _FORECLOSURE_REQUIRED,
+        "tax_delinquent": _FORECLOSURE_REQUIRED,
+        "probate": _PROBATE_REQUIRED,
+        "pre_probate": _PROBATE_REQUIRED,
+        "eviction": _EVICTION_REQUIRED,
+        "code_violation": _CODE_VIOLATION_REQUIRED,
+        "divorce": _DIVORCE_REQUIRED,
+    }.get(notice_type, _FORECLOSURE_REQUIRED)
+
+
 async def extract_with_llm(
     raw_text: str,
     notice_type: str,
     county: str,
     api_key: str,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
 ) -> dict:
     """Call Claude Haiku to extract structured fields from notice text.
 
     Returns dict with keys: address, city, state, zip, owner_name (+ probate fields).
     Returns empty dict on any failure.
+
+    When ``rate_tracker`` is supplied, the per-prompt expected-keys tuple
+    is forwarded to ``llm_client.chat_json_async`` via the ``required_keys``
+    kwarg so the LLM rate counts the call as a success only when the
+    response contains every key the prompt asked for (per CONTEXT.md D-04).
     """
     if not raw_text.strip():
         return {}
@@ -222,12 +265,17 @@ async def extract_with_llm(
     try:
         parsed = await llm_client.chat_json_async(
             prompt, system=SYSTEM_PROMPT, max_tokens=MAX_TOKENS, api_key=api_key,
+            rate_tracker=rate_tracker,
+            required_keys=_required_keys_for(notice_type),
         )
 
         if not parsed:
             return {}
 
-        # Validate expected keys exist
+        # Validate expected keys exist. NOTE: chat_json_async with
+        # required_keys already returns None when a required key is
+        # missing, so this branch is a defensive belt-and-suspenders for
+        # callers that haven't migrated to required_keys yet.
         if not expected.issubset(parsed.keys()):
             logger.warning("LLM response missing expected keys: %s", parsed.keys())
             return {}
@@ -287,7 +335,12 @@ Notice text:
 {raw_text}"""
 
 
-async def extract_county_from_notice(raw_text: str, api_key: str) -> str:
+async def extract_county_from_notice(
+    raw_text: str,
+    api_key: str,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
+) -> str:
     """Classify the AL county where a notice is being filed/recorded.
 
     Used as a tiebreaker when regex-based county detection in
@@ -308,6 +361,8 @@ async def extract_county_from_notice(raw_text: str, api_key: str) -> str:
     try:
         parsed = await llm_client.chat_json_async(
             prompt, system=SYSTEM_PROMPT, max_tokens=64, api_key=api_key,
+            rate_tracker=rate_tracker,
+            required_keys=("county",),
         )
         if not parsed:
             return ""
@@ -327,6 +382,8 @@ async def auto_detect_notice_type(
     raw_text: str,
     county: str,
     api_key: str,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
 ) -> str | None:
     """Use LLM to classify notice type from OCR text.
 
@@ -346,6 +403,8 @@ async def auto_detect_notice_type(
     try:
         parsed = await llm_client.chat_json_async(
             prompt, system=SYSTEM_PROMPT, max_tokens=64, api_key=api_key,
+            rate_tracker=rate_tracker,
+            required_keys=_AUTO_DETECT_REQUIRED,
         )
         if not parsed or "notice_type" not in parsed:
             return None
