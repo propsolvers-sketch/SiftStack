@@ -196,10 +196,16 @@ async def screenshot(page, name: str) -> None:
 
 
 async def dismiss_popups(page) -> None:
-    """Dismiss notification popups and remove Beamer NPS overlay.
+    """Dismiss notification popups + Beamer NPS overlay + DataSift onboarding modals.
 
     The Beamer NPS survey iframe (#npsIframeContainer) blocks ALL pointer
     events globally — it MUST be removed before any click interactions.
+
+    Also dismisses DataSift first-time-user onboarding modals (Loom video
+    tutorials, class `Modalstyles__ModalOverlay-*` containing loom.com links).
+    These appear on fresh browsers like GHA runners that lack
+    `.datasift_profile/` cookies marking the user as "onboarded"; their
+    overlay intercepts every wizard click and times out the upload flow.
     """
     try:
         # Try clicking dismiss text elements first
@@ -242,6 +248,17 @@ async def dismiss_popups(page) -> None:
                     removed++;
                 }
             }
+            // Remove DataSift first-time-user onboarding modals (Loom video tutorials).
+            // Surgical: only nuke ModalOverlay elements that contain a Loom link, so
+            // legitimate wizard-driven modals (Skip Send-To, upload wizard) are unaffected.
+            // Triggered on fresh browsers like GHA runners that have no
+            // .datasift_profile/ cookies marking the user as "onboarded".
+            document.querySelectorAll('[class*="ModalOverlay"]').forEach(el => {
+                if (el.querySelector('a[href*="loom.com"]')) {
+                    el.remove();
+                    removed++;
+                }
+            });
             return removed;
         }""")
         if removed:
