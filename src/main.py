@@ -1115,7 +1115,7 @@ def cli_main() -> None:
     parser.add_argument(
         "--no-raw-csv",
         action="store_true",
-        help="Skip the legacy raw `tn_notices_<ts>.csv` export. The DataSift "
+        help="Skip the legacy raw `al_notices_<ts>.csv` export. The DataSift "
              "upload CSVs (datasift_upload_DMs_*.csv / _Heirs_*.csv) are "
              "produced regardless. Use this flag for daily workflows where "
              "you only need the DataSift uploads and want fewer output files.",
@@ -1920,7 +1920,7 @@ def _run_scrape_pipeline(args, searches) -> None:
     elif not getattr(args, "no_raw_csv", False):
         logging.info("Output: %s", write_csv(notices))
     else:
-        logging.debug("Skipping raw tn_notices CSV (--no-raw-csv set)")
+        logging.debug("Skipping raw al_notices CSV (--no-raw-csv set)")
     # Phase 2 funnel: datasift_uploaded gate stamps from the surviving
     # notice count after CSV write. CLI mode is symmetric with Apify on
     # this gate — both stamp from len(notices) post-CSV.
