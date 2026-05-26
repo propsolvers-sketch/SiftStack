@@ -71,6 +71,7 @@ None yet.
 |---|-------------|------|--------|-----------|
 | 260523-uvu | Move Madison/Marshall Smarty-zip geocode helpers into shared address_standardizer.py and wire them into the legacy main.py probate flow via property_lookup.py | 2026-05-24 | 07a48fa | [260523-uvu-move-madison-marshall-smarty-zip-geocode](./quick/260523-uvu-move-madison-marshall-smarty-zip-geocode/) |
 | 260525-ucl | Rename `tn_notices_*.csv` → `al_notices_*.csv` (3 string refs in `data_formatter.py` + `main.py`) — Phase 2 validation surfaced the stale TN-era CSV name on today's all-AL daily run | 2026-05-26 | fb9d953 | [260525-ucl-tn-to-al-csv-filename](./quick/260525-ucl-tn-to-al-csv-filename/) |
+| 260525-vop | Add surgical ModalOverlay+Loom dismissal to `dismiss_popups()` in `src/datasift_core.py` — fixes the GHA daily-sweep "Uploaded 0/1 splits" failure on all 3 DataSift uploads (root cause: fresh GHA browser → no `.datasift_profile/` → DataSift treats session as first-time user → Loom-video onboarding modal intercepts every wizard click) | 2026-05-26 | 08042b7 | [260525-vop-modaloverlay-loom-dismissal](./quick/260525-vop-modaloverlay-loom-dismissal/) |
 
 ## Deferred Items
 
