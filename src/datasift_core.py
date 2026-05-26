@@ -249,12 +249,17 @@ async def dismiss_popups(page) -> None:
                 }
             }
             // Remove DataSift first-time-user onboarding modals (Loom video tutorials).
-            // Surgical: only nuke ModalOverlay elements that contain a Loom link, so
-            // legitimate wizard-driven modals (Skip Send-To, upload wizard) are unaffected.
+            // Narrow selector: only nuke ModalOverlay elements that contain a Loom
+            // link AND have no <input>/<form>/<textarea>/<select> descendants. This
+            // distinguishes a small tooltip-overlay (no data entry) from the upload
+            // wizard or other legit data-entry modals (which always have inputs).
             // Triggered on fresh browsers like GHA runners that have no
             // .datasift_profile/ cookies marking the user as "onboarded".
+            // History: 2026-05-26 hotfix narrowed from "any modal w/ loom link"
+            // (which nuked the upload wizard itself — wizard has inline help link).
             document.querySelectorAll('[class*="ModalOverlay"]').forEach(el => {
-                if (el.querySelector('a[href*="loom.com"]')) {
+                if (el.querySelector('a[href*="loom.com"]')
+                    && !el.querySelector('input, form, textarea, select')) {
                     el.remove();
                     removed++;
                 }

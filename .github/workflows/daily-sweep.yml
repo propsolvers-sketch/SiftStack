@@ -1,12 +1,17 @@
 name: SiftStack Daily Sweep
 
-# 11:00 UTC fires at 6 AM EDT (Mar-Nov) / 7 AM EST (Nov-Mar). One-hour drift
-# during EST is intentional — running two crons with `if:` guards is more
-# fragile than tolerating a 1-hour winter shift. Manual workflow_dispatch
-# lets you trigger ad-hoc runs from the GitHub Actions UI.
+# 07:00 UTC fires at 2 AM CDT (Mar-Nov) / 1 AM CST (Nov-Mar). Moved from
+# 11:00 UTC to 07:00 UTC on 2026-05-26 because GitHub free-tier scheduled
+# workflows during 11:00–20:00 UTC peak hours were routinely delayed 4–8.5 hr
+# (observed 2026-05-22 through 2026-05-26: 6.5 / 3.8 / 3.9 / 6.3 / 8.5 hr).
+# 07:00 UTC sits in GitHub's overnight-quiet window and tends to complete in
+# <30 min, so results land by 3 AM CDT and the user wakes to a clean Slack
+# post. One-hour shift between CDT and CST is intentional drift — running two
+# crons with `if:` guards is more fragile than tolerating it. Manual
+# workflow_dispatch lets you trigger ad-hoc runs from the GitHub Actions UI.
 on:
   schedule:
-    - cron: '0 11 * * *'
+    - cron: '0 7 * * *'
   workflow_dispatch:
 
 permissions:
