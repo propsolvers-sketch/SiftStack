@@ -1042,7 +1042,7 @@ async def is_target_county_async(
     if api_key:
         try:
             from llm_parser import extract_county_from_notice
-            llm_county = await extract_county_from_notice(text, api_key)
+            llm_county = await extract_county_from_notice(text, api_key, rate_tracker=rate_tracker)
         except Exception as e:
             logger.debug("LLM county lookup error: %s", e)
             llm_county = ""
@@ -1170,6 +1170,7 @@ async def _try_extract_pdf_text(page: Page) -> str:
 
 async def parse_notice_page(
     page: Page, county: str, notice_type: str, llm_api_key: str | None = None,
+    *, rate_tracker: "ServiceRateTracker | None" = None,
 ) -> NoticeData:
     """Extract structured fields from a notice detail page (after CAPTCHA solve).
 
@@ -1251,6 +1252,7 @@ async def parse_notice_page(
 
         llm_result = await extract_with_llm(
             notice.raw_text, notice_type, county, llm_api_key,
+            rate_tracker=rate_tracker,
         )
 
         if notice_type == "probate":

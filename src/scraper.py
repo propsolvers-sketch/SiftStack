@@ -312,7 +312,7 @@ async def _scrape_notice(
                 await delay()
                 continue
 
-            notice = await parse_notice_page(page, search.county, search.notice_type, llm_api_key)
+            notice = await parse_notice_page(page, search.county, search.notice_type, llm_api_key, rate_tracker=rate_tracker)
             notice.source_url = detail_url
             if pub_date:
                 notice.date_added = pub_date
