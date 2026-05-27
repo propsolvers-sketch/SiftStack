@@ -196,17 +196,61 @@ async def screenshot(page, name: str) -> None:
 
 
 async def dismiss_popups(page) -> None:
-    """Dismiss notification popups + Beamer NPS overlay + DataSift onboarding modals.
+    """Dismiss notification popups + Beamer NPS overlay + DataSift coachmark tooltips.
 
     The Beamer NPS survey iframe (#npsIframeContainer) blocks ALL pointer
     events globally — it MUST be removed before any click interactions.
 
-    Also dismisses DataSift first-time-user onboarding modals (Loom video
-    tutorials, class `Modalstyles__ModalOverlay-*` containing loom.com links).
-    These appear on fresh browsers like GHA runners that lack
-    `.datasift_profile/` cookies marking the user as "onboarded"; their
-    overlay intercepts every wizard click and times out the upload flow.
+    Also dismisses DataSift's product-tour coachmark — a tooltip with class
+    `Modalstyles__ModalOverlay-*` containing a `loom.com` "Click here to learn
+    how this section works" link. It fires CONTEXTUALLY each time the upload
+    wizard opens (fresh browser sessions get it; persistent sessions retain
+    the dismiss state). It must be dismissed via its X close button — NOT
+    removed from the DOM, because the upload wizard is rendered as a sibling
+    of the tooltip inside the same modal container, and DOM removal would
+    take the wizard with it (root cause of the 2026-05-26 / 2026-05-27 GHA
+    upload failures).
+
+    History: confirmed via failure screenshot in GHA artifact
+    siftstack-output-26538779253 (datasift_step1_wizard_opened.png).
     """
+    # ── Loom-tooltip coachmark: click X (or Esc) to dismiss ─────────
+    # Done BEFORE the JS-removal block below so the UI-native dismiss path
+    # runs first; if it works, the overlay is gone before we even consider
+    # nuking elements from the DOM.
+    try:
+        loom_overlay = page.locator(
+            '[class*="ModalOverlay"]:has(a[href*="loom.com"])'
+        ).first
+        if await loom_overlay.count() > 0:
+            # Try the X button in the modal header (standard placement)
+            close_candidates = [
+                '[class*="ModalHeader"] button',
+                '[class*="ModalHeader"] [role="button"]',
+                '[aria-label*="close" i]',
+                '[aria-label*="dismiss" i]',
+                'button:has(svg)',
+            ]
+            dismissed = False
+            for sel in close_candidates:
+                btn = loom_overlay.locator(sel).first
+                if await btn.count() > 0:
+                    try:
+                        await btn.click(force=True, timeout=2000)
+                        await page.wait_for_timeout(400)
+                        logger.debug("Dismissed Loom tooltip via selector: %s", sel)
+                        dismissed = True
+                        break
+                    except Exception:
+                        continue
+            # Fallback: Escape key (works on many modal libraries)
+            if not dismissed:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(400)
+                logger.debug("Dismissed Loom tooltip via Escape key (fallback)")
+    except Exception as e:
+        logger.debug("Loom tooltip dismissal attempt failed: %s", e)
+
     try:
         # Try clicking dismiss text elements first
         for text in ["NO, THANKS", "No, thanks", "No Thanks", "NO THANKS", "Not Now", "Dismiss"]:
@@ -248,22 +292,6 @@ async def dismiss_popups(page) -> None:
                     removed++;
                 }
             }
-            // Remove DataSift first-time-user onboarding modals (Loom video tutorials).
-            // Narrow selector: only nuke ModalOverlay elements that contain a Loom
-            // link AND have no <input>/<form>/<textarea>/<select> descendants. This
-            // distinguishes a small tooltip-overlay (no data entry) from the upload
-            // wizard or other legit data-entry modals (which always have inputs).
-            // Triggered on fresh browsers like GHA runners that have no
-            // .datasift_profile/ cookies marking the user as "onboarded".
-            // History: 2026-05-26 hotfix narrowed from "any modal w/ loom link"
-            // (which nuked the upload wizard itself — wizard has inline help link).
-            document.querySelectorAll('[class*="ModalOverlay"]').forEach(el => {
-                if (el.querySelector('a[href*="loom.com"]')
-                    && !el.querySelector('input, form, textarea, select')) {
-                    el.remove();
-                    removed++;
-                }
-            });
             return removed;
         }""")
         if removed:
