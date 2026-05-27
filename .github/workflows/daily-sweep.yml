@@ -138,6 +138,42 @@ jobs:
             --skip-trace \
             -v 2>&1 | tee logs/daily_pre_${{ steps.run_start.outputs.ts }}.log
 
+      # ── DataSift session cookies (fixes Loom-modal failure mode) ──
+      # Fresh GHA browsers have no DataSift session cookies → DataSift treats
+      # the runner as a first-time user → onboarding modal with a Loom-video
+      # tutorial overlay intercepts every wizard click → "Tag input not found"
+      # / "Could not find file input element" / Uploaded 0/1 splits on EVERY
+      # CSV upload (observed daily 2026-05-22 through 2026-05-27).
+      #
+      # Fix: persist datasift_cookies.json across runs. save_cookies()/
+      # load_cookies() in src/datasift_core.py already handle the file —
+      # this just keeps it warm across ephemeral runners.
+      #
+      # Bootstrap: first run (or whenever the cache is empty) loads cookies
+      # from the DATASIFT_COOKIES_B64 secret, which the user set via:
+      #   base64 -i datasift_cookies.json | gh secret set DATASIFT_COOKIES_B64
+      # Subsequent runs use the cache (save_cookies refreshes the file
+      # during each run so the next save covers any session token rotation).
+      - name: Restore DataSift session cookies cache
+        uses: actions/cache@v4
+        with:
+          path: datasift_cookies.json
+          key: datasift-cookies-${{ github.run_id }}
+          restore-keys: |
+            datasift-cookies-
+
+      - name: Bootstrap DataSift cookies from secret if cache empty
+        run: |
+          if [ -f datasift_cookies.json ]; then
+            echo "datasift_cookies.json restored from cache ($(wc -c < datasift_cookies.json) bytes)"
+          elif [ -n "${{ secrets.DATASIFT_COOKIES_B64 }}" ]; then
+            echo "${{ secrets.DATASIFT_COOKIES_B64 }}" | base64 -d > datasift_cookies.json
+            echo "Bootstrapped datasift_cookies.json from DATASIFT_COOKIES_B64 secret ($(wc -c < datasift_cookies.json) bytes)"
+          else
+            echo "WARNING: no cached cookies AND no DATASIFT_COOKIES_B64 secret — DataSift upload likely to fail on first-time-user onboarding modal."
+            echo "         Bootstrap via: base64 -i datasift_cookies.json | gh secret set DATASIFT_COOKIES_B64"
+          fi
+
       # ── Consolidated upload + single Slack post ──
       # daily_finalize.py:
       #   (1) parses each daily_<pipeline>_<ts>.log for funnel numbers
