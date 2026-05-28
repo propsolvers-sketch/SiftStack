@@ -251,6 +251,8 @@ def _categorize(p: Path) -> str:
         return "main_dms"
     if "_Heirs_" in p.name:
         return "main_heirs"
+    if "code_violation" in p.name:
+        return "code_violation"
     try:
         with open(p, newline="", encoding="utf-8") as f:
             row = next(csv.DictReader(f), None)
@@ -260,6 +262,8 @@ def _categorize(p: Path) -> str:
                 return "pre_probate"
             if nt == "probate":
                 return "apn_probate"
+            if nt == "code_violation":
+                return "code_violation"
     except Exception:
         pass
     return "unknown"

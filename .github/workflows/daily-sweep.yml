@@ -119,6 +119,7 @@ jobs:
             --types foreclosure,probate \
             --tiers 1,2 \
             --no-raw-csv \
+            --notify-slack \
             -v 2>&1 | tee logs/daily_main_${{ steps.run_start.outputs.ts }}.log
 
       # ── Pipeline 2: apn_probate (probate-dedicated post-probate path) ──
@@ -151,6 +152,24 @@ jobs:
             --datasift-csv \
             --skip-trace \
             -v 2>&1 | tee logs/daily_pre_${{ steps.run_start.outputs.ts }}.log
+
+      # ── Pipeline 4: code_violation (cross-city unified pipeline) ──
+      # Pulls Huntsville Unsafe Buildings PDF + Birmingham Accela + Hoover
+      # SeeClickFix in one pass. --enrich-owner runs the tax-roll address
+      # lookup (~80% hit rate for owner_name). CSV filename matches the
+      # datasift_upload*.csv glob in daily_finalize.py so the consolidated
+      # finalizer picks it up; _categorize() recognizes code_violation in
+      # row 1's Notice Type. Independent of seen_ids.json — order doesn't
+      # matter for ordering with the other pipelines.
+      - name: Run code_violation
+        continue-on-error: true
+        run: |
+          python src/code_violation_pipeline.py \
+            --counties Jefferson,Madison,Marshall \
+            --tiers 1,2 \
+            --enrich-owner \
+            --output-datasift-csv output/datasift_upload_code_violations_${{ steps.run_start.outputs.ts }}.csv \
+            2>&1 | tee logs/daily_code_${{ steps.run_start.outputs.ts }}.log
 
       # ── DataSift session cookies (fixes Loom-modal failure mode) ──
       # Fresh GHA browsers have no DataSift session cookies → DataSift treats
