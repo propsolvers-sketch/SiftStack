@@ -1,24 +1,31 @@
 name: SiftStack Daily Sweep
 
-# 08:30 UTC fires at 3:30 AM CST (Nov-Mar) / 3:30 AM CDT base-time, which
-# becomes 4:30 AM during the half of the year on CDT. Pipeline runtime is
-# ~60 min, so Slack post lands ~09:30 UTC = 3:30 AM CST. Set on 2026-05-28
-# alongside the GitHub Team plan upgrade — paid-plan scheduled workflows
-# do NOT have the 4–11 hr free-tier queueing delays observed throughout May
-# (see history below).
+# 07:30 UTC fires at 2:30 AM CST (Nov-Mar) / 2:30 AM CDT base-time, which
+# becomes 3:30 AM CDT in summer. Pipeline runtime is ~60 min, so Slack post
+# lands ~08:30 UTC = 3:30 AM CDT during summer (the half of the year the
+# user is in for 8 months) and 2:30 AM CST during winter. The user's hard
+# requirement is "before 5 AM" and the preference is to land closest to
+# 3:30 AM in their actual local time during the active summer half.
+#
+# Pairs with the GitHub Pro upgrade (2026-05-28) — paid-plan scheduled
+# workflows do NOT have the 4-11 hr free-tier queueing delays observed
+# throughout May (see history below). Pro is the user-account equivalent of
+# Team plan; both put the account in the same paid-priority cron queue.
 #
 # History:
 #   2026-05-22 → 26 (free tier, 11:00 UTC cron): delays 6.5 / 3.8 / 3.9 / 6.3 / 8.5 hr
 #   2026-05-26 → moved to 07:00 UTC hoping for an overnight-quiet window
 #   2026-05-27 (07:00 UTC cron, still free tier): delayed 11 hr to 18:08 UTC — quiet-window theory disproved
-#   2026-05-28: upgraded to Team plan + moved cron to 08:30 UTC for 3:30 AM CST delivery
+#   2026-05-28 morning: upgraded to GitHub Pro
+#   2026-05-28 first cron attempt: 08:30 UTC → 3:30 AM CST (winter) / 4:30 AM CDT (summer)
+#   2026-05-28 revised: 07:30 UTC → 3:30 AM CDT (summer, current) / 2:30 AM CST (winter)
 #
 # One-hour drift between CDT and CST is intentional — running two crons
 # with `if:` guards is more fragile than tolerating it. Manual
 # workflow_dispatch lets you trigger ad-hoc runs from the GitHub Actions UI.
 on:
   schedule:
-    - cron: '30 8 * * *'
+    - cron: '30 7 * * *'
   workflow_dispatch:
 
 permissions:
