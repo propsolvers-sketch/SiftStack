@@ -1,31 +1,31 @@
 name: SiftStack Daily Sweep
 
-# 07:30 UTC fires at 2:30 AM CST (Nov-Mar) / 2:30 AM CDT base-time, which
-# becomes 3:30 AM CDT in summer. Pipeline runtime is ~60 min, so Slack post
-# lands ~08:30 UTC = 3:30 AM CDT during summer (the half of the year the
-# user is in for 8 months) and 2:30 AM CST during winter. The user's hard
-# requirement is "before 5 AM" and the preference is to land closest to
-# 3:30 AM in their actual local time during the active summer half.
+# Daily fire is driven by EXTERNAL CRON, not GHA's `schedule:` trigger.
 #
-# Pairs with the GitHub Pro upgrade (2026-05-28) — paid-plan scheduled
-# workflows do NOT have the 4-11 hr free-tier queueing delays observed
-# throughout May (see history below). Pro is the user-account equivalent of
-# Team plan; both put the account in the same paid-priority cron queue.
+# A cronjob at cron-job.org (account: propsolvers@gmail.com) POSTs to
+# https://api.github.com/repos/propsolvers-sketch/SiftStack/actions/workflows/daily-sweep.yml/dispatches
+# at 02:30 America/Chicago daily (DST-handled by cron-job.org, so Slack
+# reliably lands at ~3:30 AM local year-round). Uses a fine-grained GitHub
+# PAT (Actions: Read+Write, SiftStack only, expires 2026-08-27).
 #
-# History:
+# Why no `schedule:` trigger here: GHA's scheduled cron proved unreliable —
+# delayed 4–11 hr on free tier (2026-05-22 → 27), then silently stopped
+# firing entirely for 2+ consecutive days (2026-05-28 / 29) even on GitHub
+# Pro with a correct cron and `state: active`. The pattern matches GHA's
+# undocumented "deprioritize on consecutive failures" behavior, and once
+# tripped it doesn't recover. workflow_dispatch is provably 100% reliable.
+#
+# History (left for context; do not re-add `schedule:` without solving the
+# underlying GHA cron-reliability issue):
 #   2026-05-22 → 26 (free tier, 11:00 UTC cron): delays 6.5 / 3.8 / 3.9 / 6.3 / 8.5 hr
 #   2026-05-26 → moved to 07:00 UTC hoping for an overnight-quiet window
-#   2026-05-27 (07:00 UTC cron, still free tier): delayed 11 hr to 18:08 UTC — quiet-window theory disproved
-#   2026-05-28 morning: upgraded to GitHub Pro
-#   2026-05-28 first cron attempt: 08:30 UTC → 3:30 AM CST (winter) / 4:30 AM CDT (summer)
-#   2026-05-28 revised: 07:30 UTC → 3:30 AM CDT (summer, current) / 2:30 AM CST (winter)
+#   2026-05-27 (07:00 UTC cron, free tier): delayed 11 hr to 18:08 UTC — quiet-window theory disproved
+#   2026-05-28 morning: upgraded to GitHub Pro; cron stayed paused (no schedule fires for 2 days)
+#   2026-05-29: cut over to cron-job.org → workflow_dispatch API; removed `schedule:` trigger
 #
-# One-hour drift between CDT and CST is intentional — running two crons
-# with `if:` guards is more fragile than tolerating it. Manual
-# workflow_dispatch lets you trigger ad-hoc runs from the GitHub Actions UI.
+# Manual workflow_dispatch from the GitHub Actions UI still works for ad-hoc
+# runs (same path the external cron uses).
 on:
-  schedule:
-    - cron: '30 7 * * *'
   workflow_dispatch:
 
 permissions:
