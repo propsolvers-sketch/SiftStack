@@ -149,6 +149,7 @@ async def login(page, email: str = None, password: str = None) -> bool:
         current_url = page.url
         if "/login" not in current_url and ("/dashboard" in current_url or "/records" in current_url):
             logger.info("DataSift session restored from cookies")
+            await install_loom_auto_dismiss(page)
             return True
         logger.info("DataSift cookies expired (url=%s), doing fresh login", current_url)
 
@@ -181,6 +182,7 @@ async def login(page, email: str = None, password: str = None) -> bool:
 
     await save_cookies(page)
     logger.info("DataSift login successful")
+    await install_loom_auto_dismiss(page)
     return True
 
 
@@ -193,6 +195,89 @@ async def screenshot(page, name: str) -> None:
         logger.debug("Screenshot: datasift_%s.png", name)
     except Exception as e:
         logger.debug("Screenshot failed (%s): %s", name, e)
+
+
+# ── Persistent Loom-tooltip dismisser ────────────────────────────────
+# Background MutationObserver that auto-clicks the X on any DataSift
+# coachmark tooltip the moment it appears. Necessary because the tooltip
+# is session-scoped (DataSift tracks "user dismissed coachmark X" in
+# localStorage, NOT cookies) and re-fires on different UI transitions
+# throughout a session — wizard tag step, filter panel, etc. The one-shot
+# dismiss_popups() call only handles the first appearance; this observer
+# catches all subsequent ones automatically.
+#
+# Idempotent — guard via window.__siftStackLoomDismisserInstalled so
+# repeat installs are a no-op. DOM removal is intentionally NOT used (the
+# wizard is rendered as a sibling inside the same ModalOverlay container;
+# nuking the overlay nukes the wizard — root cause of 2026-05-26/27
+# upload failures). Click-X path mirrors the cascade in dismiss_popups().
+_LOOM_AUTO_DISMISS_JS = r"""
+(function () {
+  if (window.__siftStackLoomDismisserInstalled) return;
+  window.__siftStackLoomDismisserInstalled = true;
+
+  const closeSelectors = [
+    '[class*="ModalHeader"] button',
+    '[class*="ModalHeader"] [role="button"]',
+    '[aria-label*="close" i]',
+    '[aria-label*="dismiss" i]',
+    'button:has(svg)',
+  ];
+
+  function tryDismiss() {
+    const overlays = document.querySelectorAll('[class*="ModalOverlay"]');
+    for (const overlay of overlays) {
+      if (!overlay.querySelector('a[href*="loom.com"]')) continue;
+      // Skip if it has a form/input/textarea — that's a real data-entry
+      // modal (upload wizard, edit dialog), not a coachmark tooltip.
+      if (overlay.querySelector('input, form, textarea, select')) continue;
+      for (const sel of closeSelectors) {
+        const btn = overlay.querySelector(sel);
+        if (btn) {
+          try { btn.click(); } catch (e) { /* ignore */ }
+          return;
+        }
+      }
+    }
+  }
+
+  // Initial pass for any tooltip already on the page when this runs.
+  tryDismiss();
+
+  // Future mutations — covers SPA route changes + dialog opens.
+  const observer = new MutationObserver(tryDismiss);
+  observer.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+  });
+})();
+"""
+
+
+async def install_loom_auto_dismiss(page) -> None:
+    """Install the persistent Loom-tooltip auto-dismisser on the page + context.
+
+    Idempotent — the JS guard prevents double-install. Safe to call multiple
+    times throughout a session (e.g. after navigation between SPA routes).
+
+    Uses both injection paths:
+      - page.context.add_init_script: runs on every future page navigation
+        in this browser context (covers SPA route changes that create new
+        document contexts).
+      - page.evaluate: runs immediately on the current page (covers the
+        in-flight session where add_init_script would arrive too late).
+    """
+    try:
+        await page.context.add_init_script(_LOOM_AUTO_DISMISS_JS)
+    except Exception as e:
+        # add_init_script can fail if called after some context-level setup;
+        # the evaluate() call below still gives us coverage on this page.
+        logger.debug("add_init_script for Loom dismisser failed: %s", e)
+    try:
+        await page.evaluate(_LOOM_AUTO_DISMISS_JS)
+        logger.debug("Loom auto-dismisser installed on current page")
+    except Exception as e:
+        logger.debug("evaluate() for Loom dismisser failed: %s", e)
 
 
 async def dismiss_popups(page) -> None:
