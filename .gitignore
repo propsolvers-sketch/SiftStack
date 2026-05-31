@@ -31,6 +31,7 @@ venv/
 # Browser profiles (contain login data)
 .ancestry_profile/
 .datasift_profile/
+.madison_probate_profile/
 .playwright/
 
 # Apify local storage
@@ -44,6 +45,20 @@ test_photos/
 Skills for REI/
 *.skill
 *.plugin
+
+# Debug screenshots from Playwright runs (auto-generated, regen on demand)
+datasift_*.png
+src/datasift_*.png
+*_debug.png
+
+# One-off / scratch scripts (kept locally for reference, not part of repo history)
+fix_v3_csvs.py
+fix_v5_add_tier_tags.py
+fix_v5_owner_names.py
+upload_apn_probate_retry.py
+upload_test_existing_list.py
+upload_v3_to_datasift.py
+scripts/apn_orchestrator_synth_test.py
 
 # IDE & OS
 .vscode/
