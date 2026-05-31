@@ -1,4 +1,4 @@
-"""Room-by-room rehab cost estimation with 4-tier finish system.
+"""Room-by-room rehab cost estimation with 6-level finish system (Rehab Levels).
 
 Generates full rehab budgets, wholetail comparisons, and project timelines.
 Regional pricing calibrated for Knoxville / East Tennessee market.
@@ -19,25 +19,200 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# ── Regional multipliers ──────────────────────────────────────────────
-# Knoxville labor/materials costs relative to national average (1.0)
+# ── Regional multipliers (Birmingham = 1.00 baseline, pivoted 2026-05-29) ────
+# Per-sqft rates in PER_SQFT_BY_SIZE are calibrated to Birmingham metro directly.
+# Other regions scale relative to that anchor (the user's investor sheet provides
+# Birmingham-specific numbers; this pivot lets us read them verbatim).
 REGIONAL_MULTIPLIERS = {
-    "knoxville": 0.88,      # ~12% below national average
-    "blount": 0.86,          # Slightly lower than Knox
-    "national": 1.00,
-    "nashville": 0.95,
-    "chattanooga": 0.90,
+    # Alabama
+    "birmingham": 1.00,      # Jefferson + Shelby (Hoover, Vestavia, Alabaster) — BASELINE
+    "huntsville": 1.04,      # Madison — tech/aerospace labor premium
+    "albertville": 0.95,     # Marshall County — rural
+    # Tennessee
+    "knoxville": 0.96,       # ~4% below Birmingham
+    "blount": 0.93,
+    "nashville": 1.03,
+    "chattanooga": 0.98,
+    # Default fallback
+    "national": 1.09,        # ~9% above Birmingham (national avg)
 }
-DEFAULT_REGION = "knoxville"
+DEFAULT_REGION = "auto"  # resolver picks the right region from city+state
 
-# ── 4-Tier Finish System ─────────────────────────────────────────────
-# Cost per sqft by tier (national average, before regional multiplier)
-TIER_NAMES = {
-    1: "Minimum Viable",     # Cheapest materials, basic function
-    2: "Builder Grade",      # Standard new construction level
-    3: "Mid-Range Upgrade",  # Granite, hardwood, updated fixtures
-    4: "Premium/Custom",     # High-end finishes, custom work
+# City → region routing. Covers all cities active in the SiftStack pipeline today
+# (Jefferson + Shelby + Madison + Marshall AL, Knox + Blount TN). Unknown cities
+# fall back to the state-level default in resolve_region().
+_CITY_TO_REGION = {
+    # Jefferson County AL (Birmingham metro)
+    "birmingham": "birmingham", "bessemer": "birmingham", "hoover": "birmingham",
+    "vestavia hills": "birmingham", "mountain brook": "birmingham", "homewood": "birmingham",
+    "trussville": "birmingham", "hueytown": "birmingham", "pinson": "birmingham",
+    "pleasant grove": "birmingham", "center point": "birmingham", "fultondale": "birmingham",
+    "gardendale": "birmingham", "adamsville": "birmingham", "tarrant": "birmingham",
+    "forestdale": "birmingham", "brighton": "birmingham", "irondale": "birmingham",
+    "leeds": "birmingham", "midfield": "birmingham", "fairfield": "birmingham",
+    # Shelby County AL (Birmingham southern bedroom communities — same labor pool)
+    "alabaster": "birmingham", "helena": "birmingham", "pelham": "birmingham",
+    "calera": "birmingham", "columbiana": "birmingham", "chelsea": "birmingham",
+    "indian springs": "birmingham", "vincent": "birmingham", "wilsonville": "birmingham",
+    "montevallo": "birmingham",
+    # Madison County AL (Huntsville metro)
+    "huntsville": "huntsville", "madison": "huntsville", "owens cross roads": "huntsville",
+    "gurley": "huntsville", "new hope": "huntsville", "new market": "huntsville",
+    "triana": "huntsville", "harvest": "huntsville", "meridianville": "huntsville",
+    # Marshall County AL (Albertville/Boaz/Guntersville/Arab)
+    "albertville": "albertville", "boaz": "albertville", "guntersville": "albertville",
+    "arab": "albertville", "union grove": "albertville", "douglas": "albertville",
+    "grant": "albertville", "horton": "albertville",
+    # Knox County TN
+    "knoxville": "knoxville", "powell": "knoxville", "farragut": "knoxville",
+    "karns": "knoxville", "halls": "knoxville", "corryton": "knoxville",
+    # Blount County TN
+    "maryville": "blount", "alcoa": "blount", "friendsville": "blount",
+    "louisville": "blount", "rockford": "blount", "townsend": "blount",
 }
+
+# State-level fallback when city isn't in the routing table.
+_STATE_TO_REGION = {
+    "AL": "birmingham",   # Most AL pipeline activity is Birmingham metro
+    "TN": "knoxville",    # Legacy SiftStack TN scope
+}
+
+
+def resolve_region(city: str = "", state: str = "", region_override: str = "") -> str:
+    """Pick the right REGIONAL_MULTIPLIERS key from property location.
+
+    - If `region_override` is set AND not "auto", honor it (explicit user choice).
+    - Else look up the city (case-insensitive) in `_CITY_TO_REGION`.
+    - Else fall back to state-level default (`_STATE_TO_REGION`).
+    - Else "national" (1.00 multiplier — neutral).
+    """
+    if region_override and region_override.lower() != "auto":
+        return region_override.lower()
+    city_key = (city or "").strip().lower()
+    if city_key in _CITY_TO_REGION:
+        return _CITY_TO_REGION[city_key]
+    state_key = (state or "").strip().upper()
+    if state_key in _STATE_TO_REGION:
+        return _STATE_TO_REGION[state_key]
+    return "national"
+
+# ── 6 Rehab Levels (Birmingham investor sheet, 2026-05-29) ────────────────────
+# Cosmetic-scope LEVELS ONLY. Big 6 systems (roof, HVAC, HWH, plumbing, electrical,
+# foundation) are ALWAYS added separately via the big_tickets parameter — they
+# are NEVER included in the per-sqft base. This avoids double-counting and matches
+# the walkthrough discipline: "price the Big 6 first, then add cosmetics."
+# Renamed from "Tier" to "Rehab Level" 2026-05-29 to avoid confusion with ZIP tiers.
+REHAB_LEVEL_NAMES = {
+    1: "Low Rehab (Rental-Almost)",
+    2: "Mid Rehab (Salvageable Materials)",
+    3: "Full Rehab (Interior Cosmetics)",
+    4: "Full + Exterior Cosmetics",
+    5: "Full + Some Big 6",
+    6: "Gut Job (Interior Only)",
+}
+# Backward-compat alias (avoid touching every old import). New code uses REHAB_LEVEL_NAMES.
+TIER_NAMES = REHAB_LEVEL_NAMES
+
+# Per-sqft rates by size bucket — smaller houses cost MORE per sqft because
+# fixed kitchen/bath overhead is spread over fewer sqft. Anchor data from the
+# user's investor sheet (900 sqft and 1,035 sqft columns); larger sizes
+# extrapolated to taper as fixed-cost overhead becomes a smaller share.
+# All values are BIRMINGHAM-TARGETED ($/sqft); regional multiplier scales them.
+PER_SQFT_BY_SIZE = {
+    "small":    {1: 25, 2: 35, 3: 45, 4: 50, 5: 55, 6: 67},  # <950 sqft
+    "standard": {1: 15, 2: 25, 3: 35, 4: 40, 5: 45, 6: 62},  # 950-1,200 (sheet anchor)
+    "mid":      {1: 13, 2: 22, 3: 32, 4: 37, 5: 42, 6: 58},  # 1,200-1,700
+    "large":    {1: 15, 2: 25, 3: 30, 4: 40, 5: 45, 6: 62},  # 1,700+ (corrected 2026-05-30)
+}
+
+
+def _size_bucket(sqft: int) -> str:
+    if sqft < 950:
+        return "small"
+    if sqft < 1200:
+        return "standard"
+    if sqft < 1700:
+        return "mid"
+    return "large"
+
+
+def per_sqft_for(sqft: int, tier: int) -> float:
+    """Birmingham-target per-sqft rate for given size + tier."""
+    return PER_SQFT_BY_SIZE[_size_bucket(sqft)][tier]
+
+
+# ── Big 6 (always-add when seen at walkthrough — investor's rule) ──────────────
+# Per Google investor sheet — Foundation, Roof, HVAC, Water Heater, Plumbing,
+# Electrical. Cost values are Birmingham midpoints from sheet's range data;
+# scaled by regional multiplier (these are mostly labor-driven).
+# Roof is special: uses sqft × $5.00/roofing-sqft (where roofing sqft ≈ living × 1.20).
+ROOF_PER_ROOFING_SQFT = 5.00  # Birmingham mid (sheet range $3.50-$7.00)
+
+BIG_6_COSTS = {
+    "roof":         None,    # computed from sqft (see big_6_cost helper)
+    "hvac":         8500,    # sheet range $5K-$12K
+    "hwh":          1250,    # sheet range $1K-$1.5K (water heater — NEW per sheet)
+    "plumbing":     7500,    # sheet range $5K-$10K (full repipe + fixtures)
+    "electrical":   7500,    # sheet range $5K-$10K (panel + wiring scope)
+    "foundation":   4000,    # sheet rate $350-$450/pier × ~10 piers
+}
+BIG_6_LABELS = {
+    "roof": "Roof (Big 6)",
+    "hvac": "HVAC (Big 6)",
+    "hwh": "Water Heater (Big 6)",
+    "plumbing": "Plumbing (Big 6)",
+    "electrical": "Electrical (Big 6)",
+    "foundation": "Foundation (Big 6)",
+}
+
+# Optional adders (NOT in Big 6, but commonly needed)
+OPTIONAL_ADDERS = {
+    "septic":  10000,    # sheet range $5K-$15K — for rural/non-sewer properties
+    "sewer":   10000,    # $5K-$15K — lateral replacement (separate from Big 6 plumbing)
+    "windows": 10000,    # $6K-$14K — full house vinyl replacement
+    "rewire":  15000,    # $10K-$20K — knob-and-tube; on top of Big 6 electrical
+}
+OPTIONAL_ADDER_LABELS = {
+    "septic": "Septic system",
+    "sewer": "Sewer lateral",
+    "windows": "Windows (full)",
+    "rewire": "Full rewire (knob-and-tube)",
+}
+
+# Single lookup for any adder name (used by walkthrough flag)
+ALL_ADDERS = {**{k: BIG_6_LABELS[k] for k in BIG_6_COSTS},
+              **OPTIONAL_ADDER_LABELS}
+
+
+def big_6_cost(item: str, sqft: int = 0) -> int:
+    """Return Birmingham-target cost for any Big 6 or optional adder item."""
+    if item == "roof":
+        roof_sqft = int(sqft * 1.20) if sqft else 0
+        return round(ROOF_PER_ROOFING_SQFT * roof_sqft)
+    if item in BIG_6_COSTS:
+        return BIG_6_COSTS[item]
+    if item in OPTIONAL_ADDERS:
+        return OPTIONAL_ADDERS[item]
+    return 0
+
+
+def _contingency_pct(year_built: int, tier: int) -> float:
+    """Pick contingency % from property age (preferred) or tier (fallback).
+
+    Per Fast Walkthrough Formula Step 3:
+      - Newer / light cosmetic   → 10%
+      - 1960s-1990s moderate     → 15%
+      - Pre-1960 / distressed    → 25% (mid of 20-30%)
+    When year_built is unknown, fall back to tier-based defaults (1-6 scale).
+    """
+    if year_built:
+        if year_built < 1960:
+            return 0.25
+        if year_built < 1991:
+            return 0.15
+        return 0.10
+    # 6-tier fallback
+    return {1: 0.10, 2: 0.10, 3: 0.15, 4: 0.15, 5: 0.20, 6: 0.25}[tier]
 
 # ── Room cost tables ──────────────────────────────────────────────────
 # Each room category has cost ranges per tier: {tier: (materials, labor)}
@@ -84,7 +259,17 @@ PAINT_LABOR_PER_SQFT = {1: 0.80, 2: 1.00, 3: 1.20, 4: 1.50}
 
 # Fixed-cost items
 WINDOWS_PER_UNIT = {1: 250, 2: 400, 3: 650, 4: 1000}  # per window (materials + labor)
-ROOF_PER_SQFT = {1: 3.50, 2: 5.00, 3: 7.00, 4: 10.00}  # per roof sqft (≈ floor sqft × 1.1)
+# Birmingham-metro asphalt-shingle roof replacement, calibrated 2026-05-28.
+# Per-sqft is roofing-sqft (NOT floor-sqft — roof area runs 15-35% larger than floor
+# due to pitch, eaves, valleys; we use 1.20x as the working multiplier).
+# Tier mapping (per market reference data):
+#   1 = basic 3-tab shingles ($4.5K-$6.5K typical)
+#   2 = architectural shingles, most common ($6K-$9K typical)
+#   3 = upgraded architectural / starter impact-resistant ($7.5K-$9.5K)
+#   4 = full impact-resistant / premium ($10.5K+)
+# Includes: tear-off, synthetic underlayment, drip edge, ridge vent, cleanup, warranty.
+# Add separately if decking replacement is needed at inspection.
+ROOF_PER_SQFT = {1: 4.00, 2: 6.00, 3: 7.25, 4: 9.25}  # per ROOFING sqft (≈ floor sqft × 1.20)
 HVAC_COSTS = {1: 4000, 2: 6000, 3: 8500, 4: 12000}     # full system replacement
 ELECTRICAL_COSTS = {1: 2000, 2: 4000, 3: 7000, 4: 12000}  # panel + rewire
 PLUMBING_COSTS = {1: 1500, 2: 3000, 3: 5000, 4: 8000}    # repipe + fixtures
@@ -214,105 +399,91 @@ def _calc_fixed(category: str, cost_table: dict, tier: int, multiplier: float,
 def estimate_rehab(address: str = "", sqft: int = 0, bedrooms: int = 3,
                    bathrooms: float = 2.0, year_built: int = 0,
                    tier: int = 2, scope: str = "full",
-                   region: str = DEFAULT_REGION) -> RehabEstimate:
-    """Generate a full rehab estimate for a property.
+                   region: str = DEFAULT_REGION,
+                   big_tickets: list[str] | None = None,
+                   city: str = "", state: str = "") -> RehabEstimate:
+    """Generate a Fast Walkthrough rehab estimate.
+
+    Formula:
+      Step 1: base = sqft × PER_SQFT_BY_TIER[tier] × regional_multiplier
+      Step 2: + sum of opt-in big-ticket items (roof, hvac, etc.)
+      Step 3: × (1 + contingency_pct), where contingency is age-driven
+              (pre-1960 = 25%, 1960-1990 = 15%, post-1990 = 10%)
 
     Args:
-        address: Property address
-        sqft: Living square footage
-        bedrooms: Number of bedrooms
-        bathrooms: Number of bathrooms (e.g. 2.5)
-        year_built: Year built (affects which systems need replacement)
-        tier: Finish tier 1-4
-        scope: "full" (everything) or "wholetail" (cosmetic only)
-        region: Regional pricing key
+        address, city, state: Used by resolve_region when region == "auto"
+        sqft: Living sqft (defaults to 1500 if unknown)
+        tier: 1=Lipstick, 2=Moderate, 3=Heavy, 4=Full Gut
+        scope: "full" or "wholetail" (forces Tier 1, lipstick-only, no big tickets)
+        big_tickets: opt-in items, keys from BIG_TICKET_COSTS
+                     (e.g. ["roof","hvac"]). Defaults: none for Tier 1/2,
+                     roof+hvac+panel for Tier 3, all for Tier 4.
     """
+    # Resolve region from location if caller passed "auto" / blank
+    region = resolve_region(city, state, region)
     multiplier = REGIONAL_MULTIPLIERS.get(region.lower(), REGIONAL_MULTIPLIERS["national"])
-    tier = max(1, min(4, tier))
+    tier = max(1, min(6, tier))  # 6-tier system
 
-    # Default sqft if not provided
     if not sqft:
-        sqft = 1500  # Knoxville average for older SFH
+        sqft = 1500  # fallback when subject data missing
 
-    full_baths = int(bathrooms)
-    secondary_baths = max(0, full_baths - 1)
-    # Window estimate: ~1 per 100 sqft
-    window_count = max(8, sqft // 100)
+    # Wholetail = Rehab Level 1 (Low Rehab), no Big 6, simple contingency
+    if scope == "wholetail":
+        tier = 1
+        big_tickets = []
+
+    # Per walkthrough rule — Big 6 are ALWAYS opt-in adders, never auto.
+    # The per-sqft tier base covers cosmetic scope only; Big 6 items get added
+    # explicitly when seen at walkthrough. Investor's rule: "price the Big 6 first."
+    if big_tickets is None:
+        big_tickets = []
 
     rooms = []
 
-    # ── Always included (both wholetail and full) ─────────────────
-    # Kitchen
-    rooms.append(_calc_room("Kitchen", KITCHEN_COSTS, tier, multiplier))
+    # ── Step 1: Base scope (size-bucket × tier × regional multiplier) ──
+    base_per_sqft = per_sqft_for(sqft, tier) * multiplier
+    base_total = round(sqft * base_per_sqft)
+    rooms.append(RoomEstimate(
+        category=f"Base Scope — Rehab Level {tier}: {REHAB_LEVEL_NAMES[tier]}",
+        tier=tier,
+        materials=round(base_total * 0.45),
+        labor=round(base_total * 0.55),
+        total=base_total,
+        line_items={"per_sqft": round(base_per_sqft, 2), "sqft": sqft,
+                    "size_bucket": _size_bucket(sqft)},
+        weeks={1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 8}[tier],
+    ))
 
-    # Master bath
-    rooms.append(_calc_room("Master Bathroom", MASTER_BATH_COSTS, tier, multiplier))
-
-    # Secondary baths
-    if secondary_baths > 0:
-        rooms.append(_calc_room("Secondary Bathroom(s)", SECONDARY_BATH_COSTS,
-                                tier, multiplier, quantity=secondary_baths))
-
-    # Flooring (whole house)
-    rooms.append(_calc_per_sqft("Flooring", sqft, FLOORING_PER_SQFT,
-                                FLOORING_LABOR_PER_SQFT, tier, multiplier, "flooring"))
-
-    # Paint (whole house)
-    rooms.append(_calc_per_sqft("Paint (Interior)", sqft, PAINT_PER_SQFT,
-                                PAINT_LABOR_PER_SQFT, tier, multiplier, "paint"))
-
-    # Exterior
-    rooms.append(_calc_room("Exterior", EXTERIOR_COSTS, tier, multiplier))
-
-    # ── Full rehab only ───────────────────────────────────────────
-    if scope == "full":
-        # Windows
-        window_total = round(WINDOWS_PER_UNIT.get(tier, 400) * window_count * multiplier)
+    # ── Step 2: Big 6 + Optional adders (opt-in only) ──
+    for key in big_tickets:
+        if key not in BIG_6_COSTS and key not in OPTIONAL_ADDERS:
+            logger.warning("Unknown adder item: %s (valid: %s)",
+                           key, list(BIG_6_COSTS.keys()) + list(OPTIONAL_ADDERS.keys()))
+            continue
+        cost = round(big_6_cost(key, sqft) * multiplier)
+        label = BIG_6_LABELS.get(key) or OPTIONAL_ADDER_LABELS.get(key, key)
         rooms.append(RoomEstimate(
-            category="Windows", tier=tier,
-            materials=round(window_total * 0.6), labor=round(window_total * 0.4),
-            total=window_total,
-            line_items={"per_window": round(WINDOWS_PER_UNIT.get(tier, 400) * multiplier),
-                        "count": window_count},
-            weeks=TIMELINE_WEEKS["windows"].get(tier, 1),
+            category=label,
+            tier=tier,
+            materials=round(cost * 0.5),
+            labor=round(cost * 0.5),
+            total=cost,
+            line_items={"adder": key, "applied_multiplier": round(multiplier, 2)},
+            weeks={"roof": 1, "hvac": 1, "hwh": 0.25, "plumbing": 1.5,
+                   "electrical": 1, "foundation": 2, "septic": 1.5,
+                   "sewer": 1, "windows": 1, "rewire": 2}.get(key, 1),
         ))
 
-        # Roof (sqft × 1.1 for slope)
-        roof_sqft = int(sqft * 1.1)
-        roof_total = round(ROOF_PER_SQFT.get(tier, 5) * roof_sqft * multiplier)
-        rooms.append(RoomEstimate(
-            category="Roof", tier=tier,
-            materials=round(roof_total * 0.5), labor=round(roof_total * 0.5),
-            total=roof_total,
-            line_items={"per_sqft": round(ROOF_PER_SQFT.get(tier, 5) * multiplier, 2),
-                        "roof_sqft": roof_sqft},
-            weeks=TIMELINE_WEEKS["roof"].get(tier, 1),
-        ))
-
-        # HVAC
-        rooms.append(_calc_fixed("HVAC", HVAC_COSTS, tier, multiplier, "hvac"))
-
-        # Electrical
-        rooms.append(_calc_fixed("Electrical", ELECTRICAL_COSTS, tier, multiplier, "electrical"))
-
-        # Plumbing
-        rooms.append(_calc_fixed("Plumbing", PLUMBING_COSTS, tier, multiplier, "plumbing"))
-
-        # Foundation/Structural (only for older homes)
-        if year_built and year_built < 1970:
-            rooms.append(_calc_fixed("Foundation/Structural", FOUNDATION_COSTS,
-                                     tier, multiplier, "foundation"))
-
-    # ── Totals ────────────────────────────────────────────────────
+    # ── Step 3: Subtotals + age-based contingency ──
     total_materials = sum(r.materials for r in rooms)
     total_labor = sum(r.labor for r in rooms)
-    total_cost = total_materials + total_labor
-    # Parallel work reduces timeline: ~60% of sequential sum
-    total_weeks = sum(r.weeks for r in rooms) * 0.6
+    subtotal = total_materials + total_labor
+    total_weeks = sum(r.weeks for r in rooms) * 0.6  # parallel work assumption
 
-    permits = round(total_cost * 0.03)  # ~3% for permits
-    contingency = round(total_cost * 0.10)  # 10% contingency
-    grand_total = total_cost + permits + contingency
+    cont_pct = _contingency_pct(year_built, tier)
+    contingency = round(subtotal * cont_pct)
+    permits = round(subtotal * 0.03)  # ~3% permits (kept from prior model)
+    grand_total = subtotal + permits + contingency
 
     estimate = RehabEstimate(
         address=address,
@@ -327,15 +498,16 @@ def estimate_rehab(address: str = "", sqft: int = 0, bedrooms: int = 3,
         rooms=rooms,
         total_materials=round(total_materials),
         total_labor=round(total_labor),
-        total_cost=round(total_cost),
+        total_cost=round(subtotal),
         total_weeks=round(total_weeks, 1),
         permits_cost=permits,
+        contingency_pct=cont_pct,
         contingency_cost=contingency,
         grand_total=round(grand_total),
     )
 
-    logger.info("Rehab estimate for %s: %s scope, Tier %d (%s), Total $%s, ~%.0f weeks",
-                address or "property", scope, tier, TIER_NAMES[tier],
+    logger.info("Rehab estimate for %s: %s scope, Rehab Level %d (%s), Total $%s, ~%.0f weeks",
+                address or "property", scope, tier, REHAB_LEVEL_NAMES[tier],
                 f"{grand_total:,.0f}", total_weeks)
 
     return estimate
@@ -343,10 +515,12 @@ def estimate_rehab(address: str = "", sqft: int = 0, bedrooms: int = 3,
 
 def estimate_wholetail(address: str = "", sqft: int = 0, bedrooms: int = 3,
                        bathrooms: float = 2.0, year_built: int = 0,
-                       tier: int = 2, region: str = DEFAULT_REGION) -> RehabEstimate:
-    """Generate a wholetail (cosmetic-only) estimate."""
+                       tier: int = 2, region: str = DEFAULT_REGION,
+                       city: str = "", state: str = "") -> RehabEstimate:
+    """Generate a wholetail (cosmetic-only / lipstick) estimate."""
     return estimate_rehab(address, sqft, bedrooms, bathrooms, year_built,
-                          tier=min(tier, 2), scope="wholetail", region=region)
+                          tier=1, scope="wholetail", region=region,
+                          city=city, state=state)
 
 
 # ── Excel report generation ──────────────────────────────────────────
@@ -387,19 +561,168 @@ def _auto_col_widths(ws, min_w=12, max_w=35):
 
 def generate_rehab_report(full_est: RehabEstimate, wholetail_est: RehabEstimate | None = None,
                           output_path: str = "") -> str:
-    """Generate a 9-tab Excel workbook rehab estimate report."""
+    """Generate a 10-tab Excel workbook rehab estimate report."""
     wb = Workbook()
 
-    # ── Tab 1: Executive Summary ──────────────────────────────────
-    ws = wb.active
-    ws.title = "Executive Summary"
+    # ── Tab 1: Budget Matrix (Quick Reference) ────────────────────
+    # Single-glance view: subject's tier × size matrix with subject row highlighted.
+    ws0 = wb.active
+    ws0.title = "Budget Matrix"
+    ws0.cell(row=1, column=1, value="Rehab Budget Matrix — Birmingham Metro").font = _TITLE_FONT
+    ws0.cell(row=2, column=1, value=full_est.address or "Subject Property").font = _SUBTITLE_FONT
+    ws0.cell(row=3, column=1,
+        value=f"Subject: {full_est.sqft:,} sqft / {full_est.bedrooms}bd / {full_est.bathrooms}ba"
+              + (f" / built {full_est.year_built}" if full_est.year_built else "")
+              + f" — region: {full_est.region.title()} (×{full_est.regional_multiplier:.2f})"
+    ).font = _LABEL_FONT
+
+    # Subject's specific computed totals — called out prominently
+    row = 5
+    ws0.cell(row=row, column=1, value="── SUBJECT PROPERTY ESTIMATES ──").font = Font(
+        name="Calibri", bold=True, size=13, color="2F5496")
+    row += 1
+    ws0.cell(row=row, column=1, value=f"Full Rehab (Rehab Level {full_est.tier} — {REHAB_LEVEL_NAMES[full_est.tier]})").font = _LABEL_FONT
+    ws0.cell(row=row, column=2, value=full_est.grand_total).number_format = _MONEY_FMT
+    ws0.cell(row=row, column=2).font = Font(name="Calibri", bold=True, size=14, color="006100")
+    ws0.cell(row=row, column=2).fill = _GREEN_FILL
+    row += 1
+    if wholetail_est:
+        ws0.cell(row=row, column=1, value=f"Wholetail (Rehab Level 1 — {REHAB_LEVEL_NAMES[1]})").font = _LABEL_FONT
+        ws0.cell(row=row, column=2, value=wholetail_est.grand_total).number_format = _MONEY_FMT
+        ws0.cell(row=row, column=2).font = Font(name="Calibri", bold=True, size=14, color="006100")
+        ws0.cell(row=row, column=2).fill = _GREEN_FILL
+        row += 1
+
+    # Reference matrix
+    row += 2
+    ws0.cell(row=row, column=1, value="── BIRMINGHAM METRO REFERENCE MATRIX ──").font = Font(
+        name="Calibri", bold=True, size=13, color="2F5496")
+    row += 1
+    ws0.cell(row=row, column=1, value="Typical rehab budget by house size + condition tier").font = _LABEL_FONT
+    row += 2
+
+    # Header row — 6 tiers
+    headers = ["House Size", "1. Low Rehab\n(Rental-Almost)", "2. Mid Rehab\n(Salvageable)",
+               "3. Full Rehab\n(Int. Cosmetics)", "4. Full + Ext.\nCosmetics",
+               "5. Full + Some\nBig 6", "6. Gut Job\n(Interior)"]
+    for col, h in enumerate(headers, 1):
+        cell = ws0.cell(row=row, column=col, value=h)
+        cell.font = _HEADER_FONT
+        cell.fill = _HEADER_FILL
+        cell.alignment = _HEADER_ALIGN
+    matrix_header_row = row
+    row += 1
+
+    # Reference rows computed live from PER_SQFT_BY_SIZE × the subject's region
+    # multiplier — shows what each tier would cost AT the subject's market.
+    bucket_anchors = [("<950 sf",   "small",    900),
+                      ("1,000 sf",  "standard", 1000),
+                      ("1,200 sf",  "mid",      1200),  # 1200 → mid bucket
+                      ("1,500 sf",  "mid",      1500),
+                      ("2,000 sf",  "large",    2000)]
+    yellow = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    subj_bucket = _size_bucket(full_est.sqft or 0)
+    for row_label, bucket_key, sample_sf in bucket_anchors:
+        is_subject_row = (bucket_key == subj_bucket)
+        ws0.cell(row=row, column=1, value=row_label).font = (
+            Font(name="Calibri", bold=True, size=11) if is_subject_row else _LABEL_FONT)
+        ws0.cell(row=row, column=1).border = _THIN_BORDER
+        for tier in range(1, 7):
+            base = PER_SQFT_BY_SIZE[bucket_key][tier] * sample_sf * full_est.regional_multiplier
+            cell = ws0.cell(row=row, column=tier + 1, value=f"${base/1000:.0f}K")
+            cell.alignment = Alignment(horizontal="center")
+            cell.border = _THIN_BORDER
+            if is_subject_row:
+                cell.fill = yellow
+                cell.font = Font(name="Calibri", bold=True, size=11)
+        if is_subject_row:
+            ws0.cell(row=row, column=1).fill = yellow
+        row += 1
+
+    row += 1
+    ws0.cell(row=row, column=1,
+        value=f"↑ Subject is {full_est.sqft:,} sqft → '{subj_bucket}' size bucket (highlighted). "
+              f"Rates shown are BASE only — Big 6 adders not included."
+    ).font = _LABEL_FONT
+    row += 2
+
+    # ── Big 6 reference block ─────────────────────────────────────
+    ws0.cell(row=row, column=1, value="── BIG 6 ADDERS (always-add when seen at walkthrough) ──").font = Font(
+        name="Calibri", bold=True, size=13, color="2F5496")
+    row += 1
+    ws0.cell(row=row, column=1, value="Investor rule: walk the house, price the Big 6 first. Cosmetics don't kill deals — hidden systems do.").font = _LABEL_FONT
+    row += 2
+    ws0.cell(row=row, column=1, value="Item").font = _HEADER_FONT
+    ws0.cell(row=row, column=1).fill = _HEADER_FILL
+    ws0.cell(row=row, column=2, value="Birmingham Cost").font = _HEADER_FONT
+    ws0.cell(row=row, column=2).fill = _HEADER_FILL
+    ws0.cell(row=row, column=3, value="Sheet Range").font = _HEADER_FONT
+    ws0.cell(row=row, column=3).fill = _HEADER_FILL
+    ws0.cell(row=row, column=4, value="CLI Key").font = _HEADER_FONT
+    ws0.cell(row=row, column=4).fill = _HEADER_FILL
+    row += 1
+    subj_sqft = full_est.sqft or 1032
+    big_6_display = [
+        ("Roof",              f"${big_6_cost('roof', subj_sqft) * full_est.regional_multiplier:,.0f}",
+                              "$3.50-$7.00/sqft of roof area", "roof"),
+        ("HVAC",              f"${BIG_6_COSTS['hvac'] * full_est.regional_multiplier:,.0f}",
+                              "$5K-$12K", "hvac"),
+        ("Water Heater (HWH)", f"${BIG_6_COSTS['hwh'] * full_est.regional_multiplier:,.0f}",
+                              "$1K-$1.5K", "hwh"),
+        ("Plumbing",          f"${BIG_6_COSTS['plumbing'] * full_est.regional_multiplier:,.0f}",
+                              "$5K-$10K", "plumbing"),
+        ("Electrical",        f"${BIG_6_COSTS['electrical'] * full_est.regional_multiplier:,.0f}",
+                              "$5K-$10K", "electrical"),
+        ("Foundation",        f"${BIG_6_COSTS['foundation'] * full_est.regional_multiplier:,.0f}",
+                              "$350-$450/pier × ~10 piers", "foundation"),
+    ]
+    for label, cost, range_, key in big_6_display:
+        ws0.cell(row=row, column=1, value=label).font = _LABEL_FONT
+        ws0.cell(row=row, column=2, value=cost).font = _VALUE_FONT
+        ws0.cell(row=row, column=3, value=range_).font = _LABEL_FONT
+        ws0.cell(row=row, column=4, value=key).font = Font(name="Consolas", size=10)
+        row += 1
+    row += 1
+    ws0.cell(row=row, column=1, value="── OPTIONAL ADDERS ──").font = Font(name="Calibri", bold=True, size=11, color="555555")
+    row += 1
+    optional_display = [
+        ("Septic system", f"${OPTIONAL_ADDERS['septic'] * full_est.regional_multiplier:,.0f}", "$5K-$15K (rural/non-sewer)", "septic"),
+        ("Sewer lateral", f"${OPTIONAL_ADDERS['sewer'] * full_est.regional_multiplier:,.0f}", "$5K-$15K", "sewer"),
+        ("Windows (full)", f"${OPTIONAL_ADDERS['windows'] * full_est.regional_multiplier:,.0f}", "$6K-$14K", "windows"),
+        ("Full rewire (K&T)", f"${OPTIONAL_ADDERS['rewire'] * full_est.regional_multiplier:,.0f}", "$10K-$20K", "rewire"),
+    ]
+    for label, cost, range_, key in optional_display:
+        ws0.cell(row=row, column=1, value=label).font = _LABEL_FONT
+        ws0.cell(row=row, column=2, value=cost).font = _VALUE_FONT
+        ws0.cell(row=row, column=3, value=range_).font = _LABEL_FONT
+        ws0.cell(row=row, column=4, value=key).font = Font(name="Consolas", size=10)
+        row += 1
+
+    row += 2
+    ws0.cell(row=row, column=1, value="Formula:").font = Font(name="Calibri", bold=True, size=11)
+    row += 1
+    for note in [
+        "  Step 1: base = sqft × per-sqft (size-bucket × tier) × regional multiplier",
+        "  Step 2: + Big 6 / optional adders (--big-tickets roof,hvac,...) — ALWAYS opt-in",
+        "  Step 3: × age contingency (pre-1960 = 25%, 1960-1990 = 15%, post-1990 = 10%)",
+    ]:
+        ws0.cell(row=row, column=1, value=note).font = _LABEL_FONT
+        row += 1
+
+    ws0.column_dimensions["A"].width = 22
+    for c in ["B", "C", "D", "E", "F", "G"]:
+        ws0.column_dimensions[c].width = 18
+    ws0.row_dimensions[matrix_header_row].height = 42
+
+    # ── Tab 2: Executive Summary ──────────────────────────────────
+    ws = wb.create_sheet("Executive Summary")
     ws.cell(row=1, column=1, value="Rehab Cost Estimate").font = _TITLE_FONT
     ws.cell(row=2, column=1, value=full_est.address or "Subject Property").font = _SUBTITLE_FONT
     ws.cell(row=3, column=1, value=f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}").font = _LABEL_FONT
 
     row = 5
     data = [
-        ("Finish Tier", f"Tier {full_est.tier} — {TIER_NAMES[full_est.tier]}"),
+        ("Rehab Level", f"Level {full_est.tier} — {REHAB_LEVEL_NAMES[full_est.tier]}"),
         ("Region", f"{full_est.region.title()} (×{full_est.regional_multiplier:.2f})"),
         ("Property Size", f"{full_est.sqft:,} sqft"),
         ("Bed/Bath", f"{full_est.bedrooms}bd / {full_est.bathrooms}ba"),
@@ -595,7 +918,7 @@ def generate_rehab_report(full_est: RehabEstimate, wholetail_est: RehabEstimate 
     ws9 = wb.create_sheet("Notes & Assumptions")
     ws9.cell(row=1, column=1, value="Notes & Assumptions").font = _TITLE_FONT
     notes = [
-        f"Tier {full_est.tier}: {TIER_NAMES[full_est.tier]}",
+        f"Rehab Level {full_est.tier}: {REHAB_LEVEL_NAMES[full_est.tier]}",
         f"Regional multiplier: {full_est.region.title()} = {full_est.regional_multiplier:.2f}x national avg",
         "",
         "Tier Definitions:",
@@ -610,7 +933,7 @@ def generate_rehab_report(full_est: RehabEstimate, wholetail_est: RehabEstimate 
         "  - Timeline assumes parallel work (60% of sequential estimate)",
         "  - Foundation/structural work included only for homes built before 1970",
         "  - Window count estimated at 1 per 100 sqft of living area",
-        "  - Roof area estimated at 1.1x living area sqft",
+        "  - Roof area estimated at 1.20x living area sqft (Birmingham-metro median; range 1.15-1.35)",
         "",
         "Wholetail Scope includes: Kitchen, Bathrooms, Flooring, Paint, Exterior (cosmetic)",
         "Wholetail Excludes: Windows, Roof, HVAC, Electrical, Plumbing, Foundation",
@@ -627,7 +950,7 @@ def generate_rehab_report(full_est: RehabEstimate, wholetail_est: RehabEstimate 
     # Save
     if not output_path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_addr = "".join(c if c.isalnum() or c in " -" else "_" for c in (full_est.address or "property"))[:40]
+        safe_addr = "".join(c if c.isalnum() or c == "-" else "_" for c in (full_est.address or "property"))[:40]
         output_path = str(config.OUTPUT_DIR / f"rehab_estimate_{safe_addr}_{timestamp}.xlsx")
 
     wb.save(output_path)
@@ -641,21 +964,26 @@ def run_rehab_estimate(address: str = "", sqft: int = 0, bedrooms: int = 3,
                        bathrooms: float = 2.0, year_built: int = 0,
                        tier: int = 2, scope: str = "full",
                        region: str = DEFAULT_REGION,
-                       output_path: str = "") -> dict:
+                       output_path: str = "",
+                       big_tickets: list[str] | None = None,
+                       city: str = "", state: str = "") -> dict:
     """Run rehab estimation and generate report.
 
     Returns dict with estimates and report path.
     """
-    logger.info("Estimating rehab for: %s (%s sqft, Tier %d, %s scope)",
-                address or "property", sqft, tier, scope)
+    resolved = resolve_region(city, state, region)
+    if resolved != region and region != DEFAULT_REGION:
+        logger.info("Region resolver: %s → %s (from %s, %s)", region, resolved, city, state)
+    logger.info("Estimating rehab for: %s (%s sqft, Rehab Level %d, %s scope, region=%s)",
+                address or "property", sqft, tier, scope, resolved)
 
-    # Full rehab estimate
     full_est = estimate_rehab(address, sqft, bedrooms, bathrooms, year_built,
-                              tier=tier, scope="full", region=region)
+                              tier=tier, scope="full", region=resolved,
+                              big_tickets=big_tickets, city=city, state=state)
 
-    # Wholetail comparison
     wholetail_est = estimate_wholetail(address, sqft, bedrooms, bathrooms,
-                                       year_built, region=region)
+                                       year_built, region=resolved,
+                                       city=city, state=state)
 
     # Generate report
     report_path = generate_rehab_report(full_est, wholetail_est, output_path)

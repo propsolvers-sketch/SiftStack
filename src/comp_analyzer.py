@@ -15,6 +15,7 @@ Usage:
 import logging
 import math
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -30,20 +31,30 @@ logger = logging.getLogger(__name__)
 # ── API Configuration ─────────────────────────────────────────────────
 API_BASE = "https://api.openwebninja.com/realtime-zillow-data"
 PROPERTY_ENDPOINT = f"{API_BASE}/property-details-address"
-COMPS_ENDPOINT = f"{API_BASE}/similar-sale-homes"
+SEARCH_ENDPOINT = f"{API_BASE}/search"
+# Sold comps come from `/search?location=<zip>&home_status=RECENTLY_SOLD` — the same
+# query Zillow's web UI uses for its "Sold" filter. Returns the real sold price
+# (`unformattedPrice`) and sold date (`dateSold`, epoch-ms).
+# `nearbyHomes` inside `/property-details-address` is a fallback only — it's Zillow's
+# curated "you might also like" panel and rarely contains SOLD records.
 REQUEST_DELAY_MIN = 1.0
 REQUEST_DELAY_MAX = 2.0
 REQUEST_TIMEOUT = 30
-MAX_RETRIES = 2
+MAX_RETRIES = 4  # bumped from 2: OpenWeb Ninja returns 200/OK with empty `data` ~25% of calls
 
-# ── Comp selection defaults ───────────────────────────────────────────
-DEFAULT_RADIUS_MILES = 0.5
-MAX_RADIUS_MILES = 1.0
-DEFAULT_MONTHS_BACK = 6
-MAX_MONTHS_BACK = 12
-MIN_COMPS = 3
-TARGET_COMPS = 5
-MAX_COMPS = 7
+# ── Comp selection defaults (revised 2026-05-31 for dual-source pull) ─
+# Strategy: pull from BOTH Zillow + Redfin, dedupe, rank by similarity.
+# Start with tight 1mi/6mo window. If combined pool < TARGET, expand radius
+# then expand timeframe. Display top 10 by similarity; ARV = average of top 5.
+DEFAULT_RADIUS_MILES = 1.0      # Primary search radius — proximity is #1 weight
+MAX_RADIUS_MILES = 3.0          # Final fallback if combined pool still too thin
+DEFAULT_MONTHS_BACK = 6         # Primary lookback — recency matters for fast-moving markets
+MAX_MONTHS_BACK = 18            # Final fallback if combined pool still too thin
+MIN_COMPS = 3                   # Below this, ARV confidence drops to "low"
+TARGET_COMPS = 10               # Display target — 10 ranked-by-similarity comps shown on report
+MAX_COMPS = 10                  # Hard cap on comps in candidate pool after dedup
+ARV_AVG_TOP_N = 5               # 2026-05-31: ARV = mean of top N comps by similarity score
+                                # (replaces middle-3-by-price trimmed mean)
 
 # ── Adjustment values (Knoxville regional calibration) ────────────────
 # These are per-unit adjustment amounts used when a comp differs from subject
@@ -99,6 +110,7 @@ class CompProperty:
     year_built: int = 0
     lot_sqft: int = 0
     property_type: str = ""
+    detail_url: str = ""           # Zillow listing URL for clickable comps in report
     sold_price: float = 0.0
     sold_date: str = ""
     days_on_market: int = 0
@@ -109,6 +121,9 @@ class CompProperty:
     ppsf: float = 0.0
     bucket: str = ""  # "A" (non-disclosure baseline) or "B" (disclosure/adjusted)
     adjustments: dict = field(default_factory=dict)
+    # Source tracking (2026-05-31: dual-source comp pulls from Zillow + Redfin)
+    source: str = "zillow"  # "zillow", "redfin", or "zillow+redfin" if same comp confirmed by both
+    mls_number: str = ""
 
 
 @dataclass
@@ -158,7 +173,13 @@ def _api_get(endpoint: str, params: dict, api_key: str) -> dict | None:
             body = resp.json()
             if body.get("status") == "OK" and body.get("data"):
                 return body["data"]
-            return body if isinstance(body, list) else None
+            if isinstance(body, list):
+                return body
+            # 200 OK but empty `data` — OpenWeb Ninja flakes here intermittently.
+            # Brief backoff and retry rather than treat as "not found".
+            logger.warning("Empty data field (attempt %d/%d) — retrying", attempt, MAX_RETRIES)
+            time.sleep(1.5)
+            continue
         except requests.Timeout:
             logger.warning("Timeout (attempt %d/%d)", attempt, MAX_RETRIES)
         except requests.RequestException as e:
@@ -220,170 +241,634 @@ def fetch_subject_property(address: str, city: str = "", state: str = "TN",
     )
 
 
+_SOLD_STATUSES = {"SOLD", "RECENTLY_SOLD"}
+
+
+def _normalize_comp_item(item: dict, subject: SubjectProperty) -> dict | None:
+    """Normalize a /search or nearbyHomes record into a flat field dict.
+
+    The two endpoints return overlapping but differently-shaped records:
+    /search has top-level scalars (`address` as string, `dateSold` as epoch-ms,
+    `unformattedPrice` as int); nearbyHomes nests address in a sub-dict and
+    rarely populates `lastSoldDate`/`lastSoldPrice`. Returns None if the record
+    isn't a sold comp.
+    """
+    if not isinstance(item, dict):
+        return None
+
+    status = (item.get("homeStatus") or "").upper()
+    if status not in _SOLD_STATUSES:
+        return None
+
+    # Address can be a dict (nearbyHomes) or string (search)
+    addr = item.get("address")
+    if isinstance(addr, dict):
+        street = addr.get("streetAddress") or ""
+        city = addr.get("city") or ""
+        state = addr.get("state") or subject.state
+        zipc = str(addr.get("zipcode") or "")
+    else:
+        street = item.get("streetAddress") or item.get("addressStreet") or ""
+        city = item.get("city") or item.get("addressCity") or ""
+        state = item.get("state") or item.get("addressState") or subject.state
+        zipc = str(item.get("zipcode") or item.get("addressZipcode") or "")
+
+    # Sold price: search puts the real sold price in `unformattedPrice`/`price`;
+    # nearbyHomes occasionally has `lastSoldPrice` but usually `price` is the only signal.
+    sold_price = float(
+        item.get("unformattedPrice")
+        or item.get("lastSoldPrice")
+        or item.get("price")
+        or 0
+    )
+
+    # Sold date: search returns epoch-ms in `dateSold`; nearbyHomes returns a
+    # date string in `lastSoldDate` (or None).
+    sold_date = ""
+    ds = item.get("dateSold") or item.get("lastSoldDate")
+    if isinstance(ds, (int, float)):
+        try:
+            sold_date = datetime.fromtimestamp(int(ds) / 1000).strftime("%Y-%m-%d")
+        except (ValueError, OSError):
+            pass
+    elif isinstance(ds, str):
+        sold_date = ds[:10]
+
+    lot_sqft = 0
+    lot_val = item.get("lotAreaValue") or item.get("lotSize")
+    lot_units = (item.get("lotAreaUnits") or item.get("lotAreaUnit") or "").lower()
+    if lot_val:
+        try:
+            lot_sqft = int(float(lot_val) * 43560) if "acre" in lot_units else int(float(lot_val))
+        except (ValueError, TypeError):
+            pass
+
+    return {
+        "street": street, "city": city, "state": state, "zipc": zipc,
+        "lat": float(item.get("latitude") or 0),
+        "lon": float(item.get("longitude") or 0),
+        "sqft": int(item.get("livingArea") or item.get("area") or 0),
+        "bedrooms": int(item.get("bedrooms") or item.get("beds") or 0),
+        "bathrooms": float(item.get("bathrooms") or item.get("baths") or 0),
+        "year_built": int(item.get("yearBuilt") or 0),
+        "lot_sqft": lot_sqft,
+        "property_type": item.get("homeType") or item.get("propertyTypeDimension") or "",
+        "sold_price": sold_price,
+        "sold_date": sold_date,
+        "days_on_market": int(item.get("daysOnZillow") or 0),
+        "garage_spaces": int(item.get("garageSpaces") or 0),
+        "zpid": str(item.get("zpid") or item.get("id") or ""),
+        "detail_url": item.get("detailUrl") or item.get("hdpUrl") or "",
+    }
+
+
+def _fetch_zillow_sold_pool(subject: SubjectProperty, radius_miles: float,
+                            months_back: int, api_key: str) -> list[CompProperty]:
+    """Inner: pull RECENTLY_SOLD from Zillow via OpenWeb Ninja at the given window."""
+    if not subject.zip_code:
+        return []
+    search_data = _api_get(
+        SEARCH_ENDPOINT,
+        {"location": subject.zip_code, "home_status": "RECENTLY_SOLD"},
+        api_key,
+    )
+    items = search_data if isinstance(search_data, list) else []
+    logger.info("Zillow /search returned %d RECENTLY_SOLD records for ZIP %s",
+                len(items), subject.zip_code)
+    if not items:
+        full_address = f"{subject.address} {subject.city} {subject.state} {subject.zip_code}"
+        details = _api_get(PROPERTY_ENDPOINT, {"address": full_address}, api_key)
+        items = (details or {}).get("nearbyHomes") or []
+        logger.info("Zillow /search yielded 0 — fallback nearbyHomes (%d items)", len(items))
+    time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+
+    cutoff_date = (datetime.now() - timedelta(days=months_back * 30)).strftime("%Y-%m-%d")
+    comps = []
+    for item in items:
+        n = _normalize_comp_item(item, subject)
+        if not n:
+            continue
+        if n["street"] and n["street"].lower().strip() == subject.address.lower().strip():
+            continue
+        if n["sold_price"] < 10000:
+            continue
+        if n["sold_date"] and n["sold_date"] < cutoff_date:
+            continue
+        dist = 0.0
+        if subject.latitude and subject.longitude and n["lat"] and n["lon"]:
+            dist = _haversine_miles(subject.latitude, subject.longitude, n["lat"], n["lon"])
+            if dist > radius_miles:
+                continue
+        detail_url = n.get("detail_url") or ""
+        if not detail_url and n.get("zpid"):
+            detail_url = f"https://www.zillow.com/homedetails/{n['zpid']}_zpid/"
+        comp = CompProperty(
+            address=n["street"], city=n["city"], state=n["state"], zip_code=n["zipc"],
+            latitude=n["lat"], longitude=n["lon"], distance_miles=round(dist, 2),
+            sqft=n["sqft"], bedrooms=n["bedrooms"], bathrooms=n["bathrooms"],
+            year_built=n["year_built"], lot_sqft=n["lot_sqft"],
+            property_type=n["property_type"],
+            detail_url=detail_url,
+            sold_price=n["sold_price"], sold_date=n["sold_date"],
+            days_on_market=n["days_on_market"], garage_spaces=n["garage_spaces"],
+            source="zillow",
+        )
+        comp.ppsf = round(comp.sold_price / comp.sqft, 2) if comp.sqft else 0.0
+        if not comp.sqft or comp.ppsf < 30:
+            continue
+        comps.append(comp)
+    return comps
+
+
+def _fetch_redfin_sold_pool(subject: SubjectProperty, radius_miles: float,
+                            months_back: int) -> list[CompProperty]:
+    """Inner: pull SOLD listings from Redfin via the CSV API."""
+    try:
+        from redfin_pending_scraper import fetch_sold_comps_via_redfin
+    except ImportError:
+        return []
+    raw = fetch_sold_comps_via_redfin(
+        zip_code=subject.zip_code,
+        subject_lat=subject.latitude,
+        subject_lon=subject.longitude,
+        radius_miles=radius_miles,
+        months_back=months_back,
+        max_results=50,
+    )
+    comps = []
+    for r in raw:
+        if r["address"].lower().strip() == subject.address.lower().strip():
+            continue  # subject itself
+        comp = CompProperty(
+            address=r["address"], city=r["city"], state=r.get("state", subject.state),
+            zip_code=r["zip_code"],
+            latitude=r["latitude"], longitude=r["longitude"],
+            distance_miles=r["distance_miles"],
+            sqft=r["sqft"], bedrooms=r["bedrooms"], bathrooms=r["bathrooms"],
+            year_built=r["year_built"], lot_sqft=0,
+            property_type=r.get("property_type", ""),
+            detail_url=r["detail_url"],
+            sold_price=r["sold_price"], sold_date=r["sold_date"],
+            days_on_market=0, garage_spaces=0,
+            source="redfin",
+            mls_number=r.get("mls_number", ""),
+        )
+        comp.ppsf = r["ppsf"] or (round(r["sold_price"] / r["sqft"], 2) if r["sqft"] else 0.0)
+        if not comp.sqft or comp.ppsf < 30:
+            continue
+        comps.append(comp)
+    return comps
+
+
+def _normalize_address_key(addr: str) -> str:
+    """Stable dedup key — strips suffix variants, casing, punctuation."""
+    s = (addr or "").lower().strip()
+    # Drop common suffix variations
+    for long, short in [
+        (" street", " st"), (" drive", " dr"), (" road", " rd"),
+        (" avenue", " ave"), (" boulevard", " blvd"), (" lane", " ln"),
+        (" circle", " cir"), (" court", " ct"), (" place", " pl"),
+        (" terrace", " ter"), (" parkway", " pkwy"), (" highway", " hwy"),
+    ]:
+        s = s.replace(long, short)
+    # Strip punctuation + collapse whitespace
+    s = re.sub(r"[.,#]", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def _merge_dedupe_comps(zillow_comps: list[CompProperty],
+                        redfin_comps: list[CompProperty]) -> list[CompProperty]:
+    """Combine + dedupe Zillow and Redfin sold pools.
+
+    Match rule: normalized street address. When the same property exists in
+    both sources, prefer the Redfin record (MLS-direct = more reliable sold
+    price) but tag source as "zillow+redfin" so the report shows cross-
+    confirmation.
+    """
+    by_key: dict[str, CompProperty] = {}
+    for c in zillow_comps:
+        key = _normalize_address_key(c.address)
+        if key:
+            by_key[key] = c
+    for c in redfin_comps:
+        key = _normalize_address_key(c.address)
+        if not key:
+            continue
+        if key in by_key:
+            # Cross-confirmed comp — prefer Redfin's MLS price but flag both sources
+            existing = by_key[key]
+            c.source = "zillow+redfin"
+            # Preserve Zillow's detail_url if Redfin's is missing (Zillow URLs are reliable)
+            if not c.detail_url and existing.detail_url:
+                c.detail_url = existing.detail_url
+            # Preserve year_built if one source has it and the other doesn't
+            if not c.year_built and existing.year_built:
+                c.year_built = existing.year_built
+            by_key[key] = c
+        else:
+            by_key[key] = c
+    return list(by_key.values())
+
+
 def fetch_comparable_sales(subject: SubjectProperty, radius_miles: float = DEFAULT_RADIUS_MILES,
                            months_back: int = DEFAULT_MONTHS_BACK,
                            api_key: str = "") -> list[CompProperty]:
-    """Fetch comparable sold properties near the subject property."""
+    """Fetch comparable sold properties from BOTH Zillow + Redfin with tiered expansion.
+
+    Strategy (revised 2026-05-31):
+      1. Pull RECENTLY_SOLD from Zillow (OpenWeb Ninja) at requested radius/window
+      2. Pull SOLD from Redfin CSV API (via Webshare US residential proxy) at same window
+      3. Dedupe by normalized address → cross-confirmed comps tagged as both sources
+      4. If combined pool < MIN_COMPS, expand radius (1mi → 2mi → 3mi)
+      5. If still thin, expand timeframe (6mo → 12mo → 18mo)
+      6. Return all comps (similarity ranking + ARV-top-5 selection happen downstream)
+
+    Proximity is the heaviest single weight in similarity scoring, so starting
+    with a tight 1mi/6mo window and expanding only when necessary keeps the
+    candidate pool tightly clustered around the subject.
+    """
     api_key = api_key or config.OPENWEBNINJA_API_KEY
     if not api_key:
         return []
 
-    full_address = f"{subject.address} {subject.city} {subject.state} {subject.zip_code}"
-    data = _api_get(COMPS_ENDPOINT, {"address": full_address}, api_key)
+    # Tier 1: requested radius / months (default 1mi / 6mo)
+    pool = _dual_source_fetch(subject, radius_miles, months_back, api_key)
+    if len(pool) >= TARGET_COMPS:
+        return pool
 
-    time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+    # Tier 2: expand radius (cap at MAX_RADIUS_MILES), same timeframe
+    if radius_miles < MAX_RADIUS_MILES:
+        expanded_radius = min(radius_miles * 2.0, MAX_RADIUS_MILES)
+        logger.info("Pool size %d < %d — expanding radius %.1f → %.1f mi",
+                    len(pool), TARGET_COMPS, radius_miles, expanded_radius)
+        pool = _dual_source_fetch(subject, expanded_radius, months_back, api_key)
+        if len(pool) >= TARGET_COMPS:
+            return pool
+        radius_miles = expanded_radius
 
-    comps = []
-    items = data if isinstance(data, list) else (data.get("comps") or data.get("results") or []) if data else []
+    # Tier 3: extend timeframe (cap at MAX_MONTHS_BACK)
+    if months_back < MAX_MONTHS_BACK:
+        expanded_months = min(months_back * 2, MAX_MONTHS_BACK)
+        logger.info("Pool size %d still < %d — expanding lookback %d → %d months",
+                    len(pool), TARGET_COMPS, months_back, expanded_months)
+        pool = _dual_source_fetch(subject, radius_miles, expanded_months, api_key)
 
-    cutoff_date = (datetime.now() - timedelta(days=months_back * 30)).strftime("%Y-%m-%d")
+    return pool
 
-    for item in items:
-        if isinstance(item, str):
-            continue
 
-        # Parse sold info
-        sold_price = float(item.get("lastSoldPrice") or item.get("price") or 0)
-        sold_date = str(item.get("lastSoldDate") or item.get("dateSold") or "")[:10]
+def _dual_source_fetch(subject: SubjectProperty, radius_miles: float,
+                       months_back: int, api_key: str) -> list[CompProperty]:
+    """Pull from both Zillow + Redfin at a given radius/window and dedupe."""
+    zillow_comps = _fetch_zillow_sold_pool(subject, radius_miles, months_back, api_key)
+    redfin_comps = _fetch_redfin_sold_pool(subject, radius_miles, months_back)
+    merged = _merge_dedupe_comps(zillow_comps, redfin_comps)
+    z_only = sum(1 for c in merged if c.source == "zillow")
+    r_only = sum(1 for c in merged if c.source == "redfin")
+    both = sum(1 for c in merged if c.source == "zillow+redfin")
+    logger.info("Dual-source pool @ %.1fmi/%dmo: %d total (%d Zillow-only, %d Redfin-only, %d cross-confirmed)",
+                radius_miles, months_back, len(merged), z_only, r_only, both)
+    return merged
 
-        if not sold_price or sold_price < 10000:
-            continue
 
-        # Filter by date
-        if sold_date and sold_date < cutoff_date:
-            continue
+def fetch_pending_sales(subject: SubjectProperty, radius_miles: float = DEFAULT_RADIUS_MILES,
+                        api_key: str = "") -> list[dict]:
+    """Fetch under-contract / pending / contingent listings near subject.
 
+    Three-tier source strategy:
+      1. **Preferred — Redfin CSV API** (via Webshare US residential proxy).
+         Returns true Pending + Contingent listings with MLS-direct status.
+         Most reliable: Redfin's anti-bot is light enough that residential
+         proxy traffic flows through with no CAPTCHA. Requires
+         `ZILLOW_PROXY_URL` in .env.
+      2. **Tier 2 — Zillow scrape** (Playwright + Webshare). Same proxy. Often
+         blocked by PerimeterX even with residential IPs, so rarely succeeds
+         in practice — kept for the rare case it works.
+      3. **Tier 3 — OpenWeb Ninja /search FOR_SALE sorted by DOM ASC**.
+         Approximation only — fresh active listings, NOT true pending. Used
+         when both scrapes fail or no proxy is configured.
+
+    Returns dicts (not CompProperty — list price isn't a sold price) with:
+        address, list_price, sqft, bedrooms, bathrooms, year_built,
+        distance_miles, days_on_market, detail_url, status
+    """
+    # ── Tier 1: Redfin CSV API via Webshare residential proxy ──
+    if subject.zip_code and config.ZILLOW_PROXY_URL:
+        try:
+            from redfin_pending_scraper import fetch_pending_via_redfin
+            scraped = fetch_pending_via_redfin(
+                zip_code=subject.zip_code,
+                subject_lat=subject.latitude,
+                subject_lon=subject.longitude,
+                radius_miles=max(radius_miles, 2.0),
+                max_results=6,
+            )
+            if scraped:
+                logger.info("Got %d Pending/Contingent listings via Redfin for ZIP %s",
+                            len(scraped), subject.zip_code)
+                return scraped
+            logger.info("Redfin returned 0 pendings for ZIP %s — falling back to Zillow scrape",
+                        subject.zip_code)
+        except Exception as e:
+            logger.warning("Redfin scrape failed (%s) — falling back to Zillow scrape", e)
+
+    # ── Tier 2: Zillow scrape via Playwright (often blocked by PerimeterX) ──
+    if subject.zip_code and config.ZILLOW_PROXY_URL:
+        try:
+            from zillow_pending_scraper import fetch_pending_via_zillow
+            scraped = fetch_pending_via_zillow(
+                zip_code=subject.zip_code,
+                subject_lat=subject.latitude,
+                subject_lon=subject.longitude,
+                radius_miles=max(radius_miles, 2.0),
+                max_results=6,
+            )
+            if scraped:
+                logger.info("Got %d listings via Zillow scrape for ZIP %s",
+                            len(scraped), subject.zip_code)
+                return scraped
+            logger.info("Zillow scrape returned 0 — falling back to FOR_SALE fresh-listings proxy")
+        except Exception as e:
+            logger.warning("Zillow pending scrape failed (%s) — falling back to FOR_SALE proxy", e)
+
+    # ── Tier 3: FOR_SALE fresh-listings proxy via OpenWeb Ninja ──
+    api_key = api_key or config.OPENWEBNINJA_API_KEY
+    if not api_key or not subject.zip_code:
+        return []
+    data = _api_get(
+        SEARCH_ENDPOINT,
+        {"location": subject.zip_code, "home_status": "FOR_SALE"},
+        api_key,
+    )
+    items = data if isinstance(data, list) else []
+    logger.info("/search returned %d FOR_SALE records for ZIP %s (fallback proxy for pendings)",
+                len(items), subject.zip_code)
+
+    def _parse(item):
+        if not isinstance(item, dict):
+            return None
+        price = item.get("unformattedPrice") or item.get("price") or 0
+        sqft = item.get("livingArea") or item.get("area") or 0
+        if not price or not sqft or price > 50_000_000:
+            return None
+        addr_obj = item.get("address") or {}
+        if isinstance(addr_obj, dict):
+            street = addr_obj.get("streetAddress") or ""
+            city = addr_obj.get("city") or ""
+            zipc = addr_obj.get("zipcode") or ""
+        else:
+            street = item.get("streetAddress") or ""
+            city = ""
+            zipc = ""
         lat = float(item.get("latitude") or 0)
         lon = float(item.get("longitude") or 0)
-
-        # Filter by distance
         dist = 0.0
         if subject.latitude and subject.longitude and lat and lon:
             dist = _haversine_miles(subject.latitude, subject.longitude, lat, lon)
             if dist > radius_miles:
-                continue
+                return None
+        if street and street.lower().strip() == subject.address.lower().strip():
+            return None
+        # Convert daysOnZillow from ms-since-epoch or int days (API mixes formats)
+        dom_raw = item.get("daysOnZillow")
+        if isinstance(dom_raw, (int, float)):
+            dom = int(dom_raw) if dom_raw < 100000 else int(dom_raw / 86_400_000)
+        else:
+            dom = 0
+        return {
+            "address": street,
+            "city": city,
+            "zip_code": zipc,
+            "list_price": int(price),
+            "sqft": int(sqft),
+            "bedrooms": item.get("bedrooms") or item.get("beds") or 0,
+            "bathrooms": item.get("bathrooms") or item.get("baths") or 0,
+            "year_built": int(item.get("yearBuilt") or 0),
+            "ppsf": round(price / sqft, 2) if sqft else 0.0,
+            "distance_miles": round(dist, 2),
+            "days_on_market": dom,
+            "detail_url": item.get("detailUrl") or "",
+            "status": item.get("statusText") or "For sale",
+        }
 
-        lot_sqft = 0
-        lot_val = item.get("lotAreaValue") or item.get("lotSize")
-        lot_units = (item.get("lotAreaUnits") or "").lower()
-        if lot_val:
+    pendings = [p for p in (_parse(item) for item in items) if p]
+    # Auto-expand if sparse — fresh listings are rarer than mature listings
+    if len(pendings) < 3 and radius_miles < 2.0:
+        for try_radius in (1.0, 2.0):
+            if try_radius <= radius_miles:
+                continue
+            wider = []
+            for item in items:
+                p = _parse(item)
+                if p and p["distance_miles"] <= try_radius:
+                    wider.append(p)
+            if len(wider) >= 3 or try_radius >= 2.0:
+                pendings = wider
+                radius_miles = try_radius
+                break
+    # Sort by days-on-market ASC — freshest listings first (highest probability of
+    # going pending soon). Then by proximity within the same DOM bucket.
+    pendings.sort(key=lambda p: (p["days_on_market"], p["distance_miles"]))
+    time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+    logger.info("Kept %d active listings within %.1f mi (fresh-listing proxy for pending)",
+                len(pendings), radius_miles)
+    return pendings[:6]
+
+
+def _enrich_comp_year_built(comps: list[CompProperty], api_key: str = "") -> None:
+    """Backfill comp.year_built via property-details-address (one call per comp).
+
+    /search doesn't return yearBuilt, but /property-details-address does. Mutates
+    comps in place. Silently leaves year_built at 0 if a call fails (so the rest
+    of the analysis still works). Brief delay between calls to avoid rate-limit.
+    """
+    api_key = api_key or config.OPENWEBNINJA_API_KEY
+    if not api_key:
+        return
+    for comp in comps:
+        if comp.year_built or not comp.address:
+            continue  # already have it (or no address to look up)
+        full_addr = f"{comp.address} {comp.city} {comp.state} {comp.zip_code}".strip()
+        data = _api_get(PROPERTY_ENDPOINT, {"address": full_addr}, api_key)
+        if isinstance(data, dict) and data.get("yearBuilt"):
             try:
-                lot_sqft = int(float(lot_val) * 43560) if "acre" in lot_units else int(float(lot_val))
+                comp.year_built = int(data["yearBuilt"])
             except (ValueError, TypeError):
                 pass
+        time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
 
-        comp = CompProperty(
-            address=item.get("streetAddress") or item.get("address") or "",
-            city=item.get("city") or "",
-            state=item.get("state") or "TN",
-            zip_code=str(item.get("zipcode") or item.get("zip") or ""),
-            latitude=lat,
-            longitude=lon,
-            distance_miles=round(dist, 2),
-            sqft=int(item.get("livingArea") or item.get("sqft") or 0),
-            bedrooms=int(item.get("bedrooms") or 0),
-            bathrooms=float(item.get("bathrooms") or 0),
-            year_built=int(item.get("yearBuilt") or 0),
-            lot_sqft=lot_sqft,
-            property_type=item.get("homeType") or item.get("propertyType") or "",
-            sold_price=sold_price,
-            sold_date=sold_date,
-            days_on_market=int(item.get("daysOnZillow") or 0),
-            garage_spaces=int(item.get("garageSpaces") or 0),
-        )
-        comp.ppsf = round(comp.sold_price / comp.sqft, 2) if comp.sqft else 0.0
-        comps.append(comp)
 
-    logger.info("Fetched %d comparable sales within %.1f mi (last %d months)", len(comps), radius_miles, months_back)
+def fetch_rental_comps(subject: SubjectProperty, radius_miles: float = 1.0,
+                       n: int = 6, api_key: str = "") -> list[dict]:
+    """Fetch active rental listings near subject for Monthly Rent validation.
 
-    # If we don't have enough comps, try expanding radius and time window
-    if len(comps) < MIN_COMPS and (radius_miles < MAX_RADIUS_MILES or months_back < MAX_MONTHS_BACK):
-        new_radius = min(radius_miles * 1.5, MAX_RADIUS_MILES)
-        new_months = min(months_back + 3, MAX_MONTHS_BACK)
-        if new_radius > radius_miles or new_months > months_back:
-            logger.info("Only %d comps — expanding search to %.1f mi / %d months",
-                        len(comps), new_radius, new_months)
-            # Re-filter with expanded params (comps already fetched, just relax filters)
-            expanded_cutoff = (datetime.now() - timedelta(days=new_months * 30)).strftime("%Y-%m-%d")
-            # Re-process original items with relaxed filters
-            # For now, the API returns what it returns — we just note the expansion
-            pass
+    Auto-expands radius (1mi → 3mi → 5mi) if fewer than 3 comps found at the
+    starting radius, since rentals are sparser than sales in suburban markets.
 
-    return comps
+    Returns a list of dicts (not CompProperty — different shape) with:
+        address, rent, sqft, bedrooms, bathrooms, distance_miles, detail_url
+
+    Sorted by closeness to subject's sqft (most similar size first). Filters
+    null/zero rent + records without sqft (often apartment-complex aggregates).
+    """
+    api_key = api_key or config.OPENWEBNINJA_API_KEY
+    if not api_key or not subject.zip_code:
+        return []
+    data = _api_get(
+        SEARCH_ENDPOINT,
+        {"location": subject.zip_code, "home_status": "FOR_RENT"},
+        api_key,
+    )
+    items = data if isinstance(data, list) else []
+
+    def _parse(item, max_radius):
+        if not isinstance(item, dict):
+            return None
+        rent = item.get("unformattedPrice") or item.get("price") or 0
+        sqft = item.get("livingArea") or item.get("area") or 0
+        if not rent or not sqft:
+            return None
+        if rent > 50000:  # sale price leak
+            return None
+        addr = item.get("address") or {}
+        if isinstance(addr, dict):
+            street = addr.get("streetAddress") or ""
+        else:
+            street = item.get("streetAddress") or str(addr) or ""
+        lat = float(item.get("latitude") or 0)
+        lon = float(item.get("longitude") or 0)
+        dist = 0.0
+        if subject.latitude and subject.longitude and lat and lon:
+            dist = _haversine_miles(subject.latitude, subject.longitude, lat, lon)
+            if dist > max_radius:
+                return None
+        return {
+            "address": street,
+            "rent": rent,
+            "sqft": sqft,
+            "bedrooms": item.get("bedrooms") or item.get("beds") or 0,
+            "bathrooms": item.get("bathrooms") or item.get("baths") or 0,
+            "distance_miles": round(dist, 2),
+            "detail_url": item.get("detailUrl") or "",
+        }
+
+    # Auto-expand if first attempt yields too few
+    rentals = []
+    for try_radius in [radius_miles, 3.0, 5.0]:
+        if try_radius < radius_miles:
+            continue
+        rentals = [r for r in (_parse(item, try_radius) for item in items) if r]
+        if len(rentals) >= 3 or try_radius >= 5.0:
+            radius_miles = try_radius
+            break
+
+    if subject.sqft:
+        rentals.sort(key=lambda r: abs(r["sqft"] - subject.sqft))
+    logger.info("Fetched %d rental comps within %.1f mi (subject ZIP %s)",
+                len(rentals), radius_miles, subject.zip_code)
+    return rentals[:n]
 
 
 # ── Similarity scoring ────────────────────────────────────────────────
 
 def _score_similarity(subject: SubjectProperty, comp: CompProperty) -> float:
-    """Score how similar a comp is to the subject (0.0 to 1.0, higher = more similar)."""
+    """Score comp similarity (0.0-1.0, higher = more similar).
+
+    Priority order (user-set 2026-05-31):
+      1. SOLD DATE  (most important — up to -0.30 deduction)
+      2. PROXIMITY  (up to -0.25)
+      3. YEAR BUILT (up to -0.20)
+      4. SQFT       (up to -0.15)
+      5. Bedrooms / Bathrooms / Property type (smaller deductions)
+
+    Higher-priority factors get larger possible deductions, so they push
+    less-similar comps further down the ranking. The top 6 by score get
+    sent to the trimmed-mean ARV calc.
+    """
     score = 1.0
-    penalties = []
 
-    # Square footage (most important)
-    if subject.sqft and comp.sqft:
-        sqft_diff_pct = abs(subject.sqft - comp.sqft) / subject.sqft
-        if sqft_diff_pct > 0.30:
-            score -= 0.30
-            penalties.append(f"sqft {sqft_diff_pct:.0%} diff")
-        elif sqft_diff_pct > 0.20:
-            score -= 0.15
-        elif sqft_diff_pct > 0.10:
-            score -= 0.05
-
-    # Bedrooms
-    if subject.bedrooms and comp.bedrooms:
-        bed_diff = abs(subject.bedrooms - comp.bedrooms)
-        if bed_diff > 2:
-            score -= 0.25
-        elif bed_diff > 1:
-            score -= 0.10
-        elif bed_diff == 1:
-            score -= 0.03
-
-    # Bathrooms
-    if subject.bathrooms and comp.bathrooms:
-        bath_diff = abs(subject.bathrooms - comp.bathrooms)
-        if bath_diff > 2:
-            score -= 0.20
-        elif bath_diff > 1:
-            score -= 0.08
-
-    # Year built
-    if subject.year_built and comp.year_built:
-        age_diff = abs(subject.year_built - comp.year_built)
-        if age_diff > 20:
-            score -= 0.20
-        elif age_diff > 10:
-            score -= 0.08
-        elif age_diff > 5:
-            score -= 0.03
-
-    # Distance (closer = better)
-    if comp.distance_miles > 0.75:
-        score -= 0.15
-    elif comp.distance_miles > 0.5:
-        score -= 0.08
-    elif comp.distance_miles > 0.25:
-        score -= 0.03
-
-    # Property type mismatch
-    if subject.property_type and comp.property_type:
-        if subject.property_type.upper() != comp.property_type.upper():
-            score -= 0.20
-
-    # Recency bonus (sold more recently = better)
+    # ── 1. SOLD DATE (most important) — max -0.30 ──
     if comp.sold_date:
         try:
             sold_dt = datetime.strptime(comp.sold_date[:10], "%Y-%m-%d")
             days_ago = (datetime.now() - sold_dt).days
             if days_ago < 30:
-                score += 0.05
+                score -= 0.00     # fresh
             elif days_ago < 90:
-                score += 0.02
-            elif days_ago > 180:
                 score -= 0.05
+            elif days_ago < 180:
+                score -= 0.15
+            elif days_ago < 365:
+                score -= 0.25
+            else:
+                score -= 0.30     # stale
         except ValueError:
-            pass
+            score -= 0.15  # bad date = treat as moderately stale
+    else:
+        score -= 0.15
+
+    # ── 2. PROXIMITY (distance from subject) — max -0.25 ──
+    if comp.distance_miles <= 0.5:
+        score -= 0.00
+    elif comp.distance_miles <= 1.0:
+        score -= 0.05
+    elif comp.distance_miles <= 1.5:
+        score -= 0.10
+    elif comp.distance_miles <= 2.0:
+        score -= 0.18
+    elif comp.distance_miles <= 3.0:
+        score -= 0.22
+    else:
+        score -= 0.25
+
+    # ── 3. YEAR BUILT — max -0.20 ──
+    if subject.year_built and comp.year_built:
+        age_diff = abs(subject.year_built - comp.year_built)
+        if age_diff <= 5:
+            score -= 0.00
+        elif age_diff <= 10:
+            score -= 0.05
+        elif age_diff <= 20:
+            score -= 0.10
+        elif age_diff <= 30:
+            score -= 0.15
+        else:
+            score -= 0.20
+    # else: missing year_built data → neutral (no deduction), common when /search lookup fails
+
+    # ── 4. SQFT — max -0.15 ──
+    if subject.sqft and comp.sqft:
+        sqft_diff_pct = abs(subject.sqft - comp.sqft) / subject.sqft
+        if sqft_diff_pct <= 0.10:
+            score -= 0.00
+        elif sqft_diff_pct <= 0.20:
+            score -= 0.05
+        elif sqft_diff_pct <= 0.30:
+            score -= 0.10
+        else:
+            score -= 0.15
+
+    # ── 5. Secondary factors (smaller weights) ──
+    # Bedrooms — max -0.05
+    if subject.bedrooms and comp.bedrooms:
+        bed_diff = abs(subject.bedrooms - comp.bedrooms)
+        if bed_diff >= 2:
+            score -= 0.05
+        elif bed_diff == 1:
+            score -= 0.02
+
+    # Bathrooms — max -0.05
+    if subject.bathrooms and comp.bathrooms:
+        bath_diff = abs(subject.bathrooms - comp.bathrooms)
+        if bath_diff > 1:
+            score -= 0.05
+        elif bath_diff >= 0.5:
+            score -= 0.02
+
+    # Property type mismatch — max -0.10
+    if subject.property_type and comp.property_type:
+        if subject.property_type.upper() != comp.property_type.upper():
+            score -= 0.10
 
     return max(0.0, min(1.0, score))
 
@@ -476,12 +961,17 @@ def _classify_bucket(comp: CompProperty) -> str:
 # ── ARV calculation ───────────────────────────────────────────────────
 
 def calculate_arv(subject: SubjectProperty, comps: list[CompProperty]) -> ARVResult:
-    """Calculate After Repair Value using Two-Bucket methodology.
+    """Calculate ARV using Top-N-by-Similarity mean of RAW SOLD prices (revised 2026-05-31).
 
-    1. Score and rank comps by similarity
-    2. Classify into Bucket A (non-disclosure) and Bucket B (disclosure)
-    3. Apply property-specific adjustments
-    4. Calculate weighted ARV with confidence bands
+    Methodology:
+      1. Score + rank ALL comps by similarity (sold-date > proximity > year > sqft)
+      2. Display top TARGET_COMPS (=10) on the report
+      3. ARV = average of SOLD prices of the top ARV_AVG_TOP_N (=5) most similar comps
+         → replaces prior "middle-3 trimmed mean" — similarity ranking is now
+           strong enough (dual-source + tight 1mi/6mo window) that price-trim
+           is no longer needed
+      4. Property-specific adjustments still computed for reference column
+      5. Confidence bands from price spread WITHIN the top-N used for ARV
     """
     if not comps:
         return ARVResult(confidence="none", confidence_reason="No comparable sales found")
@@ -489,13 +979,20 @@ def calculate_arv(subject: SubjectProperty, comps: list[CompProperty]) -> ARVRes
     # Score and sort by similarity
     for comp in comps:
         comp.similarity_score = _score_similarity(subject, comp)
-
     comps.sort(key=lambda c: c.similarity_score, reverse=True)
+    selected = comps[:MAX_COMPS]  # top 10 for display
 
-    # Take top comps
-    selected = comps[:MAX_COMPS]
+    # Enrich top comps with yearBuilt (/search doesn't include it — needs an extra
+    # call per comp to /property-details-address). Adds ~10s but lets the Comp
+    # Analysis tab show comp age, which matters for visual comp-vetting.
+    _enrich_comp_year_built(selected)
 
-    # Classify buckets and calculate adjustments
+    # Re-score after year_built enrichment (some comps may now score higher)
+    for comp in selected:
+        comp.similarity_score = _score_similarity(subject, comp)
+    selected.sort(key=lambda c: c.similarity_score, reverse=True)
+
+    # Apply adjustments + bucket classification (adjustments kept for reference column)
     for comp in selected:
         comp.bucket = _classify_bucket(comp)
         comp.adjustments = _calculate_adjustments(subject, comp)
@@ -504,40 +1001,24 @@ def calculate_arv(subject: SubjectProperty, comps: list[CompProperty]) -> ARVRes
     bucket_a = [c for c in selected if c.bucket == "A"]
     bucket_b = [c for c in selected if c.bucket == "B"]
 
-    # Calculate PPSF from adjusted prices
-    ppsf_values = []
-    for comp in selected:
-        if comp.sqft:
-            ppsf_values.append(comp.adjusted_price / comp.sqft)
+    # PPSF values for reporting — uses sold_price (matches ARV basis)
+    ppsf_values = [comp.sold_price / comp.sqft for comp in selected if comp.sqft]
 
-    # Weighted ARV: Bucket B gets 70% weight, Bucket A gets 30%
-    # (disclosure data is more reliable)
-    adj_prices = [c.adjusted_price for c in selected if c.adjusted_price > 0]
+    # ── ARV = mean of SOLD prices of top ARV_AVG_TOP_N most similar comps ──
+    top_for_arv = [c for c in selected[:ARV_AVG_TOP_N] if c.sold_price > 0]
+    if not top_for_arv:
+        return ARVResult(confidence="none", confidence_reason="No valid sold prices")
 
-    if not adj_prices:
-        return ARVResult(confidence="none", confidence_reason="No valid adjusted prices")
+    arv_prices = [c.sold_price for c in top_for_arv]
+    arv_mid = sum(arv_prices) / len(arv_prices)
 
-    if bucket_b:
-        bucket_b_avg = sum(c.adjusted_price for c in bucket_b) / len(bucket_b)
+    # Confidence bands based on spread WITHIN the top-N used for ARV
+    if len(arv_prices) > 1:
+        spread = max(arv_prices) - min(arv_prices)
+        spread_pct = (spread / arv_mid * 100) if arv_mid else 0
     else:
-        bucket_b_avg = 0
-
-    if bucket_a:
-        bucket_a_avg = sum(c.adjusted_price for c in bucket_a) / len(bucket_a)
-    else:
-        bucket_a_avg = 0
-
-    # Weighted average
-    if bucket_b_avg and bucket_a_avg:
-        arv_mid = bucket_b_avg * 0.70 + bucket_a_avg * 0.30
-    elif bucket_b_avg:
-        arv_mid = bucket_b_avg
-    else:
-        arv_mid = bucket_a_avg
-
-    # Confidence bands based on comp spread
-    spread = max(adj_prices) - min(adj_prices)
-    spread_pct = (spread / arv_mid * 100) if arv_mid else 0
+        spread = 0
+        spread_pct = 0
 
     # Conservative bands — low end is intentionally more conservative
     if spread_pct < 10:
@@ -927,7 +1408,7 @@ def run_comp_analysis(address: str, city: str = "", state: str = "TN",
     # Step 4: Generate report
     if not output_path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_address = "".join(c if c.isalnum() or c in " -" else "_" for c in address)[:40]
+        safe_address = "".join(c if c.isalnum() or c == "-" else "_" for c in address)[:40]
         output_path = str(config.OUTPUT_DIR / f"comp_report_{safe_address}_{timestamp}.xlsx")
 
     report_path = generate_comp_report(subject, comps, arv, output_path)

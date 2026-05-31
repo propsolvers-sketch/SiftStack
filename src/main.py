@@ -110,6 +110,20 @@ def _post_daily_slack_with_funnel(
 # ── Shared helpers ────────────────────────────────────────────────────
 
 
+def _link(path: str, label: str | None = None) -> str:
+    """Return an OSC 8 hyperlink when stdout is a TTY, plain path otherwise.
+
+    VS Code's integrated terminal, iTerm2, and modern Terminal.app all render
+    this as a clickable link that opens the file in the system default app.
+    """
+    text = label or path
+    if not sys.stdout.isatty():
+        return text
+    from urllib.parse import quote
+    url = "file://" + quote(path)
+    return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
+
+
 def _filter_searches(
     counties: list[str] | None,
     types: list[str] | None,
@@ -1080,7 +1094,7 @@ def cli_main() -> None:
             "daily", "historical", "pdf-import", "photo-import", "dropbox-watch",
             "csv-import", "phone-validate", "manage-sold", "manage-presets",
             # New analysis & workflow modes
-            "comp", "rehab", "analyze-deal", "market-analysis", "buyer-prospect",
+            "comp", "rehab", "analyze-deal", "analyze", "market-analysis", "buyer-prospect",
             "deep-prospect", "lead-manage", "setup-sequences", "niche-sequential",
             "playbook",
         ],
@@ -1442,6 +1456,8 @@ def cli_main() -> None:
                         help="Property address (comp/rehab/analyze-deal modes)")
     parser.add_argument("--city", type=str, default=None,
                         help="Property city (comp/rehab/analyze-deal modes)")
+    parser.add_argument("--state", type=str, default="TN",
+                        help="Property state (comp/analyze-deal modes, default: TN)")
     parser.add_argument("--zip-code", type=str, default=None,
                         help="Property ZIP code (comp/rehab/analyze-deal modes)")
     parser.add_argument("--radius", type=float, default=0.5,
@@ -1450,27 +1466,35 @@ def cli_main() -> None:
                         help="Comp lookback months (comp mode, default: 6)")
 
     # Rehab estimation
-    parser.add_argument("--tier", type=int, default=2, choices=[1, 2, 3, 4],
-                        help="Finish tier 1-4 (rehab mode, default: 2)")
+    parser.add_argument("--rehab-level", "--tier", dest="rehab_level",
+                        type=int, default=3, choices=[1, 2, 3, 4, 5, 6],
+                        help="Rehab Level 1-6 (rehab mode, default: 3=Full Rehab Interior Cosmetics). 1=Low/Rental, 2=Mid/Salvageable, 3=Full/Interior, 4=Full+Exterior, 5=Full+Some Big 6, 6=Gut Job. (--tier kept as alias for backward compat.)")
     parser.add_argument("--scope", type=str, default="full", choices=["full", "wholetail"],
                         help="Rehab scope (rehab mode, default: full)")
-    parser.add_argument("--region", type=str, default="knoxville",
-                        help="Regional pricing (rehab mode, default: knoxville)")
+    parser.add_argument("--region", type=str, default="auto",
+                        help="Regional pricing override (rehab/analyze-deal). Default 'auto' resolves from city+state. Explicit values: knoxville, blount, birmingham, huntsville, albertville, nashville, chattanooga, national")
     parser.add_argument("--sqft", type=int, default=0,
                         help="Property sqft override (rehab mode)")
     parser.add_argument("--bedrooms", type=int, default=0,
                         help="Bedrooms override (rehab mode)")
     parser.add_argument("--bathrooms", type=float, default=0,
                         help="Bathrooms override (rehab mode)")
+    parser.add_argument("--year-built", type=int, default=0,
+                        help="Year built (rehab mode — drives age-based contingency: pre-1960=25%%, 1960-1990=15%%, post-1990=10%%)")
+    parser.add_argument("--big-tickets", type=str, default="",
+                        help="Comma-separated Big 6 + optional adders: roof,hvac,hwh,plumbing,electrical,foundation,septic,sewer,windows,rewire")
 
     # Deal analysis
     parser.add_argument("--purchase-price", type=float, default=0,
                         help="Purchase price (analyze-deal mode, default: auto-calculate MAO)")
-    parser.add_argument("--rehab-tier", type=int, default=2, choices=[1, 2, 3, 4],
-                        help="Rehab tier for deal analysis (default: 2)")
+    parser.add_argument("--deal-rehab-level", "--rehab-tier", dest="rehab_tier",
+                        type=int, default=None, choices=[1, 2, 3, 4, 5, 6],
+                        help="Rehab Level 1-6 for analyze/analyze-deal mode. If omitted in analyze mode AND running interactively, you'll be prompted to pick. Default for non-interactive: 3 (Full Rehab Interior). (--rehab-tier kept as alias for backward compat.)")
     parser.add_argument("--exit-strategy", type=str, default="flip",
                         choices=["flip", "wholesale", "hold"],
                         help="Exit strategy (analyze-deal mode, default: flip)")
+    parser.add_argument("--share", action="store_true",
+                        help="Upload report to Dropbox and print shareable link (analyze mode). Uses existing DROPBOX_* env vars.")
 
     # Market analysis
     parser.add_argument("--zip-codes", type=str, default=None,
@@ -1553,13 +1577,14 @@ def cli_main() -> None:
             return
         from comp_analyzer import run_comp_analysis
         result = run_comp_analysis(
-            address=args.address, city=args.city or "", zip_code=args.zip_code or "",
+            address=args.address, city=args.city or "", state=args.state,
+            zip_code=args.zip_code or "",
             radius=args.radius, months=args.months,
         )
         if "error" in result:
             logger.error("Comp analysis failed: %s", result["error"])
         else:
-            print(f"Comp report: {result['report_path']}")
+            print(f"Comp report: {_link(result['report_path'])}")
             arv = result["arv"]
             print(f"ARV: ${arv.arv_low:,.0f} (low) / ${arv.arv_mid:,.0f} (mid) / ${arv.arv_high:,.0f} (high)")
             print(f"Confidence: {arv.confidence} — {arv.confidence_reason}")
@@ -1570,14 +1595,17 @@ def cli_main() -> None:
             print("ERROR: --address is required for rehab mode")
             return
         from rehab_estimator import run_rehab_estimate
+        big_tickets = [t.strip() for t in (args.big_tickets or "").split(",") if t.strip()]
         result = run_rehab_estimate(
             address=args.address, sqft=args.sqft, bedrooms=args.bedrooms or 3,
-            bathrooms=args.bathrooms or 2.0, tier=args.tier, scope=args.scope,
-            region=args.region,
+            bathrooms=args.bathrooms or 2.0, year_built=args.year_built,
+            tier=args.rehab_level, scope=args.scope, region=args.region,
+            big_tickets=big_tickets or None,
+            city=args.city or "", state=args.state,
         )
         full = result["full_estimate"]
         wt = result["wholetail_estimate"]
-        print(f"Rehab report: {result['report_path']}")
+        print(f"Rehab report: {_link(result['report_path'])}")
         print(f"Full rehab: ${full.grand_total:,.0f} ({full.total_weeks:.0f} weeks)")
         print(f"Wholetail:  ${wt.grand_total:,.0f} ({wt.total_weeks:.0f} weeks)")
         return
@@ -1588,8 +1616,10 @@ def cli_main() -> None:
             return
         from deal_analyzer import run_deal_analysis
         result = run_deal_analysis(
-            address=args.address, city=args.city or "", zip_code=args.zip_code or "",
-            purchase_price=args.purchase_price, rehab_tier=args.rehab_tier,
+            address=args.address, city=args.city or "", state=args.state,
+            zip_code=args.zip_code or "",
+            purchase_price=args.purchase_price,
+            rehab_tier=args.rehab_tier if args.rehab_tier is not None else 3,
             exit_strategy=args.exit_strategy, region=args.region,
             radius=args.radius, months=args.months,
         )
@@ -1597,10 +1627,101 @@ def cli_main() -> None:
             logger.error("Deal analysis failed: %s", result["error"])
         else:
             pkg = result["package"]
-            print(f"Deal report: {result['report_path']}")
+            print(f"Deal report: {_link(result['report_path'])}")
             print(f"Recommendation: {pkg.recommendation}")
             print(f"ARV: ${pkg.arv.arv_mid:,.0f} | Rehab: ${pkg.rehab_full.grand_total:,.0f}")
             print(f"Flip MAO: ${pkg.mao.flip_mao:,.0f} | Profit: ${pkg.flip.net_profit:,.0f} ({pkg.flip.roi_pct:.0f}% ROI)")
+        return
+
+    if args.mode == "analyze":
+        # Single-address full pipeline. Parses "STREET, CITY, ST ZIP" into parts,
+        # runs analyze-deal, and opens the Excel automatically.
+        if not args.address:
+            print("ERROR: --address is required for analyze mode")
+            print('Usage: analyze --address "940 2nd Ave SW, Alabaster, AL 35007" [--purchase-price 95000]')
+            return
+        import re as _re
+        street, city, state, zipc = args.address, "", "", ""
+        m = _re.match(
+            r"^\s*(.+?)\s*,\s*([^,]+?)\s*,\s*([A-Za-z]{2})\s+(\d{5})\s*$",
+            args.address,
+        )
+        if m:
+            street, city, state, zipc = m.group(1), m.group(2), m.group(3).upper(), m.group(4)
+            logger.info("Parsed address: street=%r city=%r state=%r zip=%r", street, city, state, zipc)
+        else:
+            # Fall back to CLI overrides if format doesn't match the canonical one
+            city = args.city or ""
+            state = args.state if args.state != "TN" else (args.state or "")
+            zipc = args.zip_code or ""
+            if not (city and state and zipc):
+                print("ERROR: Could not parse address. Use either:")
+                print('  --address "940 2nd Ave SW, Alabaster, AL 35007"')
+                print('  OR pass --address/--city/--state/--zip-code separately')
+                return
+
+        # Resolve rehab level — interactive prompt if not set via CLI flag.
+        rehab_level = args.rehab_tier
+        if rehab_level is None:
+            if sys.stdin.isatty():
+                from rehab_estimator import REHAB_LEVEL_NAMES
+                print()
+                print(f"What rehab scope does the seller advise for {street}?")
+                for i in range(1, 7):
+                    print(f"   {i}. {REHAB_LEVEL_NAMES[i]}")
+                while True:
+                    choice = input("Enter 1-6 [default 3 = Full Rehab Interior]: ").strip()
+                    if not choice:
+                        rehab_level = 3
+                        break
+                    if choice.isdigit() and 1 <= int(choice) <= 6:
+                        rehab_level = int(choice)
+                        break
+                    print("  ↳ Invalid — enter a number 1-6 (or just press Enter for default 3).")
+                print(f"   → Using Rehab Level {rehab_level}: {REHAB_LEVEL_NAMES[rehab_level]}")
+                print()
+            else:
+                rehab_level = 3  # Non-interactive (cron, pipe) — silent default
+
+        from deal_analyzer import run_deal_analysis
+        result = run_deal_analysis(
+            address=street, city=city, state=state, zip_code=zipc,
+            purchase_price=args.purchase_price, rehab_tier=rehab_level,
+            exit_strategy=args.exit_strategy, region=args.region,
+            radius=args.radius, months=args.months,
+        )
+        if "error" in result:
+            logger.error("Analyze failed: %s", result["error"])
+            return
+        pkg = result["package"]
+        report_path = result["report_path"]
+        print()
+        print(f"📊 Deal report: {_link(report_path)}")
+        print(f"   Recommendation: {pkg.recommendation}")
+        print(f"   ARV: ${pkg.arv.arv_mid:,.0f}  |  Rehab: ${pkg.rehab_full.grand_total:,.0f}")
+        print(f"   Flip MAO (15% target): ${pkg.mao.flip_mao:,.0f}  |  Wholetail MAO: ${pkg.mao.wholesale_mao:,.0f}  |  Rental MAO (20% eq): ${pkg.mao.hold_mao:,.0f}")
+        # Optional: upload to Dropbox and print a shareable link
+        if getattr(args, "share", False):
+            try:
+                from datetime import datetime as _dt
+                from dropbox_share import upload_and_share
+                # Group by year-month so the root folder doesn't get cluttered
+                subfolder = _dt.now().strftime("%Y-%m")
+                share_url = upload_and_share(report_path, subfolder=subfolder)
+                if share_url:
+                    print(f"   🔗 Share link: {share_url}")
+                else:
+                    print(f"   ⚠️  Dropbox share failed (see logs). Local file still available above.")
+            except Exception as _e:
+                logger.error("Dropbox share error: %s", _e)
+                print(f"   ⚠️  Dropbox share error: {_e}")
+        # Auto-open the Excel
+        try:
+            import subprocess as _sp
+            _sp.run(["open", report_path], check=False)
+            print(f"   📂 Opened in default app.")
+        except Exception as _e:
+            print(f"   (Open manually: {report_path})")
         return
 
     if args.mode == "market-analysis":
@@ -1615,7 +1736,7 @@ def cli_main() -> None:
             logger.error("Market analysis failed: %s", result["error"])
         else:
             report = result["report"]
-            print(f"Market report: {result['report_path']}")
+            print(f"Market report: {_link(result['report_path'])}")
             print(f"Analyzed {report.total_zips} zips, {report.total_notices} total notices")
             if report.top_zips:
                 top = report.top_zips[0]
@@ -1634,7 +1755,7 @@ def cli_main() -> None:
             logger.error("Buyer prospecting failed: %s", result["error"])
         else:
             report = result["report"]
-            print(f"Buyer report: {result['report_path']}")
+            print(f"Buyer report: {_link(result['report_path'])}")
             print(f"Found {report.total_investors} investors")
             print(f"CSV: {result.get('csv_path', 'N/A')}")
         return
@@ -1657,7 +1778,7 @@ def cli_main() -> None:
             logger.error("Deep prospecting failed: %s", result["error"])
         else:
             stats = result["stats"]
-            print(f"Report: {result['report_path']}")
+            print(f"Report: {_link(result['report_path'])}")
             print(f"Processed {stats['total']} records at depth {args.depth}")
             print(f"Phones: {stats['phones_found']} | Deceased: {stats['deceased_confirmed']} | DMs: {stats['dms_identified']}")
         return
@@ -1671,7 +1792,7 @@ def cli_main() -> None:
         if "error" in result:
             logger.error("Lead management failed: %s", result["error"])
         else:
-            print(f"STABM report: {result['report_path']}")
+            print(f"STABM report: {_link(result['report_path'])}")
             print(f"Total: {result['total']} | Hot: {result['hot']} | Warm: {result['warm']} | Cold: {result['cold']}")
         return
 

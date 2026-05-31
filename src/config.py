@@ -55,6 +55,7 @@ ANCESTRY_PASSWORD = os.getenv("ANCESTRY_PASSWORD", "")
 DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY", "")            # Dropbox OAuth2 app key
 DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET", "")
 DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN", "")
+ZILLOW_PROXY_URL = os.getenv("ZILLOW_PROXY_URL", "")           # Webshare residential proxy for Zillow pending-listings scrape
 
 # ── LLM Backend ──────────────────────────────────────────────────────
 LLM_BACKEND = os.getenv("LLM_BACKEND", "anthropic")           # "anthropic", "ollama", or "openrouter"
