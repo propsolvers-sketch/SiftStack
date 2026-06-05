@@ -227,29 +227,37 @@ jobs:
           path: |
             output/datasift_upload*.csv
             output/tn_notices*.csv
+            output/observability/service_rates.json
             logs/*.log
             seen_ids.json
             last_run.json
             datasift_*.png
           retention-days: 30
 
-      # Even on cancellation / partial failure, push the current seen_ids
-      # state back so we don't re-pay the cold-start cost on the next run.
-      # Uses `git add -f` because both files are gitignored locally — the
-      # bot still needs to track them on main for cross-run continuity.
-      - name: Commit seen_ids.json + last_run.json back to repo
+      # Even on cancellation / partial failure, push current dedup +
+      # rolling-rates state back so we don't re-pay cold-start cost OR
+      # lose the 7-day rolling-rates baseline on the next run. Uses
+      # `git add -f` because output/ + seen_ids.json + last_run.json are
+      # all gitignored locally — each developer keeps their own state on
+      # their laptop, but the bot needs them tracked on main for
+      # cross-run continuity.
+      - name: Commit cross-run state back to repo
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f seen_ids.json last_run.json 2>/dev/null || true
+          git add -f \
+            seen_ids.json \
+            last_run.json \
+            output/observability/service_rates.json \
+            2>/dev/null || true
           if ! git diff --cached --quiet; then
-            git commit -m "chore(bot): update seen_ids + last_run after daily sweep"
+            git commit -m "chore(bot): update seen_ids + last_run + rolling rates after daily sweep"
             # Rebase-pull in case another commit landed during the run
             git pull --rebase origin main || true
             git push origin HEAD:main
           else
-            echo "No changes to seen_ids/last_run — skipping commit"
+            echo "No state changes to commit — skipping"
           fi
 
       - name: Notify Slack on workflow failure
