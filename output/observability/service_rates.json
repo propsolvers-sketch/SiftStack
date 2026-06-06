@@ -9,6 +9,11 @@
       "date": "2026-05-27",
       "success": 243,
       "total": 243
+    },
+    {
+      "date": "2026-06-06",
+      "success": 59,
+      "total": 59
     }
   ],
   "smarty": [
@@ -21,6 +26,11 @@
       "date": "2026-05-27",
       "success": 29,
       "total": 29
+    },
+    {
+      "date": "2026-06-06",
+      "success": 0,
+      "total": 16
     }
   ],
   "tracerfy": [
@@ -33,6 +43,11 @@
       "date": "2026-05-27",
       "success": 11,
       "total": 24
+    },
+    {
+      "date": "2026-06-06",
+      "success": 8,
+      "total": 16
     }
   ],
   "llm": [
@@ -45,6 +60,11 @@
       "date": "2026-05-27",
       "success": 230,
       "total": 231
+    },
+    {
+      "date": "2026-06-06",
+      "success": 54,
+      "total": 55
     }
   ]
 }
