@@ -422,14 +422,25 @@ def _build_slack_message(
             else:
                 lines.append(f"  {emoji} {r['csv']}: {r.get('message','')}")
         lines.append("")
-        lines.append(f"_Output dir: {out}_")
 
+    # Always include a working link to the source-of-truth artifact for this
+    # run. The "Output dir" line that used to appear here pointed at the
+    # cloud runner's ephemeral filesystem (/home/runner/...) — useless to
+    # the operator since that machine is gone the moment the job ends. The
+    # artifact ZIP is what they actually need to download.
     run_id = os.environ.get("GITHUB_RUN_ID", "")
     repo = os.environ.get("GITHUB_REPOSITORY", "propsolvers-sketch/SiftStack")
     if run_id:
+        run_url = f"https://github.com/{repo}/actions/runs/{run_id}"
         lines.append(
-            f"_<https://github.com/{repo}/actions/runs/{run_id}|GitHub Actions log>_"
+            f"_:floppy_disk: <{run_url}|Download today's CSV bundle> "
+            f"— scroll to the Artifacts section at the bottom of the run page._"
         )
+        lines.append(f"_:scroll: <{run_url}|Live GitHub Actions log>_")
+    else:
+        # Local-run fallback — the operator IS at the machine that produced
+        # these files, so showing the on-disk path is correct here.
+        lines.append(f"_Output dir: {out}_")
 
     return "\n".join(lines)
 
