@@ -13,6 +13,15 @@ load_dotenv()
 # ── Paths ──────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
+# Sub-divisions of output/ so the directory doesn't become a junk drawer.
+# LEADS_DIR  — every datasift_upload_*.csv (DM / Heirs / per-distressor)
+# DEALS_DIR  — deal-analyzer XLSX reports (MAO / ARV / financing scenarios)
+# RAW_DIR    — al_notices_*.csv legacy backup dump + any forensic raw exports
+# REPORTS_DIR — per-record deep-prospecting PDFs (already in use)
+LEADS_DIR = OUTPUT_DIR / "leads"
+DEALS_DIR = OUTPUT_DIR / "deals"
+RAW_DIR = OUTPUT_DIR / "raw"
+REPORTS_DIR = OUTPUT_DIR / "reports"
 LOG_DIR = PROJECT_ROOT / "logs"
 STATE_FILE = PROJECT_ROOT / "last_run.json"
 SEEN_IDS_FILE = PROJECT_ROOT / "seen_ids.json"
@@ -32,6 +41,10 @@ DROPBOX_ROOT_FOLDER = os.getenv("DROPBOX_ROOT_FOLDER", "")  # root folder path i
 DROPBOX_STORAGE_WARN_PERCENT = 80  # warn when storage usage exceeds this %
 
 OUTPUT_DIR.mkdir(exist_ok=True)
+LEADS_DIR.mkdir(exist_ok=True)
+DEALS_DIR.mkdir(exist_ok=True)
+RAW_DIR.mkdir(exist_ok=True)
+REPORTS_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
 # ── Credentials ────────────────────────────────────────────────────────

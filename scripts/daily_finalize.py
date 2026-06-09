@@ -240,9 +240,15 @@ def parse_pre_probate(path: Path) -> PreProbateFunnel:
 # ── CSV discovery + categorization ──────────────────────────────────────
 
 def _csvs_from_this_run(after_ts: float) -> list[Path]:
+    """Find all datasift CSVs written this run. Pipelines now drop them in
+    output/leads/ (post-reorg). We still glob output/ root for backward-compat
+    so a partial transition or legacy script invocation still gets picked up."""
+    candidates: list[Path] = []
+    for root in (OUT / "leads", OUT):
+        if root.exists():
+            candidates.extend(root.glob("datasift_upload*.csv"))
     return sorted(
-        p for p in OUT.glob("datasift_upload*.csv")
-        if p.stat().st_mtime > after_ts
+        {p for p in candidates if p.stat().st_mtime > after_ts}
     )
 
 

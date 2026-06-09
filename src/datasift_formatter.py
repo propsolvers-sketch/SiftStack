@@ -16,7 +16,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from config import OUTPUT_DIR
+from config import OUTPUT_DIR, LEADS_DIR
 from notice_parser import NoticeData
 
 logger = logging.getLogger(__name__)
@@ -1194,9 +1194,9 @@ def write_datasift_csv(
         filename = f"datasift_upload_{timestamp}.csv"
 
     # If caller passed a path (absolute or relative-with-dir), use it as-is.
-    # If they passed a bare filename, drop it in OUTPUT_DIR.
+    # If they passed a bare filename, drop it in output/leads/.
     fn_path = Path(filename)
-    output_path = fn_path if fn_path.is_absolute() or fn_path.parent != Path(".") else OUTPUT_DIR / filename
+    output_path = fn_path if fn_path.is_absolute() or fn_path.parent != Path(".") else LEADS_DIR / filename
     written = 0
     incomplete = 0
     issue_counts: dict[str, int] = {}
@@ -1255,8 +1255,8 @@ def write_datasift_split_csvs(
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     results = []
 
-    # CSV 1: DMs — all records
-    dm_path = OUTPUT_DIR / f"datasift_upload_DMs_{timestamp}.csv"
+    # CSV 1: DMs — all records (lands in output/leads/)
+    dm_path = LEADS_DIR / f"datasift_upload_DMs_{timestamp}.csv"
     dm_written = 0
     incomplete = 0
     issue_counts: dict[str, int] = {}
@@ -1297,7 +1297,7 @@ def write_datasift_split_csvs(
     ]
 
     if deceased_with_heirs:
-        heir_path = OUTPUT_DIR / f"datasift_upload_Heirs_{timestamp}.csv"
+        heir_path = LEADS_DIR / f"datasift_upload_Heirs_{timestamp}.csv"
         heir_written = 0
         with open(heir_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)

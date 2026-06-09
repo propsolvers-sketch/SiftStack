@@ -666,7 +666,7 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
     if not output_path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_addr = "".join(c if c.isalnum() or c in " -" else "_" for c in pkg.subject.address)[:40]
-        output_path = str(config.OUTPUT_DIR / f"deal_analysis_{safe_addr}_{timestamp}.xlsx")
+        output_path = str(config.DEALS_DIR / f"deal_analysis_{safe_addr}_{timestamp}.xlsx")
 
     wb.save(output_path)
     logger.info("Deal analysis saved to %s", output_path)
