@@ -227,7 +227,7 @@ jobs:
           path: |
             output/leads/datasift_upload*.csv
             output/raw/al_notices*.csv
-            output/deals/deal_analysis*.xlsx
+            output/deals/*.xlsx
             output/observability/service_rates.json
             logs/*.log
             seen_ids.json

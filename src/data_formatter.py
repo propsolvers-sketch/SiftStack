@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from config import OUTPUT_DIR
+from config import OUTPUT_DIR, RAW_DIR
 from notice_parser import NoticeData
 
 logger = logging.getLogger(__name__)
@@ -244,7 +244,13 @@ def write_csv(notices: list[NoticeData], filename: str | None = None) -> Path:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         filename = f"al_notices_{timestamp}.csv"
 
-    output_path = OUTPUT_DIR / filename
+    # If caller passed an absolute path or a path with a directory component,
+    # respect it. Otherwise drop the bare filename into output/raw/.
+    fn_path = Path(filename)
+    if fn_path.is_absolute() or fn_path.parent != Path("."):
+        output_path = fn_path
+    else:
+        output_path = RAW_DIR / filename
     written = 0
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
