@@ -124,6 +124,9 @@ class CompProperty:
     # Source tracking (2026-05-31: dual-source comp pulls from Zillow + Redfin)
     source: str = "zillow"  # "zillow", "redfin", or "zillow+redfin" if same comp confirmed by both
     mls_number: str = ""
+    # Price tier (2026-06-09: bias ARV toward renovated comps in fix-n-flip markets)
+    # Set in calculate_arv() based on pool median PPSF: "renovated" / "standard" / "distressed"
+    tier: str = "standard"
 
 
 @dataclass
@@ -771,19 +774,28 @@ def fetch_rental_comps(subject: SubjectProperty, radius_miles: float = 1.0,
 
 # ── Similarity scoring ────────────────────────────────────────────────
 
-def _score_similarity(subject: SubjectProperty, comp: CompProperty) -> float:
-    """Score comp similarity (0.0-1.0, higher = more similar).
+def _score_similarity(subject: SubjectProperty, comp: CompProperty,
+                       pool_median_ppsf: float = 0.0) -> float:
+    """Score comp similarity (0.0-1.0+, higher = more similar).
 
-    Priority order (user-set 2026-05-31):
-      1. SOLD DATE  (most important — up to -0.30 deduction)
-      2. PROXIMITY  (up to -0.25)
-      3. YEAR BUILT (up to -0.20)
-      4. SQFT       (up to -0.15)
-      5. Bedrooms / Bathrooms / Property type (smaller deductions)
+    Priority order (revised 2026-06-09 for fix-n-flip ARV accuracy):
+      1. SOLD DATE   (most important — up to -0.30 deduction)
+      2. PROXIMITY   (up to -0.25)
+      3. PPSF TIER   (-0.10 to +0.15) — NEW: bias toward renovated comps
+                     (high-PPSF) since they reflect post-rehab sale price in
+                     fix-n-flip markets. Distressed (low-PPSF) penalized.
+      4. SQFT        (up to -0.15)
+      5. YEAR BUILT  (up to -0.10) — SOFTENED: ±10yr no penalty (typical
+                     market variance for housing stock vintage).
+      6. Bedrooms / Bathrooms / Property type (smaller deductions)
 
-    Higher-priority factors get larger possible deductions, so they push
-    less-similar comps further down the ranking. The top 6 by score get
-    sent to the trimmed-mean ARV calc.
+    Higher-priority factors get larger possible deductions/bonuses, so they
+    push less-similar comps further down the ranking. The top ARV_AVG_TOP_N
+    by score get averaged for ARV.
+
+    pool_median_ppsf — pre-computed median PPSF across the candidate pool.
+    Pass 0 (default) to skip the PPSF tier adjustment (used when pool
+    statistics aren't available yet).
     """
     score = 1.0
 
@@ -821,20 +833,25 @@ def _score_similarity(subject: SubjectProperty, comp: CompProperty) -> float:
     else:
         score -= 0.25
 
-    # ── 3. YEAR BUILT — max -0.20 ──
-    if subject.year_built and comp.year_built:
-        age_diff = abs(subject.year_built - comp.year_built)
-        if age_diff <= 5:
-            score -= 0.00
-        elif age_diff <= 10:
-            score -= 0.05
-        elif age_diff <= 20:
+    # ── 3. PPSF TIER (NEW 2026-06-09) — bias toward renovated comps ──
+    # Subject's post-rehab ARV should match what other renovated houses in
+    # the area sold for. In a fix-n-flip market this is the top-PPSF tier.
+    # Conversely, deeply-distressed comps (tax sales, quitclaims, gut-needed
+    # properties) are misleading — penalize them.
+    # Tier thresholds:
+    #   renovated  → PPSF > pool_median × 1.25 → +0.15 bonus  (ARV-relevant)
+    #   distressed → PPSF < pool_median × 0.75 → -0.10 penalty
+    #   standard   → in between → neutral
+    if pool_median_ppsf and comp.ppsf:
+        ratio = comp.ppsf / pool_median_ppsf
+        if ratio > 1.25:
+            score += 0.15
+            comp.tier = "renovated"
+        elif ratio < 0.75:
             score -= 0.10
-        elif age_diff <= 30:
-            score -= 0.15
+            comp.tier = "distressed"
         else:
-            score -= 0.20
-    # else: missing year_built data → neutral (no deduction), common when /search lookup fails
+            comp.tier = "standard"
 
     # ── 4. SQFT — max -0.15 ──
     if subject.sqft and comp.sqft:
@@ -848,7 +865,22 @@ def _score_similarity(subject: SubjectProperty, comp: CompProperty) -> float:
         else:
             score -= 0.15
 
-    # ── 5. Secondary factors (smaller weights) ──
+    # ── 5. YEAR BUILT (SOFTENED 2026-06-09) — max -0.10, ±10yr no penalty ──
+    # Real-estate convention: a 10-year vintage delta is functionally
+    # negligible for housing stock built post-WWII. Drop the harsh penalty.
+    if subject.year_built and comp.year_built:
+        age_diff = abs(subject.year_built - comp.year_built)
+        if age_diff <= 10:
+            score -= 0.00       # within typical market variance
+        elif age_diff <= 20:
+            score -= 0.03
+        elif age_diff <= 30:
+            score -= 0.06
+        else:
+            score -= 0.10
+    # else: missing year_built data → neutral (no deduction)
+
+    # ── 6. Secondary factors (smaller weights) ──
     # Bedrooms — max -0.05
     if subject.bedrooms and comp.bedrooms:
         bed_diff = abs(subject.bedrooms - comp.bedrooms)
@@ -870,7 +902,10 @@ def _score_similarity(subject: SubjectProperty, comp: CompProperty) -> float:
         if subject.property_type.upper() != comp.property_type.upper():
             score -= 0.10
 
-    return max(0.0, min(1.0, score))
+    # Allow score > 1.0 — renovated comps with +0.15 PPSF bonus can exceed
+    # 1.0 and that's a useful signal for sorting + display ("this is the
+    # most ARV-relevant comp in the pool"). Floor at 0.0 only.
+    return max(0.0, score)
 
 
 # ── Adjustment engine ─────────────────────────────────────────────────
@@ -976,9 +1011,17 @@ def calculate_arv(subject: SubjectProperty, comps: list[CompProperty]) -> ARVRes
     if not comps:
         return ARVResult(confidence="none", confidence_reason="No comparable sales found")
 
-    # Score and sort by similarity
+    # Compute pool median PPSF for tier classification (2026-06-09).
+    # Drives the "renovated +0.15 / distressed -0.10" bonus in _score_similarity.
+    pool_ppsf_values = [c.ppsf for c in comps if c.ppsf > 0]
+    pool_median_ppsf = (
+        sorted(pool_ppsf_values)[len(pool_ppsf_values) // 2]
+        if pool_ppsf_values else 0.0
+    )
+
+    # Score and sort by similarity (with PPSF tier bonus applied)
     for comp in comps:
-        comp.similarity_score = _score_similarity(subject, comp)
+        comp.similarity_score = _score_similarity(subject, comp, pool_median_ppsf)
     comps.sort(key=lambda c: c.similarity_score, reverse=True)
     selected = comps[:MAX_COMPS]  # top 10 for display
 
@@ -989,7 +1032,7 @@ def calculate_arv(subject: SubjectProperty, comps: list[CompProperty]) -> ARVRes
 
     # Re-score after year_built enrichment (some comps may now score higher)
     for comp in selected:
-        comp.similarity_score = _score_similarity(subject, comp)
+        comp.similarity_score = _score_similarity(subject, comp, pool_median_ppsf)
     selected.sort(key=lambda c: c.similarity_score, reverse=True)
 
     # Apply adjustments + bucket classification (adjustments kept for reference column)

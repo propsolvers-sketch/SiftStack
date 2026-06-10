@@ -787,7 +787,8 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
 
         # R8 — Repairs (D8 INPUT, E8 FORMULA)
         ws0.cell(row=8, column=1, value="Less Repairs").font = _LABEL_FONT
-        c = ws0.cell(row=8, column=4, value=pb["repairs"]); c.number_format = '"$"#,##0'; c.fill = INPUT_FILL; c.border = _THIN_BORDER
+        # D8 — Repairs input (red fill 2026-06-10 per user request for at-a-glance review)
+        c = ws0.cell(row=8, column=4, value=pb["repairs"]); c.number_format = '"$"#,##0'; c.fill = _RED_FILL; c.border = _THIN_BORDER
         c = ws0.cell(row=8, column=5, value="=E7-D8"); c.number_format = '"$"#,##0'; c.border = _THIN_BORDER
 
         # R9 — Holding Costs → All-In (C9 INPUT %, D9 + E9 FORMULAS)
@@ -939,15 +940,17 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
         base_w_region = base * region_mult
         is_chosen = (level == rf.tier)
         label_text = f"{level}. {REHAB_LEVEL_NAMES[level]}" + ("  ← CHOSEN (= D8)" if is_chosen else "")
+        # CHOSEN row gets red fill + dark-red text (2026-06-10) so it visually pairs
+        # with D8 (also red) for at-a-glance review of the active rehab assumption.
         ws0.cell(row=row, column=SC, value=label_text).font = (
-            Font(name="Calibri", bold=True, size=11, color="006100") if is_chosen else _LABEL_FONT
+            Font(name="Calibri", bold=True, size=11, color="9C0006") if is_chosen else _LABEL_FONT
         )
         c2 = ws0.cell(row=row, column=SC + 1, value=per_sqft); c2.number_format = '"$"#,##0'
         c3 = ws0.cell(row=row, column=SC + 2, value=base); c3.number_format = '"$"#,##0'
         c4 = ws0.cell(row=row, column=SC + 3, value=base_w_region); c4.number_format = '"$"#,##0'
         if is_chosen:
             for off in range(4):
-                ws0.cell(row=row, column=SC + off).fill = _GREEN_FILL
+                ws0.cell(row=row, column=SC + off).fill = _RED_FILL
         for off in range(4):
             ws0.cell(row=row, column=SC + off).border = _THIN_BORDER
 
@@ -960,15 +963,17 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
     # 11-row block = header + 10 comp rows. Map Comp Analysis cols B..K + M
     # (drop A=# and L=Used — green-fill on first 5 snippet rows already conveys
     # which comps drove ARV) → 11 cols I..S on Profit Calc.
-    # NOTE: source-row mapping assumes Comp Analysis methodology block has 6
-    # lines (revised 2026-05-31). If that block changes length, update src_row.
+    # ⚠️ FRAGILE: source-row mapping assumes Comp Analysis methodology block has
+    # 9 lines (revised 2026-06-09 added 3 lines for PPSF tier methodology).
+    # If you add/remove methodology lines, MUST update COMP_HDR_SRC_ROW.
     ws0.cell(row=13, column=SC, value="── SOLD ARV COMP SNIPPET (top 10 by similarity — top 5 green = used for ARV) ──").font = Font(
         name="Calibri", bold=True, size=12, color="2F5496")
     HYPERLINK_FONT = Font(name="Calibri", size=10, color="0563C1", underline="single")
     USED_FILL_SNIPPET = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
     _comps_for_links = sorted(pkg.comps or [], key=lambda c: -c.similarity_score)[:10]
-    # Comp Analysis source rows: header at row 29 (was 28 before adding "Pool:" line in methodology)
-    COMP_HDR_SRC_ROW = 29
+    # Comp Analysis source rows: header at row 32 (was 29 before adding PPSF tier
+    # methodology block on 2026-06-09 — +3 methodology lines pushed everything down).
+    COMP_HDR_SRC_ROW = 32
     # Comp Analysis column mapping: skip A (#), include B-K, skip L (Used), include M (Adj Price)
     src_cols = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13]  # B,C,D,E,F,G,H,I,J,K,M
     for ridx in range(11):  # 1 header + 10 comp rows
@@ -1486,15 +1491,20 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
     used_set = {id(c) for c in top_for_arv}
     avg_used = sum(c.sold_price for c in top_for_arv) / len(top_for_arv) if top_for_arv else 0
 
-    # Source-distribution counts for transparency
+    # Source + tier-distribution counts for transparency
     z_only = sum(1 for c in comps_sorted if c.source == "zillow")
     r_only = sum(1 for c in comps_sorted if c.source == "redfin")
     both = sum(1 for c in comps_sorted if c.source == "zillow+redfin")
+    renovated_count = sum(1 for c in comps_sorted if c.tier == "renovated")
+    distressed_count = sum(1 for c in comps_sorted if c.tier == "distressed")
 
     method_lines = [
         f"Step 1: Pull SOLD comps from BOTH Zillow + Redfin within 1mi / 6mo. Dedupe by address.",
         f"        → Pool: {len(pkg.comps)} unique sales ({z_only} Zillow-only, {r_only} Redfin-only, {both} cross-confirmed).",
-        f"Step 2: Rank by similarity (sold-date > proximity > year built > sqft). Show top {len(comps_sorted)}.",
+        f"Step 2: Rank by similarity. Priorities: Sold Date > Proximity > PPSF Tier > Sqft > Year Built > Bd/Ba.",
+        f"        → PPSF Tier (revised 2026-06-09): renovated comps (PPSF > pool median × 1.25) get +0.15 bonus,",
+        f"          distressed (PPSF < median × 0.75) get -0.10 penalty. Year-built ±10yr = no penalty.",
+        f"        → Top 10 displayed: {renovated_count} 🔨 renovated, {distressed_count} 💰 distressed, {len(comps_sorted) - renovated_count - distressed_count} standard.",
         f"Step 3: Average the top {len(top_for_arv)} most-similar comps' SOLD prices = ${avg_used:,.0f}  ← ARV Mid",
         f"Step 4: Confidence bands (driven by spread {a.spread_pct:.1f}% within top-5, '{a.confidence}'):"
         f"  ARV Low = ${a.arv_low:,.0f}  |  ARV High = ${a.arv_high:,.0f}",
@@ -1513,7 +1523,7 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
     ).font = _LABEL_FONT
     r += 1
     ws_c.cell(row=r, column=1,
-        value="Similarity priority (heaviest → lightest): 1) Sold Date · 2) Proximity · 3) Year Built · 4) Sqft · then beds/baths/type"
+        value="Similarity priority (heaviest → lightest): 1) Sold Date · 2) Proximity · 3) PPSF Tier 🔨/💰 · 4) Sqft · 5) Year Built (±10yr ok) · then beds/baths/type"
     ).font = Font(name="Calibri", italic=True, size=10, color="555555")
     r += 2
     headers = ["#", "Address", "Distance", "Sold Date", "Sold Price",
@@ -1526,6 +1536,7 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
     USED_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
     REF_FILL = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
     SOURCE_LABEL = {"zillow": "Z", "redfin": "R", "zillow+redfin": "Z+R"}
+    TIER_EMOJI = {"renovated": "🔨", "distressed": "💰", "standard": ""}
     comps_data_first_row = r  # capture for AVERAGE formula below
     for i, comp in enumerate(comps_sorted, 1):
         addr_text = f"{comp.address}, {comp.city} {comp.zip_code}"
@@ -1533,6 +1544,10 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
         used_label = "✅ ARV" if is_used else "reference"
         row_fill = USED_FILL if is_used else REF_FILL
         src_label = SOURCE_LABEL.get(comp.source, comp.source)
+        tier_emoji = TIER_EMOJI.get(comp.tier, "")
+        # Show tier emoji alongside similarity % so renovated/distressed comps
+        # are visually identifiable without adding a new column.
+        sim_display = f"{tier_emoji}{comp.similarity_score:.0%}" if tier_emoji else f"{comp.similarity_score:.0%}"
         row_vals = [
             i, addr_text,
             f"{comp.distance_miles:.2f} mi",
@@ -1541,7 +1556,7 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
             f"{comp.bedrooms}/{comp.bathrooms}",
             comp.year_built or "—",
             comp.ppsf,
-            f"{comp.similarity_score:.0%}",
+            sim_display,
             src_label,
             used_label,
             comp.adjusted_price,
