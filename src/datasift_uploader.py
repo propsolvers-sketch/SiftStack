@@ -294,8 +294,15 @@ async def upload_csv(
     # "ASSOCIATE DATA WITH LIST" — enter or search for list name
     try:
         if existing_list:
-            # Existing list mode: styled dropdown showing "Select a list"
-            # Click the dropdown to open it, then select the target list
+            # Existing list mode. Three-stage selection:
+            #  1. Open the styled "Select a list" dropdown
+            #  2. Type into the typeahead search input so DataSift virtualises
+            #     down to just the matching option (default option list is
+            #     long; the target list can be below the fold)
+            #  3. Click the matching option, then VERIFY the dropdown trigger
+            #     now shows the list name (post-check). If verification fails,
+            #     abort the upload so we don't silently fall through into a
+            #     SiftStack-2026 wrapper list (2026-06-10 operator report).
             list_dropdown = page.locator('text="Select a list"')
             if await list_dropdown.count() > 0:
                 await list_dropdown.first.click()
@@ -303,18 +310,77 @@ async def upload_csv(
                 logger.debug("Opened existing list dropdown")
                 await _screenshot(page, "step1_list_dropdown_opened")
 
-                # Look for the target list name in the dropdown options
-                match = page.locator(f'text="{list_name}"')
-                if await match.count() > 0:
-                    # Click the last match (dropdown option, not the label)
-                    await match.last.click()
-                    await page.wait_for_timeout(1000)
-                    logger.info("Selected existing list: %s", list_name)
-                else:
-                    logger.warning("List '%s' not found in dropdown", list_name)
+                # Stage 2: type into the typeahead input to filter the
+                # dropdown down to just our target. The dropdown's search
+                # input typically lives inside the opened popover.
+                typeahead = page.locator(
+                    '[class*="SelectOptionContainer"] input, '
+                    '[class*="dropdown"] input, '
+                    'input[placeholder*="Search"]:visible'
+                )
+                if await typeahead.count() > 0:
+                    try:
+                        await typeahead.first.fill(list_name)
+                        await page.wait_for_timeout(800)
+                        logger.debug("Filtered dropdown by typing: %s", list_name)
+                    except Exception as e:
+                        logger.debug("Typeahead fill failed: %s", e)
+
+                # Stage 3: click the matching option. Try multiple selector
+                # shapes — styled-component dropdowns vary; option text can
+                # also live inside nested spans rather than as direct text.
+                clicked = False
+                for opt_selector in (
+                    f'[class*="SelectOption"]:has-text("{list_name}")',
+                    f'[role="option"]:has-text("{list_name}")',
+                    f'li:has-text("{list_name}")',
+                    f'text="{list_name}"',
+                ):
+                    opt = page.locator(opt_selector)
+                    if await opt.count() == 0:
+                        continue
+                    try:
+                        await opt.last.scroll_into_view_if_needed(timeout=2000)
+                    except Exception:
+                        pass
+                    try:
+                        await opt.last.click(timeout=5000)
+                        clicked = True
+                        logger.info("Selected existing list: %s (via %s)",
+                                    list_name, opt_selector)
+                        break
+                    except Exception as e:
+                        logger.debug("Click failed for %s: %s", opt_selector, e)
+
+                if not clicked:
                     await _screenshot(page, "step1_list_not_found")
+                    result["message"] = (
+                        f"Existing list '{list_name}' not found in DataSift "
+                        f"dropdown — aborting upload to avoid falling back "
+                        f"into a SiftStack-named wrapper list. Confirm the "
+                        f"list exists in DataSift (Records → Lists) and "
+                        f"that its name matches exactly."
+                    )
+                    logger.error(result["message"])
+                    return result
+
+                await page.wait_for_timeout(1000)
+
+                # Post-check: dropdown trigger should now show the selected
+                # list name instead of "Select a list". If it still shows
+                # "Select a list", the click registered but the selection
+                # didn't apply — abort rather than upload to a phantom list.
+                still_placeholder = page.locator('text="Select a list"')
+                if await still_placeholder.count() > 0:
+                    await _screenshot(page, "step1_list_not_applied")
+                    result["message"] = (
+                        f"List '{list_name}' click did not apply — dropdown "
+                        f"still shows the placeholder. Aborting upload."
+                    )
+                    logger.error(result["message"])
+                    return result
             else:
-                # Fallback: try searching for existing list via input
+                # Fallback: standalone search input (rare layout variant)
                 list_input = page.locator(
                     'input[placeholder*="Search"], '
                     'input[placeholder*="list"]'
@@ -327,6 +393,14 @@ async def upload_csv(
                         await match.last.click()
                         await page.wait_for_timeout(1000)
                         logger.info("Selected existing list via search: %s", list_name)
+                    else:
+                        await _screenshot(page, "step1_list_not_found")
+                        result["message"] = (
+                            f"Existing list '{list_name}' not found "
+                            f"(standalone-search fallback)"
+                        )
+                        logger.error(result["message"])
+                        return result
         else:
             # New list mode: type a new list name
             list_input = page.locator('input[placeholder*="Enter new list name"], input[placeholder*="list name"]')
@@ -462,59 +536,100 @@ async def upload_csv(
     await page.wait_for_timeout(3000)
     await _screenshot(page, "step4_column_mapping")
 
-    # Try to drag unmapped columns (left side) to their targets (right side)
-    # DataSift uses styled-components with draggable="false" — need slow mouse drag
-    async def _drag_column(source_el, target_el):
-        """Drag a CSV column card to a mapping target using slow mouse moves."""
-        src_box = await source_el.bounding_box()
-        dst_box = await target_el.bounding_box()
-        if not src_box or not dst_box:
+    # ── Column mapping (rewritten 2026-06-10) ─────────────────────────
+    # Operator reported Tags column missing from EVERY CSV uploaded on
+    # 2026-06-10 — meaning the previous mouse-based drag was failing
+    # ~100% of the time in CI even though it appeared to work locally.
+    # Two changes:
+    #   1. Replace manual mouse.move/down/up with Playwright's drag_to()
+    #      (the high-level primitive that correctly fires React's
+    #      synthetic dragstart/dragenter/dragover/drop sequence — manual
+    #      mouse events don't always trigger React's dnd handlers).
+    #   2. Stricter source/target selectors anchored to the actual
+    #      column-card structure, plus a post-drag verification that
+    #      checks whether the source card disappeared from the LEFT
+    #      panel. If verification fails, retry up to 2 more times before
+    #      giving up (and log a clear warning so operator can spot it).
+    async def _try_map_column(col_name: str, attempt: int) -> bool:
+        """Try once to map the named column from left to right.
+        Returns True iff post-check confirms it actually got mapped."""
+        # Source: the LEFT-panel column card. Cards are typically
+        # <300px wide and live at x < ~500. Prefer cards with
+        # "Card" / "Column" / draggable in the class chain.
+        source_candidates = page.locator(
+            f'[class*="Card"]:has-text("{col_name}"), '
+            f'[class*="Column"]:has-text("{col_name}"), '
+            f'[draggable="true"]:has-text("{col_name}")'
+        )
+        source = None
+        for i in range(await source_candidates.count()):
+            cand = source_candidates.nth(i)
+            box = await cand.bounding_box()
+            if box and box["x"] < 600 and 30 < box["height"] < 200:
+                source = cand
+                break
+        if source is None:
+            # Fallback: broader text-based selector (old behaviour)
+            source = page.locator(
+                f'div:has-text("{col_name}") >> visible=true'
+            ).first
+
+        # Target: a RIGHT-panel slot bearing the same field name (x > 500).
+        target_candidates = page.locator(f'text="{col_name}"')
+        target = None
+        for i in range(await target_candidates.count()):
+            cand = target_candidates.nth(i)
+            box = await cand.bounding_box()
+            if box and box["x"] > 500:
+                target = cand
+                break
+        if target is None:
             return False
-        sx = src_box["x"] + src_box["width"] / 2
-        sy = src_box["y"] + src_box["height"] / 2
-        dx = dst_box["x"] + dst_box["width"] / 2
-        dy = dst_box["y"] + dst_box["height"] / 2
-        await page.mouse.move(sx, sy)
-        await page.wait_for_timeout(500)
-        await page.mouse.down()
-        await page.wait_for_timeout(500)
-        steps = 20
-        for i in range(1, steps + 1):
-            frac = i / steps
-            await page.mouse.move(
-                sx + (dx - sx) * frac,
-                sy + (dy - sy) * frac,
-            )
-            await page.wait_for_timeout(50)
-        await page.wait_for_timeout(500)
-        await page.mouse.up()
-        await page.wait_for_timeout(1000)
+
+        # Playwright's drag_to() handles React-DnD correctly where manual
+        # mouse.move/down/up sometimes fails to fire synthetic events.
+        try:
+            await source.drag_to(target, timeout=8000)
+        except Exception as e:
+            logger.debug("drag_to(%s) attempt %d failed: %s",
+                         col_name, attempt, e)
+            return False
+        await page.wait_for_timeout(1200)
+
+        # Post-check: the LEFT-panel card should be gone (or the right
+        # slot should now contain the column name). Re-locate candidates
+        # and verify none remain on the LEFT.
+        after = page.locator(
+            f'[class*="Card"]:has-text("{col_name}"), '
+            f'[class*="Column"]:has-text("{col_name}")'
+        )
+        for i in range(await after.count()):
+            box = await after.nth(i).bounding_box()
+            if box and box["x"] < 600:
+                return False  # still on the left → mapping didn't take
         return True
 
-    # Map Tags column: find "Tags" card on left, drag to "Tags" target on right
     for col_name in ["Tags", "Lists"]:
         try:
-            # Source: unmapped column card on the left (contains column name + sample data)
-            source = page.locator(f'div:has-text("{col_name}") >> visible=true').first
-            # Target: mapping slot on the right side (search for it)
-            # Right-side targets have the field name — search within right panel area
-            target = page.locator(f'text="{col_name}"').last
-            if await source.count() > 0 and await target.count() > 0:
-                src_box = await source.bounding_box()
-                tgt_box = await target.bounding_box()
-                # Ensure source is on left (<600px) and target is on right (>600px)
-                if src_box and tgt_box and src_box["x"] < 600 and tgt_box["x"] > 600:
-                    if await _drag_column(source, target):
-                        logger.info("Mapped column: %s", col_name)
-                        await page.wait_for_timeout(1000)
-                    else:
-                        logger.warning("Drag failed for column: %s", col_name)
-                else:
-                    logger.debug("Column %s: no valid source/target positions", col_name)
-            else:
-                logger.debug("Column %s: source or target not found", col_name)
+            mapped = False
+            for attempt in (1, 2, 3):
+                if await _try_map_column(col_name, attempt):
+                    mapped = True
+                    logger.info(
+                        "Mapped column %s (attempt %d)", col_name, attempt,
+                    )
+                    await page.wait_for_timeout(500)
+                    break
+                await page.wait_for_timeout(800)
+            if not mapped:
+                logger.warning(
+                    "Column %s failed to map after 3 attempts — values "
+                    "in this column will NOT reach DataSift records. "
+                    "Check step4_after_mapping.png for wizard state.",
+                    col_name,
+                )
         except Exception as e:
-            logger.warning("Column mapping %s failed: %s", col_name, e)
+            logger.warning("Column %s mapping threw: %s", col_name, e)
 
     await _screenshot(page, "step4_after_mapping")
 
@@ -773,18 +888,28 @@ async def _select_all_records(page: Page) -> bool:
         return False
 
 
-async def enrich_records(page: Page, list_name: str) -> dict:
+async def enrich_records(
+    page: Page,
+    list_name: str,
+    swap_owners: bool = False,
+) -> dict:
     """Enrich uploaded records with DataSift's SiftMap property data.
 
     UI Flow: Records → Filter by list → Select all → Manage → Enrich Data
     → toggle "Enrich Property Information" ON → click "Enrich"
 
     Only enriches property info (beds, baths, Zestimate, sqft, sale history).
-    Owner enrichment is OFF to protect our PR/DM contact mapping.
 
     Args:
         page: Logged-in Playwright page.
         list_name: Name of the list to filter and enrich.
+        swap_owners: When True, set DataSift's "Swap Owners" toggle ON so
+            existing records with a stale owner (e.g. the decedent uploaded
+            previously under a non-probate workflow) get overwritten with
+            the new upload's owner (the DM / executor). Use ONLY for probate
+            and pre_probate distressors — leaving it on for foreclosure
+            uploads would let SiftMap's tax-roll-derived owner clobber a
+            correctly-extracted court owner. Default False.
 
     Returns:
         Dict with {success, message}.
@@ -846,51 +971,54 @@ async def enrich_records(page: Page, list_name: str) -> dict:
 
         # Configure enrichment toggles via JavaScript.
         # The modal uses react-toggle components with hidden checkbox inputs.
-        # We want: "Enrich Property Information" ON, "Enrich Owners" OFF, "Swap Owners" OFF.
-        # Configure enrichment toggles via JavaScript.
-        # Based on the Enrich Records modal structure, toggles appear next to their label text.
-        # Use previousElementSibling text to identify each toggle.
-        toggle_result = await page.evaluate("""() => {
-            const results = {};
+        # Defaults: "Enrich Property Information" ON, "Enrich Owners" OFF.
+        # "Swap Owners" varies per call — see swap_owners docstring above.
+        # Pass the wanted-state as a literal so the closure sees the same value.
+        toggle_result = await page.evaluate(
+            f"""(() => {{
+            const SWAP_OWNERS_ON = {str(bool(swap_owners)).lower()};
+            const results = {{}};
             const toggles = document.querySelectorAll('.react-toggle');
-            for (const toggle of toggles) {
-                // Check previous sibling for label text
+            for (const toggle of toggles) {{
                 const prev = toggle.previousElementSibling;
                 const prevText = prev ? prev.textContent.trim() : '';
 
                 let name = null;
-                if (prevText.includes('Enrich Property Information') || prevText.includes('Property Information')) {
+                if (prevText.includes('Enrich Property Information') || prevText.includes('Property Information')) {{
                     name = 'Enrich Property Information';
-                } else if (prevText.includes('Enrich Owners') || prevText === 'Enrich Owners') {
+                }} else if (prevText.includes('Enrich Owners') || prevText === 'Enrich Owners') {{
                     name = 'Enrich Owners';
-                } else if (prevText.includes('Swap Owners') || prevText === 'Swap Owners') {
+                }} else if (prevText.includes('Swap Owners') || prevText === 'Swap Owners') {{
                     name = 'Swap Owners';
-                }
-                if (!name) {
-                    // Also try next sibling or parent's other children
+                }}
+                if (!name) {{
                     const next = toggle.nextElementSibling;
                     const nextText = next ? next.textContent.trim() : '';
                     if (nextText.includes('Property Information')) name = 'Enrich Property Information';
                     else if (nextText.includes('Enrich Owners')) name = 'Enrich Owners';
                     else if (nextText.includes('Swap Owners')) name = 'Swap Owners';
-                }
+                }}
                 if (!name) continue;
 
                 const isChecked = toggle.classList.contains('react-toggle--checked');
-                const shouldBeOn = name === 'Enrich Property Information';
+                let shouldBeOn;
+                if (name === 'Enrich Property Information') shouldBeOn = true;
+                else if (name === 'Swap Owners') shouldBeOn = SWAP_OWNERS_ON;
+                else shouldBeOn = false;  // Enrich Owners stays OFF always
 
-                if (shouldBeOn && !isChecked) {
+                if (shouldBeOn && !isChecked) {{
                     toggle.click();
                     results[name] = 'turned ON';
-                } else if (!shouldBeOn && isChecked) {
+                }} else if (!shouldBeOn && isChecked) {{
                     toggle.click();
                     results[name] = 'turned OFF';
-                } else {
+                }} else {{
                     results[name] = shouldBeOn ? 'already ON' : 'already OFF';
-                }
-            }
+                }}
+            }}
             return results;
-        }""")
+        }})()"""
+        )
         logger.info("Enrichment toggles: %s", toggle_result)
         await page.wait_for_timeout(1000)
 
@@ -1387,8 +1515,18 @@ async def upload_to_datasift_per_distressor(
                 if i < len(splits) - 1:
                     await page.wait_for_timeout(10000)
 
+            # Probate + pre_probate get Swap Owners ON so DataSift overwrites
+            # any pre-existing record's owner (typically the decedent from a
+            # prior upload) with the new upload's owner (the DM / executor).
+            # Foreclosure, code_violation, tax distressors stay OFF — their
+            # owners on file are typically the correct contact.
+            swap_on = any(
+                s["notice_type"] in ("probate", "pre_probate") for s in splits
+            )
             if enrich:
-                enrich_result = await enrich_records(page, splits[0]["list_name"])
+                enrich_result = await enrich_records(
+                    page, splits[0]["list_name"], swap_owners=swap_on,
+                )
             if skip_trace:
                 skip_result = await skip_trace_records(page, splits[0]["list_name"])
         finally:

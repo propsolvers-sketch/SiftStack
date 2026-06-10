@@ -266,6 +266,14 @@ def _clean_and_split_name(full_name: str) -> tuple[str, str]:
         return ("", "")
 
     parts = name.split()
+    # Strip trailing commas from each token. Catches "JANE," → "JANE" left
+    # behind when a name like "JANE, EXECUTOR" got partially cleaned by
+    # _ROLE_SUFFIX_RE (matched 'EXECUTOR' but the comma between Jane and
+    # the role word survived). Per operator note: trailing-comma only —
+    # no spaces/semicolons/etc.
+    parts = [p.rstrip(",") for p in parts if p.rstrip(",")]
+    if not parts:
+        return ("", "")
     if len(parts) == 1:
         return (parts[0], "")
     if len(parts) >= 3:

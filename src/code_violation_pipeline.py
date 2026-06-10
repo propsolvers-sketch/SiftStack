@@ -336,6 +336,42 @@ def fetch_code_violations(
         notices = kept
     funnel.set("tier_gated", len(notices))
 
+    # ── Within-run dedup ──────────────────────────────────────────────
+    # Same code-violation case can appear across multiple feeds:
+    #   * Huntsville Unsafe Buildings PDF re-publishes the same property
+    #     month over month while the case is still open
+    #   * Birmingham Accela returns historical entries on each pull within
+    #     the --days-back window
+    #   * Hoover SeeClickFix can list the same nuisance via multiple
+    #     citizen reports against the same address
+    # Operator reported duplicate uploads to DataSift (2026-06-10). Dedup
+    # on the strongest identity available — (normalized address, case#) —
+    # so the same property at the same case doesn't ride through twice.
+    # Falls back to address-only when case# is missing (some adapters
+    # don't populate it consistently).
+    seen: set[tuple[str, str]] = set()
+    deduped: list[NoticeData] = []
+    drops = 0
+    for n in notices:
+        addr_key = (n.address or "").strip().lower()
+        case_key = (n.case_number or "").strip().lower()
+        if not addr_key:
+            # No address — pass through (can't dedup safely)
+            deduped.append(n)
+            continue
+        key = (addr_key, case_key)
+        if key in seen:
+            drops += 1
+            continue
+        seen.add(key)
+        deduped.append(n)
+    if drops:
+        logger.info(
+            "Code-violation dedup: %d → %d (dropped %d duplicates)",
+            len(notices), len(deduped), drops,
+        )
+        notices = deduped
+
     return notices, funnel, rate_tracker
 
 
