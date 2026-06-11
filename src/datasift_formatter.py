@@ -1002,12 +1002,47 @@ def _build_dm_notes(notice: NoticeData) -> str:
 
 
 def _build_heir_notes(notice: NoticeData) -> str:
-    """Build Notes for CSV 2: full heir map only.
+    """Build Notes for CSV 2: deceased-owner header + heir map.
 
-    Used by write_datasift_split_csvs() for the Heirs upload.
-    Returns empty string if no heir data.
+    Used by write_datasift_split_csvs() for the Heirs upload. Mirrors
+    the DMs CSV's deceased-owner header (decedent name, DoD, obituary
+    URL, confidence) so heir rows carry the same context — operator
+    reported the Heirs Notes were too sparse on 2026-06-10 with no
+    signing-order context. Returns empty string if no heir data AND no
+    deceased-owner context (shouldn't happen for rows that make it into
+    the Heirs CSV — the writer filters on owner_deceased=="yes" AND
+    heir_map_json).
     """
-    return _build_heir_summary(notice)
+    sections = []
+
+    # Deceased owner header — same shape as _build_dm_notes for parity
+    deceased_parts = []
+    if notice.decedent_name:
+        deceased_parts.append(f"Decedent: {notice.decedent_name}")
+    if notice.date_of_death:
+        deceased_parts.append(f"Died: {_format_date(notice.date_of_death)}")
+    if notice.obituary_url:
+        deceased_parts.append(f"Obituary: {notice.obituary_url}")
+
+    confidence_line = ""
+    if notice.dm_confidence:
+        confidence_line = f"Confidence: {notice.dm_confidence.upper()}"
+        if notice.dm_confidence_reason:
+            confidence_line += f" — {notice.dm_confidence_reason}"
+
+    if deceased_parts or confidence_line:
+        header = "=== DECEASED OWNER ==="
+        body = " | ".join(deceased_parts)
+        if confidence_line:
+            body += f"\n{confidence_line}" if body else confidence_line
+        sections.append(f"{header}\n{body}")
+
+    # Heir map (signing chain + other family)
+    heir_section = _build_heir_summary(notice)
+    if heir_section:
+        sections.append(heir_section)
+
+    return "\n\n".join(sections)
 
 
 def _validate_row(row: dict) -> tuple[bool, list[str]]:

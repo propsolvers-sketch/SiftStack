@@ -2369,7 +2369,15 @@ def enrich_obituary_data(
                 "executor_named": notice.owner_name,
                 "_probate_preset": True,
             }
-            matches.append((notice, synthetic_parsed, notice.source_url or "", "probate_preset", raw_name, is_tax_name))
+            # Pass "" as the URL (not notice.source_url, which is the
+            # alabamapublicnotices.com detail page). For probate_preset
+            # records there is no obituary research and therefore no
+            # obituary URL. _apply_obituary_match() writes this through
+            # to notice.obituary_url; passing source_url here was the
+            # root cause of the operator's 2026-06-10 report that
+            # Column BG and the "Obituary:" line inside Notes (Column AA)
+            # both showed APN URLs across DMs + Heirs CSVs.
+            matches.append((notice, synthetic_parsed, "", "probate_preset", raw_name, is_tax_name))
             confirmed += 1
             probate_preset_count += 1
             logger.info(
@@ -2825,6 +2833,13 @@ def enrich_obituary_data(
                 "status": "verified_living",
                 "source": "probate_notice",
                 "rank": 1,
+                # Per AL § 43-2-833, the court-appointed Personal
+                # Representative has full authority to sell, mortgage,
+                # lease, etc. estate property during the probate process.
+                # They ARE the signing authority — flag them so the
+                # Heirs CSV's _build_heir_summary renders them in the
+                # SIGNING CHAIN section instead of "Other Family".
+                "signing_authority": True,
                 "street": notice.owner_street,
                 "city": notice.owner_city or "Knoxville",
                 "state": "TN",
