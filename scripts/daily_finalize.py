@@ -241,12 +241,20 @@ def parse_pre_probate(path: Path) -> PreProbateFunnel:
 
 def _csvs_from_this_run(after_ts: float) -> list[Path]:
     """Find all datasift upload CSVs written this run, sorted by upload
-    priority (lowest priority value first → uploads first).
+    priority (lowest priority value first → uploads first), with any
+    multi-file distressors consolidated into a single upload CSV.
 
-    Skips the per-run archive file (datasift_archive_*.csv) since it's
-    intentionally not for upload. Skips the legacy DMs/Heirs combined
-    masters too — those are no longer produced post-2026-06-11 but old
-    leftovers on disk could otherwise sneak into the upload queue.
+    Consolidation (2026-06-11 operator request): main.py daily writes a
+    probate file AND apn_probate may write a SECOND probate file. Both go
+    to the same DataSift list, so we concat them into one upload file
+    before submitting — avoids a redundant browser session, redundant
+    enrich pass, and confusing audit trail. Both original files are kept
+    on disk for archive purposes; only the consolidated file gets uploaded.
+
+    Skips:
+      * datasift_archive_*.csv — audit only, never uploaded
+      * Legacy DMs/Heirs masters — old build artifacts that would
+        duplicate the new per-distressor files
 
     Priority comes from DISTRESSOR_PRIORITY in datasift_formatter via
     the row 1 Notice Type. Unknown types sort last (priority 99)."""
@@ -267,18 +275,93 @@ def _csvs_from_this_run(after_ts: float) -> list[Path]:
         if p.stat().st_mtime <= after_ts:
             continue
         if "_DMs_" in p.name or "_Heirs_" in p.name:
-            # Legacy master files no longer written by the formatter.
-            # If they exist on disk from an old build, skip uploading
-            # them — they'd duplicate the new per-distressor files.
+            continue  # legacy master files — see docstring
+        # Skip already-consolidated files from a prior partial run — they'd
+        # be re-detected by the freshness filter but we don't want them as
+        # inputs to a fresh consolidation pass.
+        if "_consolidated_" in p.name:
             continue
         fresh.append(p)
+
+    # Group by row 1 Notice Type, consolidate multi-file groups.
+    grouped: dict[str, list[Path]] = {}
+    for p in fresh:
+        nt = _notice_type_from_csv(p)
+        grouped.setdefault(nt, []).append(p)
+
+    uploads: list[Path] = []
+    for nt, group in grouped.items():
+        if len(group) == 1:
+            uploads.append(group[0])
+        else:
+            consolidated = _consolidate_csvs(group, nt)
+            if consolidated:
+                uploads.append(consolidated)
+                logger = __import__("logging").getLogger(__name__)
+                logger.info(
+                    "Consolidated %d %s files → %s",
+                    len(group), nt or "unknown", consolidated.name,
+                )
 
     # Sort by upload priority via each CSV's row 1 Notice Type.
     def _priority_for(p: Path) -> tuple[int, str]:
         nt = _notice_type_from_csv(p)
         return (distressor_sort_key(nt), p.name)
 
-    return sorted(fresh, key=_priority_for)
+    return sorted(uploads, key=_priority_for)
+
+
+def _consolidate_csvs(group: list[Path], notice_type: str) -> Path | None:
+    """Concat multiple CSVs of the same notice_type into one upload file.
+
+    Operator request 2026-06-11: when main.py daily AND apn_probate both
+    produce probate files on the same day, merge them so DataSift sees ONE
+    consolidated upload (one browser session, one enrich pass, one Slack
+    line). The originals stay on disk for archive — only the consolidated
+    file is uploaded.
+
+    Filename: datasift_upload_<notice_type>_consolidated_<ts>.csv. Header
+    row comes from group[0]; subsequent files' header rows are skipped.
+    Returns the consolidated file path, or None if the group was empty or
+    all files were unreadable.
+    """
+    from datetime import datetime as _dt
+
+    if not group:
+        return None
+
+    nt_slug = notice_type or "unknown"
+    timestamp = _dt.now().strftime("%Y-%m-%d_%H%M%S")
+    out_dir = group[0].parent
+    out_path = out_dir / f"datasift_upload_{nt_slug}_consolidated_{timestamp}.csv"
+
+    header: list[str] | None = None
+    rows_written = 0
+    with open(out_path, "w", newline="", encoding="utf-8") as out_f:
+        writer = None
+        for src in group:
+            try:
+                with open(src, newline="", encoding="utf-8") as in_f:
+                    reader = csv.DictReader(in_f)
+                    if header is None:
+                        header = list(reader.fieldnames or [])
+                        writer = csv.DictWriter(out_f, fieldnames=header)
+                        writer.writeheader()
+                    for row in reader:
+                        writer.writerow(row)
+                        rows_written += 1
+            except Exception as e:
+                logger = __import__("logging").getLogger(__name__)
+                logger.warning("Skipping %s during consolidation: %s", src, e)
+                continue
+
+    if rows_written == 0:
+        try:
+            out_path.unlink()
+        except OSError:
+            pass
+        return None
+    return out_path
 
 
 def _notice_type_from_csv(p: Path) -> str:
