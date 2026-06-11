@@ -1093,12 +1093,43 @@ def _build_row(
         Dict keyed by DATASIFT_COLUMNS headers.
     """
     contact = _get_contact_info(notice)
-    tags = _build_tags(notice, phone_tiers=phone_tiers)
+
+    # Tags strategy (rewritten 2026-06-11 per operator request).
+    #
+    # The DataSift upload wizard's Step-4 column-mapping for the "Tags"
+    # column has been chronically unreliable (operator reports across
+    # 2026-06-08 → 06-10 confirm every upload silently drops descriptive
+    # tags). To stop losing this signal, we split the tag set into two
+    # surfaces:
+    #
+    #  * **Tags column → "Courthouse Data" only.** A single value the
+    #    wizard's Step-2 typeahead can reliably set (and Step-4 won't
+    #    drop because there's only one comma-separated value).
+    #
+    #  * **Notes column (Column AA) → full descriptive tag list appended
+    #    at the bottom under "=== TAGS ===".** Notes maps reliably in
+    #    Step-4 because the wizard auto-detects it as a free-text field.
+    #    Downstream filter presets need to be rewritten to search the
+    #    Notes content via "contains" instead of pure Tag filters —
+    #    operator confirmed acceptable trade-off for reliability.
+    full_tag_list = _build_tags(notice, phone_tiers=phone_tiers)
     if is_heir_row and notice.notice_type:
         heir_tag = f"heir_of_{notice.notice_type}"
-        tags = f"{tags},{heir_tag}" if tags else heir_tag
+        full_tag_list = (
+            f"{full_tag_list},{heir_tag}" if full_tag_list else heir_tag
+        )
+
+    tags = "Courthouse Data"
     list_name = NOTICE_TYPE_TO_LIST.get(notice.notice_type, "")
     notes = notes_override if notes_override is not None else _build_notes(notice)
+
+    # Append the full descriptive tag list to Notes so it survives the
+    # upload regardless of Step-4 Tags column-mapping behaviour.
+    if full_tag_list:
+        notes = (
+            f"{notes}\n\n=== TAGS ===\n{full_tag_list}"
+            if notes else f"=== TAGS ===\n{full_tag_list}"
+        )
 
     # Conditionally map auction_date to the right built-in field
     tax_auction = ""
