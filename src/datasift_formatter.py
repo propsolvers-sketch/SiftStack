@@ -307,6 +307,45 @@ NOTICE_TYPE_TO_LIST = {
     "divorce": "Divorce",
 }
 
+# Upload priority — lower numbers upload FIRST.
+# Operator request 2026-06-11: route uploads code_violation → foreclosure →
+# pre_probate → probate so that probate runs LAST and its swap_owners=ON
+# enrich pass doesn't risk corrupting earlier (non-probate) uploads of the
+# same property. Probate is rightful-last because the executor (PR) has
+# actually filed with the courts to represent the estate, so they should
+# overwrite any stale owner data from prior distressors at the same
+# property address.
+DISTRESSOR_PRIORITY: dict[str, int] = {
+    "code_violation": 1,
+    "foreclosure": 2,
+    "tax_delinquent": 3,
+    "tax_sale": 3,
+    "eviction": 4,
+    "divorce": 5,
+    "pre_probate": 6,
+    "probate": 7,  # LAST — see swap_owners reasoning above
+}
+
+# Which distressors trigger DataSift's "Swap Owners" enrich-modal toggle.
+# These are the cases where the new upload's owner (executor / DM) is more
+# authoritative than DataSift's existing record (which may still hold the
+# deceased's name from a prior upload). For non-probate distressors the
+# existing owner is typically correct and should be preserved.
+SWAP_OWNERS_ON_NOTICE_TYPES: frozenset[str] = frozenset({
+    "probate",
+    "pre_probate",
+})
+
+
+def distressor_sort_key(notice_type: str) -> int:
+    """Sort key for upload ordering. Unknown types sort last."""
+    return DISTRESSOR_PRIORITY.get(notice_type, 99)
+
+
+def should_swap_owners(notice_type: str) -> bool:
+    """True iff this distressor should run enrich with Swap Owners ON."""
+    return notice_type in SWAP_OWNERS_ON_NOTICE_TYPES
+
 # Display-only labels for heir-row uploads in run summaries / Slack messages.
 # These do NOT correspond to real DataSift lists — heir records land in
 # NOTICE_TYPE_TO_LIST[notice_type] (same as DMs) and are tagged with
@@ -1305,94 +1344,159 @@ def write_datasift_split_csvs(
     date_str: str | None = None,
     phone_tiers: dict | None = None,
 ) -> list[dict]:
-    """Generate separate DM and Heir Map CSVs for two-upload Message Board flow.
+    """Generate per-distressor upload CSVs + one consolidated archive CSV.
 
-    CSV 1 ("DMs"): All records. Deceased get DM breakdown as Notes, living get
-    property details. Creates/updates all records in DataSift.
+    Architecture (operator request 2026-06-11): each distressor (code_violation,
+    foreclosure, pre_probate, probate, etc.) gets its OWN upload file containing
+    both the primary DM row AND every heir row for the notices of that type.
+    Plus one ``datasift_archive_<ts>.csv`` with every row from every distressor
+    in one file for audit / records purposes — never uploaded.
 
-    CSV 2 ("Heirs"): Only deceased records with heir data. Notes = full heir map.
-    DataSift merges by address, adding a second Message Board comment.
+    Why per-distressor + dual-row:
+      * DataSift filter is by LIST, not by tag. A property scraped as both
+        foreclosure AND probate today gets a row in each upload file and lands
+        on both lists. Dual-list membership IS the urgency signal.
+      * Uploads can run in priority order (DISTRESSOR_PRIORITY constant) so
+        probate runs LAST with Swap Owners ON without affecting earlier
+        non-probate uploads of the same property.
+      * Heir rows ride along on the same list as their parent DM — no
+        separate Heirs CSV needed. Operator gets a clean record-per-row view
+        in each list.
 
     Args:
-        notices: List of enriched NoticeData objects.
-        date_str: Optional date string for filenames/list names (default: today).
-        phone_tiers: Optional Trestle scoring dict — applied to both DMs and
-            Heirs rows so phone_dial_first/etc. tags appear on every row.
+        notices: Enriched NoticeData objects.
+        date_str: Optional date string for filenames (default: today).
+        phone_tiers: Optional Trestle scoring dict — applied to every row.
 
     Returns:
-        List of dicts: [{"path": Path, "label": str, "list_name": str}, ...]
-        Returns 1 item if no deceased-with-heirs, 2 items otherwise.
+        List of dicts. First entry is always the archive
+        ``{"role": "archive", "path": ..., ...}``. Remaining entries are
+        per-distressor upload files
+        ``{"role": "upload", "path": ..., "notice_type": ...,
+           "list_name": ..., "priority": int, "swap_owners": bool,
+           "dm_count": int, "heir_count": int}``
+        sorted by priority (lowest first → upload first).
     """
     if date_str is None:
         date_str = datetime.now().strftime("%Y-%m-%d")
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    results = []
 
-    # CSV 1: DMs — all records (lands in output/leads/)
-    dm_path = LEADS_DIR / f"datasift_upload_DMs_{timestamp}.csv"
-    dm_written = 0
+    # Pre-build every row (DM + heir variants). Each row carries its
+    # notice_type so we can sort it into the right per-distressor bucket.
+    dm_rows_by_type: dict[str, list[dict]] = {}
+    heir_rows_by_type: dict[str, list[dict]] = {}
+    archive_rows: list[dict] = []  # everything, archive only
     incomplete = 0
     issue_counts: dict[str, int] = {}
-    with open(dm_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
-        writer.writeheader()
-        for notice in notices:
-            row = _build_row(
+
+    for notice in notices:
+        nt = (notice.notice_type or "").strip() or "unknown"
+
+        # DM row — every notice gets one
+        dm_row = _build_row(
+            notice,
+            notes_override=_build_dm_notes(notice),
+            phone_tiers=phone_tiers,
+        )
+        is_complete, issues = _validate_row(dm_row)
+        if not is_complete:
+            incomplete += 1
+            for issue in issues:
+                issue_counts[issue] = issue_counts.get(issue, 0) + 1
+        dm_rows_by_type.setdefault(nt, []).append(dm_row)
+        archive_rows.append(dm_row)
+
+        # Heir rows — only for deceased records with heir_map_json
+        if notice.owner_deceased == "yes" and notice.heir_map_json:
+            heir_row = _build_row(
                 notice,
-                notes_override=_build_dm_notes(notice),
+                notes_override=_build_heir_notes(notice),
+                is_heir_row=True,
                 phone_tiers=phone_tiers,
             )
-            is_complete, issues = _validate_row(row)
-            if not is_complete:
-                incomplete += 1
-                for issue in issues:
-                    issue_counts[issue] = issue_counts.get(issue, 0) + 1
-            writer.writerow(row)
-            dm_written += 1
+            heir_rows_by_type.setdefault(nt, []).append(heir_row)
+            archive_rows.append(heir_row)
 
-    logger.info("DMs CSV: %d records → %s", dm_written, dm_path)
-    if incomplete:
-        logger.warning("DataSift completeness: %d/%d clean, %d incomplete (%s)",
-                        dm_written - incomplete, dm_written, incomplete,
-                        ", ".join(f"{k}={v}" for k, v in issue_counts.items()))
-    else:
-        logger.info("DataSift completeness: %d/%d clean (100%%)", dm_written, dm_written)
+    results: list[dict] = []
+
+    # ── Archive CSV — all rows, never uploaded ──────────────────────
+    archive_path = LEADS_DIR / f"datasift_archive_{timestamp}.csv"
+    with open(archive_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
+        writer.writeheader()
+        for row in archive_rows:
+            writer.writerow(row)
+    logger.info("Archive CSV: %d rows → %s", len(archive_rows), archive_path)
     results.append({
-        "path": dm_path,
-        "label": "DMs",
-        "list_name": f"SiftStack {date_str} - DMs",
+        "role": "archive",
+        "path": archive_path,
+        "label": "Archive",
+        "row_count": len(archive_rows),
     })
 
-    # CSV 2: Heirs — only deceased with heir data
-    deceased_with_heirs = [
-        n for n in notices
-        if n.owner_deceased == "yes" and n.heir_map_json
-    ]
+    if incomplete:
+        logger.warning("DataSift completeness: %d/%d clean, %d incomplete (%s)",
+                        len(notices) - incomplete, len(notices), incomplete,
+                        ", ".join(f"{k}={v}" for k, v in issue_counts.items()))
+    else:
+        logger.info(
+            "DataSift completeness: %d/%d clean (100%%)",
+            len(notices), len(notices),
+        )
 
-    if deceased_with_heirs:
-        heir_path = LEADS_DIR / f"datasift_upload_Heirs_{timestamp}.csv"
-        heir_written = 0
-        with open(heir_path, "w", newline="", encoding="utf-8") as f:
+    # ── Per-distressor upload CSVs ──────────────────────────────────
+    # One file per notice_type that produced at least one DM row.
+    # Sorted by DISTRESSOR_PRIORITY so the upload loop in daily_finalize
+    # can iterate the returned list in upload order without re-sorting.
+    notice_types_present = sorted(
+        dm_rows_by_type.keys(),
+        key=distressor_sort_key,
+    )
+
+    for nt in notice_types_present:
+        list_name = NOTICE_TYPE_TO_LIST.get(nt, "")
+        if not list_name:
+            logger.warning(
+                "No NOTICE_TYPE_TO_LIST mapping for notice_type=%r — "
+                "skipping upload-file generation for %d row(s)",
+                nt, len(dm_rows_by_type[nt]),
+            )
+            continue
+
+        upload_path = LEADS_DIR / f"datasift_upload_{nt}_{timestamp}.csv"
+        dm_rows = dm_rows_by_type.get(nt, [])
+        heir_rows = heir_rows_by_type.get(nt, [])
+        total = len(dm_rows) + len(heir_rows)
+
+        with open(upload_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
             writer.writeheader()
-            for notice in deceased_with_heirs:
-                row = _build_row(
-                    notice,
-                    notes_override=_build_heir_notes(notice),
-                    is_heir_row=True,
-                    phone_tiers=phone_tiers,
-                )
+            # DM rows first, then heir rows — consistent within each file
+            for row in dm_rows:
                 writer.writerow(row)
-                heir_written += 1
+            for row in heir_rows:
+                writer.writerow(row)
 
-        logger.info("Heirs CSV: %d records → %s", heir_written, heir_path)
+        swap = should_swap_owners(nt)
+        priority = distressor_sort_key(nt)
+        logger.info(
+            "Upload CSV (%s, list=%s, prio=%d, swap=%s): "
+            "%d DM + %d heir = %d rows → %s",
+            nt, list_name, priority, swap,
+            len(dm_rows), len(heir_rows), total, upload_path,
+        )
+
         results.append({
-            "path": heir_path,
-            "label": "Heirs",
-            "list_name": f"SiftStack {date_str} - Heirs",
+            "role": "upload",
+            "path": upload_path,
+            "label": list_name,
+            "notice_type": nt,
+            "list_name": list_name,
+            "priority": priority,
+            "swap_owners": swap,
+            "dm_count": len(dm_rows),
+            "heir_count": len(heir_rows),
         })
-    else:
-        logger.info("No deceased records with heir data — skipping Heirs CSV")
 
     return results

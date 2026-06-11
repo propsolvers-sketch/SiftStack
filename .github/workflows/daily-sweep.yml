@@ -233,6 +233,7 @@ jobs:
           name: siftstack-output-${{ github.run_id }}
           path: |
             output/leads/datasift_upload*.csv
+            output/leads/datasift_archive*.csv
             output/raw/al_notices*.csv
             output/deals/*.xlsx
             output/observability/service_rates.json

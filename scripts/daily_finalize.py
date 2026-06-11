@@ -240,38 +240,77 @@ def parse_pre_probate(path: Path) -> PreProbateFunnel:
 # ── CSV discovery + categorization ──────────────────────────────────────
 
 def _csvs_from_this_run(after_ts: float) -> list[Path]:
-    """Find all datasift CSVs written this run. Pipelines now drop them in
-    output/leads/ (post-reorg). We still glob output/ root for backward-compat
-    so a partial transition or legacy script invocation still gets picked up."""
+    """Find all datasift upload CSVs written this run, sorted by upload
+    priority (lowest priority value first → uploads first).
+
+    Skips the per-run archive file (datasift_archive_*.csv) since it's
+    intentionally not for upload. Skips the legacy DMs/Heirs combined
+    masters too — those are no longer produced post-2026-06-11 but old
+    leftovers on disk could otherwise sneak into the upload queue.
+
+    Priority comes from DISTRESSOR_PRIORITY in datasift_formatter via
+    the row 1 Notice Type. Unknown types sort last (priority 99)."""
+    from datasift_formatter import distressor_sort_key
+
     candidates: list[Path] = []
     for root in (OUT / "leads", OUT):
         if root.exists():
             candidates.extend(root.glob("datasift_upload*.csv"))
-    return sorted(
-        {p for p in candidates if p.stat().st_mtime > after_ts}
-    )
+
+    # Dedup + freshness filter
+    seen: set[Path] = set()
+    fresh: list[Path] = []
+    for p in candidates:
+        if p in seen:
+            continue
+        seen.add(p)
+        if p.stat().st_mtime <= after_ts:
+            continue
+        if "_DMs_" in p.name or "_Heirs_" in p.name:
+            # Legacy master files no longer written by the formatter.
+            # If they exist on disk from an old build, skip uploading
+            # them — they'd duplicate the new per-distressor files.
+            continue
+        fresh.append(p)
+
+    # Sort by upload priority via each CSV's row 1 Notice Type.
+    def _priority_for(p: Path) -> tuple[int, str]:
+        nt = _notice_type_from_csv(p)
+        return (distressor_sort_key(nt), p.name)
+
+    return sorted(fresh, key=_priority_for)
 
 
-def _categorize(p: Path) -> str:
-    if "_DMs_" in p.name:
-        return "main_dms"
-    if "_Heirs_" in p.name:
-        return "main_heirs"
-    if "code_violation" in p.name:
-        return "code_violation"
+def _notice_type_from_csv(p: Path) -> str:
+    """Read row 1's Notice Type. Empty string if unreadable."""
     try:
         with open(p, newline="", encoding="utf-8") as f:
             row = next(csv.DictReader(f), None)
         if row:
-            nt = (row.get("Notice Type") or "").strip()
-            if nt == "pre_probate":
-                return "pre_probate"
-            if nt == "probate":
-                return "apn_probate"
-            if nt == "code_violation":
-                return "code_violation"
+            return (row.get("Notice Type") or "").strip()
     except Exception:
         pass
+    return ""
+
+
+def _categorize(p: Path) -> str:
+    """Map a CSV to its log-parsing bucket (for funnel display).
+
+    Filename hints come first (some pipelines stamp the distressor in the
+    name), then row 1 Notice Type as fallback. The buckets here are
+    log/funnel labels — NOT DataSift list names — so probate vs
+    apn_probate is a meaningful distinction (different log sources)."""
+    if "code_violation" in p.name:
+        return "code_violation"
+    nt = _notice_type_from_csv(p)
+    if nt == "pre_probate":
+        return "pre_probate"
+    if nt == "probate":
+        return "apn_probate"
+    if nt == "code_violation":
+        return "code_violation"
+    if nt == "foreclosure":
+        return "main_dms"  # main.py daily foreclosure output
     return "unknown"
 
 

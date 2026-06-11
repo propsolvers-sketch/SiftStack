@@ -1436,33 +1436,35 @@ async def upload_to_datasift_per_distressor(
     headless: bool = True,
     enrich: bool = True,
     skip_trace: bool = True,
-    tmp_dir: Path | None = None,
+    tmp_dir: Path | None = None,  # kept for back-compat; ignored
 ) -> dict:
-    """Canonical DataSift upload: split CSV by notice_type, upload each subset to
-    its existing distressor list (no SiftStack wrapper list).
+    """Upload a SINGLE-distressor CSV to its corresponding DataSift list.
 
-    Splits csv_path into one temp CSV per distinct ``Notice Type`` value, then
-    uploads each subset using ``existing_list=True`` with the list name resolved
-    from ``NOTICE_TYPE_TO_LIST``. Enrich + skip-trace run once at the end against
-    the first list seen (the per-list filter would only pick up that one subset
-    cleanly — multi-list enrich on a mixed batch requires a separate UI flow we
-    haven't built).
+    Architecture change 2026-06-11 (operator request): incoming CSVs are now
+    pre-split by distressor at formatter time (datasift_upload_<distressor>_
+    <ts>.csv), so this function NO LONGER splits internally. It just reads
+    row 1 to identify the notice_type, looks up the target list_name and
+    Swap Owners flag, uploads via existing-list mode, then runs enrich +
+    skip-trace with the per-distressor Swap Owners setting.
 
     Args:
-        csv_path: Path to a DataSift-formatted CSV with a populated ``Notice
-            Type`` column.
+        csv_path: Path to a DataSift-formatted CSV. ALL rows must share the
+            same ``Notice Type`` value (validated by reading row 1 + spot-
+            check). Pre-2026-06-11 mixed-distressor CSVs are not supported
+            and will fail validation.
         email / password: DataSift creds. Default to env vars.
         headless: Playwright launch flag.
         enrich: Run enrichment after upload.
         skip_trace: Run skip-trace after upload.
-        tmp_dir: Override the temp dir for split CSVs (test convenience).
+        tmp_dir: Unused. Retained so existing callers don't break.
 
     Returns:
-        Dict with ``success``, ``message``, ``uploads`` (one per distressor),
-        ``enrich_result``, ``skip_trace_result``, ``skipped_unmapped`` (any rows
-        whose notice_type wasn't in NOTICE_TYPE_TO_LIST).
+        Dict with ``success``, ``message``, ``uploads`` (single-entry list
+        for back-compat with old caller expecting a list shape),
+        ``enrich_result``, ``skip_trace_result``, ``notice_type``,
+        ``list_name``, ``swap_owners``.
     """
-    from datasift_formatter import NOTICE_TYPE_TO_LIST
+    from datasift_formatter import NOTICE_TYPE_TO_LIST, should_swap_owners
 
     email = email or os.environ.get("DATASIFT_EMAIL", "")
     password = password or os.environ.get("DATASIFT_PASSWORD", "")
@@ -1480,52 +1482,59 @@ async def upload_to_datasift_per_distressor(
             "uploads": [],
         }
 
-    # Split rows by Notice Type
-    from collections import defaultdict
-    from tempfile import mkdtemp
-    if tmp_dir is None:
-        tmp_dir = Path(mkdtemp(prefix="siftstack_split_"))
-    else:
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-
+    # Identify notice_type from row 1 + row count.
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        fieldnames = reader.fieldnames or []
-        groups: dict[str, list[dict]] = defaultdict(list)
-        for row in reader:
-            nt = (row.get("Notice Type") or "").strip()
-            groups[nt].append(row)
+        rows = list(reader)
 
-    splits: list[dict] = []
-    skipped_unmapped: dict[str, int] = {}
-    for nt, rows in groups.items():
-        list_name = NOTICE_TYPE_TO_LIST.get(nt)
-        if not list_name:
-            skipped_unmapped[nt or "(blank)"] = len(rows)
-            logger.warning(
-                "No NOTICE_TYPE_TO_LIST mapping for notice_type=%r — skipping %d rows",
-                nt, len(rows),
-            )
-            continue
-        out_path = tmp_dir / f"split_{nt}_{csv_path.stem}.csv"
-        with open(out_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-        splits.append({
-            "notice_type": nt,
-            "list_name": list_name,
-            "path": out_path,
-            "row_count": len(rows),
-        })
-
-    if not splits:
+    if not rows:
         return {
             "success": False,
-            "message": "No upload-eligible splits produced (no rows matched NOTICE_TYPE_TO_LIST)",
+            "message": f"CSV is empty (header only): {csv_path}",
             "uploads": [],
-            "skipped_unmapped": skipped_unmapped,
         }
+
+    notice_type = (rows[0].get("Notice Type") or "").strip()
+    list_name = NOTICE_TYPE_TO_LIST.get(notice_type, "")
+    if not list_name:
+        return {
+            "success": False,
+            "message": (
+                f"No NOTICE_TYPE_TO_LIST mapping for notice_type="
+                f"{notice_type!r} in {csv_path.name}"
+            ),
+            "uploads": [],
+            "notice_type": notice_type,
+        }
+
+    # Sanity check: spot-check that ALL rows share the same notice_type.
+    # A mixed CSV here means the formatter ran an old codepath OR a caller
+    # is passing an archive/master file. Either way, refuse rather than
+    # silently uploading the wrong rows to the wrong list.
+    mismatched = [
+        (i, (r.get("Notice Type") or "").strip())
+        for i, r in enumerate(rows, start=1)
+        if (r.get("Notice Type") or "").strip() != notice_type
+    ]
+    if mismatched:
+        sample = mismatched[:3]
+        return {
+            "success": False,
+            "message": (
+                f"Mixed Notice Type in {csv_path.name} — refusing to upload. "
+                f"Row 1={notice_type!r}; mismatches: {sample}. "
+                f"This CSV may be a legacy DMs master or archive file."
+            ),
+            "uploads": [],
+            "notice_type": notice_type,
+        }
+
+    swap_owners = should_swap_owners(notice_type)
+    logger.info(
+        "Single-distressor upload: %d rows of notice_type=%r → list=%r "
+        "(swap_owners=%s)",
+        len(rows), notice_type, list_name, swap_owners,
+    )
 
     uploads: list[dict] = []
     enrich_result: dict = {}
@@ -1548,51 +1557,42 @@ async def upload_to_datasift_per_distressor(
                     "success": False,
                     "message": "DataSift login failed",
                     "uploads": [],
-                    "skipped_unmapped": skipped_unmapped,
+                    "notice_type": notice_type,
+                    "list_name": list_name,
                 }
 
-            for i, split in enumerate(splits):
-                logger.info(
-                    "Uploading split %d/%d: %d rows → list %r",
-                    i + 1, len(splits), split["row_count"], split["list_name"],
-                )
-                r = await upload_csv(
-                    page,
-                    split["path"],
-                    list_name=split["list_name"],
-                    existing_list=True,
-                )
-                r["notice_type"] = split["notice_type"]
-                r["list_name"] = split["list_name"]
-                uploads.append(r)
-                if i < len(splits) - 1:
-                    await page.wait_for_timeout(10000)
-
-            # Probate + pre_probate get Swap Owners ON so DataSift overwrites
-            # any pre-existing record's owner (typically the decedent from a
-            # prior upload) with the new upload's owner (the DM / executor).
-            # Foreclosure, code_violation, tax distressors stay OFF — their
-            # owners on file are typically the correct contact.
-            swap_on = any(
-                s["notice_type"] in ("probate", "pre_probate") for s in splits
+            r = await upload_csv(
+                page,
+                csv_path,
+                list_name=list_name,
+                existing_list=True,
             )
+            r["notice_type"] = notice_type
+            r["list_name"] = list_name
+            uploads.append(r)
+
             if enrich:
                 enrich_result = await enrich_records(
-                    page, splits[0]["list_name"], swap_owners=swap_on,
+                    page, list_name, swap_owners=swap_owners,
                 )
             if skip_trace:
-                skip_result = await skip_trace_records(page, splits[0]["list_name"])
+                skip_result = await skip_trace_records(page, list_name)
         finally:
             await browser.close()
 
     all_ok = all(u.get("success", False) for u in uploads)
     return {
         "success": all_ok,
-        "message": f"Uploaded {sum(1 for u in uploads if u.get('success'))}/{len(uploads)} splits",
+        "message": (
+            f"Uploaded {len(rows)} rows to list {list_name!r} "
+            f"(notice_type={notice_type}, swap_owners={swap_owners})"
+        ),
         "uploads": uploads,
         "enrich_result": enrich_result,
         "skip_trace_result": skip_result,
-        "skipped_unmapped": skipped_unmapped,
+        "notice_type": notice_type,
+        "list_name": list_name,
+        "swap_owners": swap_owners,
     }
 
 
