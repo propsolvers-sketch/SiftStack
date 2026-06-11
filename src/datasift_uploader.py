@@ -696,6 +696,45 @@ async def _navigate_to_records(page: Page) -> None:
     await _dismiss_popups(page)
 
 
+async def _nuke_records_page_overlays(page: Page) -> int:
+    """Aggressively remove ANY ModalOverlay from the Records page.
+
+    Safe to call here because we're on /records/properties — there is NO
+    wizard rendered as a sibling of the overlay (that's only the case
+    during the upload-wizard flow on /records/upload). Any ModalOverlay
+    visible during enrich / skip-trace is a coachmark, popup, or
+    notification and is safe to DOM-remove.
+
+    Operator failure 2026-06-11 (run 27357983826): Modalstyles__ModalOverlay-
+    gUheGS ipmZcI was intercepting pointer events on the
+    #Records__Filters_Trigger click. The standard dismiss_popups() only
+    handles Loom-containing overlays; this catches everything else.
+
+    Returns number of overlays removed.
+    """
+    try:
+        removed = await page.evaluate("""() => {
+            const overlays = document.querySelectorAll(
+                '[class*="ModalOverlay"], [class*="Modalstyles__Modal"]'
+            );
+            let n = 0;
+            for (const o of overlays) {
+                o.remove();
+                n++;
+            }
+            return n;
+        }""")
+        if removed:
+            logger.info(
+                "Nuked %d Records-page ModalOverlay element(s) "
+                "blocking clicks", removed,
+            )
+        return removed or 0
+    except Exception as e:
+        logger.debug("Records-page overlay nuke failed: %s", e)
+        return 0
+
+
 async def _filter_by_list(page: Page, list_name: str) -> bool:
     """Filter records page by list name. Returns True if filter applied.
 
@@ -705,6 +744,11 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
     """
     try:
         await _dismiss_popups(page)
+        # Defense in depth: nuke any ModalOverlay that survived the
+        # standard dismiss. 2026-06-11 failure was Modalstyles__Modal-
+        # Overlay-gUheGS ipmZcI which doesn't contain a Loom link so
+        # dismiss_popups()'s loom-scoped path skipped it.
+        await _nuke_records_page_overlays(page)
 
         # Open filter panel — "Filter Records" is an <a> link at top-right
         filter_link = page.locator('#Records__Filters_Trigger')
@@ -712,7 +756,16 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
             filter_link = page.locator('a:has-text("Filter Records")')
 
         if await filter_link.count() > 0:
-            await filter_link.first.click()
+            # force=True bypasses Playwright's pointer-event-interception
+            # check as belt-and-suspenders against any overlay the nuke
+            # above missed (e.g. one that appears in the 200ms gap
+            # between nuke and click).
+            try:
+                await filter_link.first.click(timeout=10000)
+            except Exception:
+                # Retry with force after a fresh nuke pass.
+                await _nuke_records_page_overlays(page)
+                await filter_link.first.click(force=True, timeout=10000)
             await page.wait_for_timeout(2000)
             logger.debug("Opened filter panel")
         else:
