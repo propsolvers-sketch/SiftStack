@@ -33,6 +33,20 @@ SEARCH_DELAY_MIN = 0.5
 SEARCH_DELAY_MAX = 1.0
 PARALLEL_WORKERS = 6  # Concurrent heir verifications
 FETCH_TIMEOUT = 20
+# Per-fetch wall-clock cap for obit-source pages (funeral homes, news
+# memorials). Cuts tail-latency runaway when a site 403s into Firecrawl-
+# into-web.archive.org-into-Facebook-into-Firecrawl-again waterfalls.
+# Operator runtime audit 2026-06-11 found this fan-out was the primary
+# contributor to the 3h workflow timeout — a single "BENNETT" surname
+# walked 8 funeral home sources serially in the last minute before the
+# job was killed.
+OBIT_FETCH_PER_URL_TIMEOUT = 8
+# How many obit search results to TRY per notice before giving up.
+# Operator request 2026-06-11. Was unbounded — DDG returned up to 8
+# direct hits + 4 fallback queries each adding ~8 more = up to 40 URLs
+# per notice. 5 keeps the highest-confidence sources while capping
+# worst-case time per notice at 5 × 8s = 40s (vs unbounded today).
+OBIT_RESULTS_PER_NOTICE_CAP = 5
 MAX_OBITUARY_TEXT = 6000
 MAX_ADDRESS_TEXT = 15000  # Larger limit for people search pages (CBC has 250+ results)
 
@@ -1553,7 +1567,17 @@ def _fetch_page_text(url: str) -> str:
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
         }
-        resp = requests.get(url, headers=headers, timeout=FETCH_TIMEOUT, allow_redirects=True)
+        # Use the tighter per-URL obit-fetch timeout. FETCH_TIMEOUT
+        # (20s) was the original default but the funeral-home/legacy
+        # fallback waterfalls turned that into a runtime killer
+        # (2026-06-11 audit). 8s is enough for any well-behaved obit
+        # source; slow ones get skipped and the next result in the
+        # capped list gets tried instead.
+        resp = requests.get(
+            url, headers=headers,
+            timeout=OBIT_FETCH_PER_URL_TIMEOUT,
+            allow_redirects=True,
+        )
         resp.raise_for_status()
 
         # Increased limit for JSON-heavy React SPA pages
@@ -2472,10 +2496,20 @@ def enrich_obituary_data(
                 time.sleep(random.uniform(SEARCH_DELAY_MIN, SEARCH_DELAY_MAX))
                 continue
 
-            # Try each result — fetch full page, then LLM parse
+            # Try each result — fetch full page, then LLM parse. Cap
+            # at OBIT_RESULTS_PER_NOTICE_CAP so a single bad surname
+            # can't dominate the run by chasing every funeral-home
+            # variant DDG returns (operator runtime audit 2026-06-11).
             best_snippet_result = None
             any_fetch_succeeded = False
-            for result in results:
+            capped_results = results[:OBIT_RESULTS_PER_NOTICE_CAP]
+            if len(results) > OBIT_RESULTS_PER_NOTICE_CAP:
+                logger.debug(
+                    "  [%d/%d] %s: capping %d obit results → %d (per-notice budget)",
+                    i, len(candidates), search_name,
+                    len(results), OBIT_RESULTS_PER_NOTICE_CAP,
+                )
+            for result in capped_results:
                 page_text = _fetch_page_text(result["url"])
                 if not page_text or len(page_text) < 100:
                     if not best_snippet_result and result.get("snippet"):

@@ -34,7 +34,14 @@ permissions:
 jobs:
   daily-sweep:
     runs-on: ubuntu-latest
-    timeout-minutes: 180  # 3 pipelines + uploads; cap at 3hr for safety
+    # 240 min budget. Bumped from 180 after the 2026-06-11 run hit the
+    # 3h cap on a high-volume day (112 notices + obit-fetch waterfalls
+    # for surnames like BENNETT). The src-side mitigations landed in
+    # the same commit (obit per-notice cap of 5, per-URL fetch timeout
+    # of 8s, pdfminer/urllib3 DEBUG silencing) should keep typical
+    # wall-clock well under 2h, but the extra 60 min of headroom
+    # absorbs spikes without killing the entire run.
+    timeout-minutes: 240
 
     # bash with -e (exit on error) and pipefail so that `cmd | tee` doesn't
     # mask non-zero exits from the python pipeline. With continue-on-error

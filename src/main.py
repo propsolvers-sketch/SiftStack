@@ -662,6 +662,26 @@ def setup_logging(verbose: bool = False) -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=handlers,
     )
+
+    # Silence noisy 3rd-party DEBUG output even when -v is on. pdfminer
+    # logs every PDF token at DEBUG (Madison newspaper PDF parses can
+    # emit 100K+ lines of these per run). urllib3 / httpcore / httpx /
+    # anthropic._base_client log every HTTP connect/close/send/receive
+    # at DEBUG — fine for one-shot debugging but disastrous for a 3h
+    # cron run (operator runtime audit 2026-06-11 found a single run
+    # log was 83 MB, almost entirely this noise). We still get
+    # WARN/ERROR from these modules so real connection problems surface.
+    for noisy in (
+        "pdfminer", "pdfminer.psparser", "pdfminer.pdfinterp",
+        "pdfminer.pdfparser", "pdfminer.cmapdb",
+        "urllib3", "urllib3.connectionpool",
+        "httpcore", "httpcore.http11", "httpcore.connection",
+        "httpx",
+        "anthropic._base_client",
+        "playwright",
+    ):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     logging.info("Logging to %s", log_file)
 
 
