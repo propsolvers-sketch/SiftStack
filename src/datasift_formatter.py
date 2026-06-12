@@ -444,6 +444,70 @@ def _phone_tier_tags(notice: NoticeData, phone_tiers: dict | None) -> list[str]:
     return out
 
 
+# Friendly display names for the per-phone tier breakdown in Notes.
+# Mirrors the column order in _collect_notice_phones() so the operator
+# sees "Phone 1 (xxx-xxx-xxxx): Dial First" matching the actual CSV column.
+_PHONE_FIELD_LABELS = [
+    ("primary_phone", "Phone 1"),
+    ("mobile_1",      "Phone 2"),
+    ("mobile_2",      "Phone 3"),
+    ("mobile_3",      "Phone 4"),
+    ("mobile_4",      "Phone 5"),
+    ("mobile_5",      "Phone 6"),
+    ("landline_1",    "Phone 7"),
+    ("landline_2",    "Phone 8"),
+    ("landline_3",    "Phone 9"),
+]
+
+
+def _build_phone_tier_section(
+    notice: NoticeData,
+    phone_tiers: dict | None,
+) -> str:
+    """Build a per-phone tier breakdown for the Notes column.
+
+    Output shape:
+
+      === PHONE TIERS (dial order) ===
+      Phone 1 (205-555-0001): Dial First  [litigator-risk]
+      Phone 2 (205-555-0002): Dial Third
+      Phone 3 (205-555-0003): unscored
+
+    Phones are listed in CSV-column order so the operator can directly see
+    which ``Phone N`` field to dial first. Litigator-risk flag is appended
+    in brackets when present (TCPA exposure marker).
+
+    Returns empty string if the record has no phones — caller decides
+    whether to skip emitting the section header at all.
+    """
+    if phone_tiers is None:
+        phone_tiers = {}
+
+    try:
+        from phone_validator import clean_phone
+    except Exception:
+        return ""
+
+    lines: list[str] = []
+    for attr, label in _PHONE_FIELD_LABELS:
+        raw = (getattr(notice, attr, "") or "").strip()
+        if not raw:
+            continue
+        cleaned = clean_phone(raw)
+        info = phone_tiers.get(cleaned) if cleaned else None
+        if info:
+            tier = info.get("tier") or "unscored"
+            litigator = info.get("is_litigator_risk")
+            suffix = "  [litigator-risk]" if litigator else ""
+            lines.append(f"{label} ({raw}): {tier}{suffix}")
+        else:
+            lines.append(f"{label} ({raw}): unscored")
+
+    if not lines:
+        return ""
+    return "=== PHONE TIERS (dial order) ===\n" + "\n".join(lines)
+
+
 def _build_tags(notice: NoticeData, phone_tiers: dict | None = None) -> str:
     """Build comma-separated tags string for DataSift upload.
 
@@ -1161,6 +1225,15 @@ def _build_row(
     tags = "Courthouse Data"
     list_name = NOTICE_TYPE_TO_LIST.get(notice.notice_type, "")
     notes = notes_override if notes_override is not None else _build_notes(notice)
+
+    # Per-phone Trestle tier breakdown (operator request 2026-06-12). The
+    # record-level "best tier" tag in the TAGS section answers "is this
+    # record worth dialing" but not "WHICH Phone N to dial first". This
+    # section spells out each phone's tier in CSV-column order so the
+    # operator can pick the right number at a glance.
+    phone_section = _build_phone_tier_section(notice, phone_tiers)
+    if phone_section:
+        notes = f"{notes}\n\n{phone_section}" if notes else phone_section
 
     # Append the full descriptive tag list to Notes so it survives the
     # upload regardless of Step-4 Tags column-mapping behaviour.

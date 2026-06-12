@@ -227,11 +227,13 @@ def run_full_pipeline(
     ]
 
     # ── Step 3: Trestle phone scoring (ALL records with phones) ───
-    # Previously restricted to DP candidates only, which left living-owner
-    # foreclosures (the bulk of every sweep) unscored. Score every record
-    # that has at least one phone field populated so DataSift filter presets
-    # can dial-prioritize across the full sweep. Litigator screening is on
-    # by default for TCPA risk protection (~$0.005-0.01/phone add-on cost).
+    # Score every record that has at least one phone field populated so
+    # DataSift filter presets can dial-prioritize across the full sweep.
+    #
+    # Litigator-check turned OFF 2026-06-12 per operator request — the
+    # add-on cost wasn't justified for the daily flow's volume. Re-enable
+    # by flipping add_litigator=True if TCPA screening becomes a
+    # compliance need.
     phone_candidates = [
         n for n in notices
         if any(
@@ -248,11 +250,11 @@ def run_full_pipeline(
             tiers = score_record_phones(
                 phone_candidates,
                 cfg.TRESTLE_API_KEY,
-                add_litigator=True,
+                add_litigator=False,
             )
             result.phone_tiers = tiers
             logger.info(
-                "Trestle scored %d unique phones across %d records (litigator-check ON)",
+                "Trestle scored %d unique phones across %d records (litigator-check OFF)",
                 len(tiers), len(phone_candidates),
             )
         except Exception as e:
