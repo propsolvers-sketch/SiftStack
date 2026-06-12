@@ -95,17 +95,20 @@ async def upload_csv(
     mode: str = "add",
     list_name: str | None = None,
     existing_list: bool = False,
+    swap_owners: bool = False,
 ) -> dict:
-    """Upload a CSV file to DataSift via the 7-step upload wizard.
+    """Upload a CSV file to DataSift via the 6-step upload wizard.
 
-    Wizard steps:
-    1. Click "Upload File" in sidebar
-    2. Choose "Add data" or "Update data"
-    3. "Let's Stay Organized" questions
-    4. Tags step (CSV has Tags column — skip adding custom tags)
-    5. Browse/upload CSV file
-    6. Map columns (auto-maps recognized headers)
-    7. Review and "Finish Upload"
+    Wizard steps (verified against live DataSift UI 2026-06-11 — note the
+    schema CHANGED from the older 5-step layout, an Enrichment step was
+    inserted between Setup and Tags):
+
+      1. Setup     — pick mode + target list
+      2. Enrichment — Swap Owners toggle (NEW; was post-upload modal only)
+      3. Add tags   — add "Courthouse Data" via the Custom Tags input
+      4. Upload the file — set file input
+      5. Map the columns — drag Tags + Lists targets (still flaky)
+      6. Review     — click Finish Upload
 
     Args:
         page: Logged-in Playwright page.
@@ -114,6 +117,9 @@ async def upload_csv(
         list_name: Target list name. Required when existing_list=True.
         existing_list: If True, select "Adding properties to an existing list"
             instead of creating a new list. The list must already exist in DataSift.
+        swap_owners: When True, toggle the wizard's Swap Owners ON at the
+            new Enrichment step. Set by upload_to_datasift_per_distressor
+            for probate / pre_probate uploads. Default False.
 
     Returns:
         Dict with upload results: {success, records_uploaded, errors, message}
@@ -444,19 +450,74 @@ async def upload_csv(
 
     await _screenshot(page, "step1_form_filled")
 
-    # Click "Next Step" to proceed to step 2
+    # Click "Next Step" to proceed to step 2 (Enrichment)
     await _click_next_step(page, timeout=30000)
 
-    # ── Wizard Step 2: Add tags ──
-    # Dismiss the Beamer/NPS modal that lazy-loads after login. This was the
-    # root cause of CI failures: the modal overlay intercepts pointer events,
-    # making the wizard's tag/file inputs appear "missing" because they're
-    # behind it. Local sessions warm cookies so the modal doesn't fire; CI
-    # gets it every time.
+    # ── Wizard Step 2: Enrichment (NEW step as of 2026-06-11) ──
+    # Headline: "Property Enrichment / Configure data enrichment options".
+    # Body has a "Swap Owners" toggle: "We will compare your existing owners
+    # against our database, if ours is different, it will be swapped."
+    # Set the toggle based on the swap_owners parameter (True for probate /
+    # pre_probate per operator policy) then advance to step 3.
     await _dismiss_popups(page)
-    logger.info("Wizard Step 2: Adding 'Courthouse Data' tag...")
+    logger.info(
+        "Wizard Step 2: Enrichment — setting Swap Owners=%s", swap_owners,
+    )
     await page.wait_for_timeout(1000)
-    await _screenshot(page, "step2_tags")
+    await _screenshot(page, "step2_enrichment")
+
+    try:
+        # Toggle by name. Re-uses the same pattern as the post-upload
+        # Enrich Data modal (react-toggle component, sibling-label
+        # identification).
+        toggle_result = await page.evaluate(
+            f"""(() => {{
+            const TARGET_ON = {str(bool(swap_owners)).lower()};
+            const toggles = document.querySelectorAll('.react-toggle');
+            for (const toggle of toggles) {{
+                const prev = toggle.previousElementSibling;
+                const prevText = prev ? prev.textContent.trim() : '';
+                const next = toggle.nextElementSibling;
+                const nextText = next ? next.textContent.trim() : '';
+                if (
+                    prevText.includes('Swap Owners') ||
+                    nextText.includes('Swap Owners')
+                ) {{
+                    const isChecked = toggle.classList.contains(
+                        'react-toggle--checked',
+                    );
+                    if (TARGET_ON && !isChecked) {{
+                        toggle.click();
+                        return 'turned ON';
+                    }} else if (!TARGET_ON && isChecked) {{
+                        toggle.click();
+                        return 'turned OFF';
+                    }} else {{
+                        return TARGET_ON ? 'already ON' : 'already OFF';
+                    }}
+                }}
+            }}
+            return 'toggle not found';
+        }})()"""
+        )
+        logger.info("Step 2 Swap Owners: %s", toggle_result)
+        await page.wait_for_timeout(800)
+    except Exception as e:
+        logger.warning("Step 2 Swap Owners toggle failed: %s", e)
+
+    await _screenshot(page, "step2_enrichment_configured")
+    # Advance to step 3 (Add tags)
+    await _click_next_step(page)
+
+    # ── Wizard Step 3: Add tags ──
+    # Dismiss the Beamer/NPS modal that lazy-loads after login. This was the
+    # root cause of earlier CI failures: the modal overlay intercepts pointer
+    # events, making the wizard's tag/file inputs appear "missing" because
+    # they're behind it.
+    await _dismiss_popups(page)
+    logger.info("Wizard Step 3: Adding 'Courthouse Data' tag...")
+    await page.wait_for_timeout(1000)
+    await _screenshot(page, "step3_tags")
 
     # Add "Courthouse Data" tag via the Custom Tags input on the right side
     try:
@@ -469,7 +530,7 @@ async def upload_csv(
             await page.wait_for_timeout(300)
             await tag_input.first.type("Courthouse Data", delay=50)
             await page.wait_for_timeout(1500)
-            await _screenshot(page, "step2_tag_typed")
+            await _screenshot(page, "step3_tag_typed")
 
             # Check if "Courthouse Data" appears in autocomplete dropdown — click it
             tag_option = page.locator('text="Courthouse Data"')
@@ -515,7 +576,7 @@ async def upload_csv(
                     await page.wait_for_timeout(1000)
                     logger.info("Added 'Courthouse Data' tag (via Enter fallback)")
 
-            await _screenshot(page, "step2_tag_added")
+            await _screenshot(page, "step3_tag_added")
         else:
             logger.warning("Tag input not found — 'Courthouse Data' tag NOT added")
     except Exception as e:
@@ -523,13 +584,13 @@ async def upload_csv(
 
     await _click_next_step(page)
 
-    # ── Wizard Step 3: Upload the file ──
+    # ── Wizard Step 4: Upload the file ──
     # Re-dismiss popups before the file-input step — the Beamer modal can
     # re-appear between wizard steps as the SPA navigates internally.
     await _dismiss_popups(page)
-    logger.info("Wizard Step 3: Uploading CSV file: %s", csv_path.name)
+    logger.info("Wizard Step 4: Uploading CSV file: %s", csv_path.name)
     await page.wait_for_timeout(3000)
-    await _screenshot(page, "step3_before_upload")
+    await _screenshot(page, "step4_before_upload")
 
     try:
         file_input = page.locator('input[type="file"]')
@@ -546,7 +607,7 @@ async def upload_csv(
             logger.info("CSV file selected: %s", csv_path.name)
             await page.wait_for_timeout(3000)
         else:
-            await _screenshot(page, "step3_no_file_input")
+            await _screenshot(page, "step4_no_file_input")
             result["message"] = "Could not find file input element"
             logger.error(result["message"])
             return result
@@ -555,14 +616,14 @@ async def upload_csv(
         logger.error(result["message"])
         return result
 
-    await _screenshot(page, "step3_file_uploaded")
+    await _screenshot(page, "step4_file_uploaded")
     await _click_next_step(page)
 
-    # ── Wizard Step 4: Map the columns ──
+    # ── Wizard Step 5: Map the columns ──
     await _dismiss_popups(page)
-    logger.info("Wizard Step 4: Column mapping — mapping Tags and Lists...")
+    logger.info("Wizard Step 5: Column mapping — mapping Tags and Lists...")
     await page.wait_for_timeout(3000)
-    await _screenshot(page, "step4_column_mapping")
+    await _screenshot(page, "step5_column_mapping")
 
     # ── Column mapping (rewritten 2026-06-10) ─────────────────────────
     # Operator reported Tags column missing from EVERY CSV uploaded on
@@ -653,23 +714,23 @@ async def upload_csv(
                 logger.warning(
                     "Column %s failed to map after 3 attempts — values "
                     "in this column will NOT reach DataSift records. "
-                    "Check step4_after_mapping.png for wizard state.",
+                    "Check step5_after_mapping.png for wizard state.",
                     col_name,
                 )
         except Exception as e:
             logger.warning("Column %s mapping threw: %s", col_name, e)
 
-    await _screenshot(page, "step4_after_mapping")
+    await _screenshot(page, "step5_after_mapping")
 
     # Click Next Step to proceed past mapping
     await _click_next_step(page)
-    await _screenshot(page, "step4_mapping_done")
+    await _screenshot(page, "step5_mapping_done")
 
-    # ── Wizard Step 5: Review ──
+    # ── Wizard Step 6: Review ──
     await _dismiss_popups(page)
-    logger.info("Wizard Step 5: Review and finish upload...")
+    logger.info("Wizard Step 6: Review and finish upload...")
     await page.wait_for_timeout(2000)
-    await _screenshot(page, "step5_review")
+    await _screenshot(page, "step6_review")
 
     try:
         finish_btn = page.locator(
@@ -681,7 +742,7 @@ async def upload_csv(
             await finish_btn.first.click()
             logger.info("Clicked Finish Upload")
         else:
-            await _screenshot(page, "step5_no_finish_btn")
+            await _screenshot(page, "step6_no_finish_btn")
             logger.warning("Finish Upload button not found")
     except Exception as e:
         logger.warning("Finish step: %s", e)
@@ -704,7 +765,7 @@ async def upload_csv(
             result["records_uploaded"] = parsed
         logger.info("DataSift upload complete: %s", result["message"])
     except PwTimeout:
-        await _screenshot(page, "step5_timeout")
+        await _screenshot(page, "step6_timeout")
         result["message"] = "Upload may have succeeded but confirmation timed out — check Activity page"
         logger.warning(result["message"])
         result["success"] = True
@@ -1594,6 +1655,7 @@ async def upload_to_datasift_per_distressor(
                 csv_path,
                 list_name=list_name,
                 existing_list=True,
+                swap_owners=swap_owners,
             )
             r["notice_type"] = notice_type
             r["list_name"] = list_name
