@@ -510,18 +510,72 @@ async def upload_csv(
     await _click_next_step(page)
 
     # ── Wizard Step 3: Add tags ──
-    # Dismiss the Beamer/NPS modal that lazy-loads after login. This was the
-    # root cause of earlier CI failures: the modal overlay intercepts pointer
-    # events, making the wizard's tag/file inputs appear "missing" because
-    # they're behind it.
+    # Operator review 2026-06-12: the wizard's Add Tags step is being
+    # SKIPPED. Screenshots labeled step3_tags consistently show the
+    # Upload-the-file page (step 4) instead. DataSift's wizard appears
+    # to auto-advance past Add Tags when no interaction happens quickly.
+    # Workaround: explicitly NAVIGATE to "Add tags" via the wizard's
+    # sidebar (clickable step indicator) instead of relying on a single
+    # Next Step click to land us there cleanly.
     await _dismiss_popups(page)
-    logger.info("Wizard Step 3: Adding 'Courthouse Data' tag...")
+    logger.info(
+        "Wizard Step 3: Navigating to Add tags via sidebar (Next Step "
+        "skips past it in the new 6-step wizard)..."
+    )
+
+    # The sidebar's "Add tags" entry is a clickable step indicator. Click
+    # it explicitly. Falls back to a numbered-step click if the text
+    # variant doesn't match (some DataSift builds render just the
+    # number "3" instead of the step name).
+    sidebar_clicked = False
+    for sel in (
+        '[class*="WizardSideBar"] >> text="Add tags"',
+        '[class*="Sidebar"] >> text="Add tags"',
+        'text="Add tags"',
+        'text="Add Tags"',
+    ):
+        try:
+            cand = page.locator(sel)
+            if await cand.count() > 0:
+                await cand.first.click(timeout=3000)
+                await page.wait_for_timeout(1500)
+                sidebar_clicked = True
+                logger.info("Navigated to Add tags via sidebar: %s", sel)
+                break
+        except Exception as e:
+            logger.debug("Sidebar nav %s failed: %s", sel, e)
+
+    if not sidebar_clicked:
+        # If sidebar navigation also fails, we're likely on a step where
+        # the tag input is no longer reachable. Log + proceed; the CSV's
+        # own Tags column (header "Tags", value "Courthouse Data") is the
+        # belt-and-suspenders backup if column auto-mapping picks it up.
+        logger.warning(
+            "Could not navigate to Add tags via sidebar — wizard may have "
+            "advanced past it. Relying on CSV's Tags column to carry "
+            "'Courthouse Data' via Step-5 column auto-mapping."
+        )
+
     await page.wait_for_timeout(1000)
     await _screenshot(page, "step3_tags")
 
-    # Add "Courthouse Data" tag via the Custom Tags input on the right side
+    # Add "Courthouse Data" tag via the Custom Tags input on the right side.
+    # Try multiple placeholder variants because DataSift has rotated the
+    # exact wording across builds. Falls back to "first visible text input
+    # on the page" which is usually the tag autocomplete on the Add tags
+    # step.
     try:
-        tag_input = page.locator('input[placeholder*="Search or add a new tag"]')
+        tag_input = page.locator(
+            'input[placeholder*="Search or add a new tag"], '
+            'input[placeholder*="Search or add"], '
+            'input[placeholder*="add a new tag"], '
+            'input[placeholder*="add tag" i], '
+            'input[placeholder*="tag" i]:visible'
+        )
+        if await tag_input.count() == 0:
+            # Last-resort fallback — any visible text input on the wizard
+            # page. Add Tags has exactly one prominent input; should be it.
+            tag_input = page.locator('input[type="text"]:visible')
         if await tag_input.count() > 0:
             # Click input first, then type to trigger autocomplete dropdown
             await tag_input.first.click()
