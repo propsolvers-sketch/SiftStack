@@ -69,6 +69,16 @@ DEFAULT_WHOLETAIL_CLOSING_PCT  = 0.10   # Sheet: 10% closing (higher — sold as
 DEFAULT_WHOLETAIL_BUYER_PROFIT = 70000  # Sheet: $70K buyer profit baked in
 DEFAULT_WHOLETAIL_WS_FEE       = 15000  # Sheet: $15K WS fee
 
+# ── Novation defaults (2026-06-12) ────────────────────────────────────
+# Novation = control listing without title. Math: Retail ARV − selling % −
+# light rehab − holding − target spread = MAO to seller. Key differences from
+# Wholetail: NO purchase closing costs (we never take title), shorter hold
+# (cosmetic only + listing period), target spread on top instead of buyer-profit.
+DEFAULT_NOVATION_SELLING_PCT      = 0.10   # 8-10% — buyer comm (2.5-3) + listing comm (2.5-3) + title (1.5) + AL transfer 0.10%
+DEFAULT_NOVATION_HOLDING          = 800    # 60 days × ~$400/mo (insurance + utilities + lawn) — no mortgage
+DEFAULT_NOVATION_TARGET_SPREAD    = 0.20   # 20% of retail ARV — higher than wholesale, lower than flip
+DEFAULT_NOVATION_SELLER_BONUS     = 0      # Extra above seller's net to incentivize agreement (deal-by-deal)
+
 # Rental (hold for cashflow):
 #   All-In = ARV × (1 - rental_closing% - rental_holding%) - Repairs
 #   MAO    = All-In - WS_Fee - (ARV × target_equity%)
@@ -227,6 +237,7 @@ class DealPackage:
     # Profit Calculator breakdowns (Google investor sheet format, 2026-05-29)
     profit_breakdown: dict = field(default_factory=dict)      # Flip Profit Calc
     wholetail_breakdown: dict = field(default_factory=dict)   # Wholetail Calculator
+    novation_breakdown: dict = field(default_factory=dict)    # Novation Calculator (2026-06-12)
     rental_breakdown: dict = field(default_factory=dict)      # Rental Calculator
     market_tier: str = "B"                                    # A / B / C per sheet
     # Comp list preserved for the Comp Analysis tab (ChatARV-style derivation)
@@ -368,6 +379,41 @@ def calculate_wholetail_breakdown(arv: float, purchase_price: float, rehab_cost:
         "mao": round(mao),
         "purchase_price": round(purchase_price),
         "your_profit": round(your_profit),
+    }
+
+
+def calculate_novation_breakdown(arv: float, rehab_cost: float,
+                                  selling_pct: float = DEFAULT_NOVATION_SELLING_PCT,
+                                  holding: float = DEFAULT_NOVATION_HOLDING,
+                                  target_spread_pct: float = DEFAULT_NOVATION_TARGET_SPREAD,
+                                  seller_bonus: float = DEFAULT_NOVATION_SELLER_BONUS,
+                                  ) -> dict:
+    """Novation Calculator breakdown (2026-06-12).
+
+    Novation = listed retail under seller's name, deed transfers seller→buyer,
+    we collect the spread. NO purchase closing costs (never take title).
+    Light cosmetic rehab only — sets up for retail listing, not full renovation.
+
+    Formula:
+      MAO to seller = Retail ARV × (1 - selling%) - light rehab - holding
+                      - (Retail ARV × target spread %) - seller bonus
+
+    Note `rehab_cost` should be the LIGHT/WHOLETAIL rehab estimate, not the
+    full-rehab number — novation properties get cosmetic-only refresh.
+    """
+    selling_costs = arv * selling_pct
+    target_spread = arv * target_spread_pct
+    mao = arv - selling_costs - rehab_cost - holding - target_spread - seller_bonus
+    return {
+        "retail_arv": round(arv),
+        "selling_pct": selling_pct,
+        "selling_costs": round(selling_costs),
+        "light_rehab": round(rehab_cost),
+        "holding": round(holding),
+        "target_spread_pct": target_spread_pct,
+        "target_spread": round(target_spread),
+        "seller_bonus": round(seller_bonus),
+        "mao": round(mao),
     }
 
 
@@ -1301,7 +1347,97 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
         for col in ["B", "C", "D", "E"]:
             ws_wt.column_dimensions[col].width = 16
 
-    # ── Tab 3: Rental Calculator (mirrors Profit Calc layout) ─────────
+    # ── Tab 3: Novation Calculator (2026-06-12) ───────────────────────
+    # Novation = control listing without title. We never close on the purchase;
+    # the seller's deed transfers directly to the end buyer. We collect the
+    # spread between retail sale and the seller's contracted price.
+    # KEY MATH DIFFERENCES from Wholetail:
+    #   - NO purchase closing costs (never take title)
+    #   - Selling % is the FULL retail close (buyer comm + listing comm + title + transfer)
+    #   - "Target Spread %" replaces Wholetail's "Buyer Profit $" — it's OUR margin
+    #   - "Seller Bonus" optional — extra above seller's net to incentivize agreement
+    if pkg.novation_breakdown:
+        nb = pkg.novation_breakdown
+        ws_n = wb.create_sheet("Novation Calculator")
+        ws_n.cell(row=1, column=1, value="Novation Calculator (Retail-Listed, No Title)").font = _TITLE_FONT
+        ws_n.cell(row=2, column=1, value=addr).font = _SUBTITLE_FONT
+        ws_n.cell(row=3, column=1, value="Control the listing, deed transfers direct seller→buyer · 🟨 yellow cells are editable inputs").font = _LABEL_FONT
+        r = 5
+        for col, h in enumerate(["", "", "%", "Amount", "Running"], 1):
+            cell = ws_n.cell(row=r, column=col, value=h)
+            if h: cell.font = _HEADER_FONT; cell.fill = _HEADER_FILL; cell.alignment = _HEADER_ALIGN
+
+        # R6 — Retail ARV (INPUT)
+        ws_n.cell(row=6, column=1, value="Retail ARV (MLS-listed price)").font = Font(name="Calibri", bold=True, size=12, color="2F5496")
+        c = ws_n.cell(row=6, column=5, value=nb["retail_arv"]); c.number_format = '"$"#,##0'; c.font = Font(name="Calibri", bold=True, size=12); c.fill = INPUT_FILL; c.border = _THIN_BORDER
+
+        # R7 — Selling % (INPUT %, FORMULA $) — buyer comm + listing comm + title + transfer
+        ws_n.cell(row=7, column=1, value="Selling Costs (buyer comm + listing comm + title + transfer)").font = _LABEL_FONT
+        c = ws_n.cell(row=7, column=3, value=nb["selling_pct"]); c.number_format = "0.00%"; c.fill = INPUT_FILL; c.border = _THIN_BORDER
+        c = ws_n.cell(row=7, column=4, value="=E6*C7"); c.number_format = '"$"#,##0'; c.border = _THIN_BORDER
+
+        # R8 — Light Rehab (INPUT) — red fill to match Profit Calc D8 convention
+        ws_n.cell(row=8, column=1, value="Light Rehab (cosmetic only — Level 1 wholetail-grade)").font = _LABEL_FONT
+        c = ws_n.cell(row=8, column=4, value=nb["light_rehab"]); c.number_format = '"$"#,##0'; c.fill = _RED_FILL; c.border = _THIN_BORDER
+
+        # R9 — Holding (INPUT) — flat $ not % since no mortgage; insurance/utilities/lawn during listing period
+        ws_n.cell(row=9, column=1, value="Holding (utilities, insurance, lawn — ~60d listing period)").font = _LABEL_FONT
+        c = ws_n.cell(row=9, column=4, value=nb["holding"]); c.number_format = '"$"#,##0'; c.fill = INPUT_FILL; c.border = _THIN_BORDER
+
+        # R10 — Target Spread % (INPUT %, FORMULA $) — OUR margin
+        ws_n.cell(row=10, column=1, value="Target Spread % (YOUR profit margin on retail sale)").font = _LABEL_FONT
+        c = ws_n.cell(row=10, column=3, value=nb["target_spread_pct"]); c.number_format = "0.00%"; c.fill = INPUT_FILL; c.border = _THIN_BORDER
+        c = ws_n.cell(row=10, column=4, value="=E6*C10"); c.number_format = '"$"#,##0'; c.border = _THIN_BORDER
+
+        # R11 — Seller Bonus (INPUT, optional)
+        ws_n.cell(row=11, column=1, value="Seller Bonus (extra above seller's net — incentivize agreement)").font = _LABEL_FONT
+        c = ws_n.cell(row=11, column=4, value=nb["seller_bonus"]); c.number_format = '"$"#,##0'; c.fill = INPUT_FILL; c.border = _THIN_BORDER
+
+        # R13 — MAO to Seller (FORMULA, headline result)
+        ws_n.cell(row=13, column=1, value="🎯 MAO to Seller (max contract you can offer)").font = Font(name="Calibri", bold=True, size=13, color="006100")
+        c = ws_n.cell(row=13, column=5, value="=E6-D7-D8-D9-D10-D11")
+        c.number_format = '"$"#,##0'
+        c.font = Font(name="Calibri", bold=True, size=14, color="006100")
+        c.fill = _GREEN_FILL
+        c.border = _THIN_BORDER
+        ws_n.row_dimensions[13].height = 24
+
+        # R15+ — Target Spread Lookup at 15/20/25%
+        ws_n.cell(row=15, column=1, value="── SPREAD LOOKUP (your MAO at different target-spread assumptions) ──").font = Font(name="Calibri", bold=True, size=12, color="2F5496")
+        for offset, (label, spread_pct, fill) in enumerate([
+            ("At 15% target spread (lean — competitive market)", 0.15, _YELLOW_FILL),
+            ("At 20% target spread (default — balanced)", 0.20, _GREEN_FILL),
+            ("At 25% target spread (conservative — risky market)", 0.25, None),
+        ]):
+            row = 16 + offset
+            ws_n.cell(row=row, column=1, value=label).font = _LABEL_FONT
+            # MAO = ARV - selling - rehab - holding - (ARV × spread) - seller_bonus
+            formula = f"=E6-D7-D8-D9-(E6*{spread_pct})-D11"
+            c = ws_n.cell(row=row, column=5, value=formula)
+            c.number_format = '"$"#,##0'
+            c.font = Font(name="Calibri", bold=True, size=12)
+            if fill: c.fill = fill
+            c.border = _THIN_BORDER
+
+        # R20+ — How novation differs from wholetail (operator note)
+        ws_n.cell(row=20, column=1, value="── HOW NOVATION DIFFERS FROM WHOLETAIL ──").font = Font(name="Calibri", bold=True, size=12, color="2F5496")
+        notes = [
+            "• You NEVER take title — no purchase closing costs (would be ~2-3% in Wholetail)",
+            "• Seller signs a novation agreement allowing YOU to list under their name",
+            "• Deed transfers directly seller → end buyer at retail closing",
+            "• Light cosmetic rehab only — paint, flooring, curb appeal, staging (not full renovation)",
+            "• Your profit = retail sale price − seller's contracted price − everything in this calc",
+            "• REQUIRES: attorney-reviewed novation contract + seller cooperation throughout listing",
+            "• HIGHER RISK than wholesale (longer time to close), LOWER RISK than flip (no title)",
+        ]
+        for i, n in enumerate(notes):
+            ws_n.cell(row=21 + i, column=1, value=n).font = _LABEL_FONT
+
+        ws_n.column_dimensions["A"].width = 60
+        for col in ["B", "C", "D", "E"]:
+            ws_n.column_dimensions[col].width = 16
+
+    # ── Tab 4: Rental Calculator (mirrors Profit Calc layout) ─────────
     if pkg.rental_breakdown:
         rb = pkg.rental_breakdown
         ws_r = wb.create_sheet("Rental Calculator")
@@ -2195,6 +2331,10 @@ def run_deal_analysis(address: str, city: str = "", state: str = "TN",
         arv.arv_mid, purchase_price, base_rehab_full)
     wholetail_breakdown = calculate_wholetail_breakdown(
         arv.arv_mid, purchase_price, base_rehab_wholetail)
+    # Novation uses the LIGHT (wholetail-grade) rehab — cosmetic only,
+    # listing-ready, not full renovation.
+    novation_breakdown = calculate_novation_breakdown(
+        arv.arv_mid, base_rehab_wholetail)
     rental_breakdown = calculate_rental_breakdown(
         arv.arv_mid, purchase_price, base_rehab_full,
         monthly_rent=hold.estimated_rent_monthly, market_tier=market_tier)
@@ -2220,6 +2360,7 @@ def run_deal_analysis(address: str, city: str = "", state: str = "TN",
         risk_factors=risk_factors,
         profit_breakdown=profit_breakdown,
         wholetail_breakdown=wholetail_breakdown,
+        novation_breakdown=novation_breakdown,
         rental_breakdown=rental_breakdown,
         market_tier=market_tier,
         comps=comps,
