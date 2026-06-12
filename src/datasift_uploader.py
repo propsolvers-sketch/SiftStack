@@ -545,6 +545,55 @@ async def upload_csv(
         except Exception as e:
             logger.debug("Sidebar nav %s failed: %s", sel, e)
 
+    # JS fallback (2026-06-12) — if Playwright's text= selectors miss the
+    # sidebar item, walk every visible element and click the one whose
+    # text equals "Add tags". Climbs to a clickable ancestor (button /
+    # role=button / element with cursor:pointer) so we don't click an
+    # inert span. Necessary because DataSift's styled-component class
+    # names rotate across builds and our selector list can fall out of
+    # date silently.
+    if not sidebar_clicked:
+        try:
+            js_clicked = await page.evaluate("""() => {
+                const wantedTexts = ['Add tags', 'Add Tags'];
+                const elements = document.querySelectorAll('*');
+                for (const el of elements) {
+                    if (!el.offsetParent) continue;  // not visible
+                    const txt = (el.textContent || '').trim();
+                    if (!wantedTexts.includes(txt)) continue;
+                    // Skip the wizard header — only the sidebar item is
+                    // a navigation target. Sidebar items are at x < 300
+                    // (left edge of the modal).
+                    const rect = el.getBoundingClientRect();
+                    if (rect.x > 300) continue;
+                    // Walk to a clickable ancestor (max 5 levels up).
+                    let target = el;
+                    for (let i = 0; i < 5 && target; i++) {
+                        const isClickable = (
+                            target.tagName === 'BUTTON'
+                            || target.tagName === 'A'
+                            || target.getAttribute('role') === 'button'
+                            || getComputedStyle(target).cursor === 'pointer'
+                        );
+                        if (isClickable) {
+                            target.click();
+                            return true;
+                        }
+                        target = target.parentElement;
+                    }
+                    // No clickable ancestor — try clicking the text node itself
+                    el.click();
+                    return true;
+                }
+                return false;
+            }""")
+            if js_clicked:
+                await page.wait_for_timeout(1500)
+                sidebar_clicked = True
+                logger.info("Navigated to Add tags via JS sidebar walk")
+        except Exception as e:
+            logger.debug("JS sidebar walk failed: %s", e)
+
     if not sidebar_clicked:
         # If sidebar navigation also fails, we're likely on a step where
         # the tag input is no longer reachable. Log + proceed; the CSV's
