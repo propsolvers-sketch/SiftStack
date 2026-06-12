@@ -37,15 +37,21 @@ DATASIFT_COLUMNS = [
     "Mailing State",
     "Mailing ZIP Code",
     # ── Phone/Email (Tracerfy skip trace, mapped to DataSift built-in) ──
-    "Phone 1",
-    "Phone 2",
-    "Phone 3",
-    "Phone 4",
-    "Phone 5",
-    "Phone 6",
-    "Phone 7",
-    "Phone 8",
-    "Phone 9",
+    # Per-phone 4-column block (Phone / Type / Status / Tags) matches the
+    # DataSift upload template layout exactly so column auto-mapping works
+    # without the Step-5 drag dance. Phone Tags N carries the Trestle tier
+    # (Dial First / Dial Second / etc.) for the SPECIFIC phone in that slot
+    # so the cold-caller can see dial order in DataSift directly without
+    # cross-referencing Notes.
+    "Phone 1", "Phone Type 1", "Phone Status 1", "Phone Tags 1",
+    "Phone 2", "Phone Type 2", "Phone Status 2", "Phone Tags 2",
+    "Phone 3", "Phone Type 3", "Phone Status 3", "Phone Tags 3",
+    "Phone 4", "Phone Type 4", "Phone Status 4", "Phone Tags 4",
+    "Phone 5", "Phone Type 5", "Phone Status 5", "Phone Tags 5",
+    "Phone 6", "Phone Type 6", "Phone Status 6", "Phone Tags 6",
+    "Phone 7", "Phone Type 7", "Phone Status 7", "Phone Tags 7",
+    "Phone 8", "Phone Type 8", "Phone Status 8", "Phone Tags 8",
+    "Phone 9", "Phone Type 9", "Phone Status 9", "Phone Tags 9",
     "Email 1",
     "Email 2",
     "Email 3",
@@ -1226,6 +1232,62 @@ def _build_row(
     list_name = NOTICE_TYPE_TO_LIST.get(notice.notice_type, "")
     notes = notes_override if notes_override is not None else _build_notes(notice)
 
+    # Per-phone column block (Phone N + Phone Type N + Phone Status N +
+    # Phone Tags N) — operator request 2026-06-12 after reviewing the
+    # DataSift upload template. The Trestle tier for EACH phone now lands
+    # in its own Phone Tags N column rather than a single record-level tag
+    # in the Tags column, so the cold-caller sees dial order directly in
+    # the DataSift record's phone block.
+    phone_cols: dict[str, str] = {}
+    if phone_tiers is None:
+        phone_tiers = {}
+    try:
+        from phone_validator import clean_phone
+    except Exception:
+        clean_phone = lambda s: ""  # noqa: E731 — defensive degrade
+    for attr, label in _PHONE_FIELD_LABELS:
+        # label is "Phone N"; the Type/Status/Tags columns are named
+        # "Phone Type N", "Phone Status N", "Phone Tags N" (number AFTER
+        # the field name). Extract the number to build the correct keys.
+        phone_n = label.split(" ", 1)[1]
+        type_col = f"Phone Type {phone_n}"
+        status_col = f"Phone Status {phone_n}"
+        tags_col = f"Phone Tags {phone_n}"
+
+        raw = (getattr(notice, attr, "") or "").strip()
+        phone_cols[label] = raw
+        if not raw:
+            phone_cols[type_col] = ""
+            phone_cols[status_col] = ""
+            phone_cols[tags_col] = ""
+            continue
+        cleaned = clean_phone(raw)
+        info = phone_tiers.get(cleaned) if cleaned else None
+        if info:
+            line_type = (info.get("line_type") or "").strip()
+            is_valid = info.get("is_valid")
+            tier = (info.get("tier") or "").strip()
+            phone_cols[type_col] = line_type
+            if is_valid is True:
+                phone_cols[status_col] = "Valid"
+            elif is_valid is False:
+                phone_cols[status_col] = "Invalid"
+            else:
+                phone_cols[status_col] = ""
+            # Phone Tags N — primarily the tier (Dial First / etc.). If
+            # litigator-risk fires on this specific phone, append it as
+            # a second comma-separated tag.
+            tag_parts: list[str] = []
+            if tier and tier != "Unknown":
+                tag_parts.append(tier)
+            if info.get("is_litigator_risk"):
+                tag_parts.append("litigator_risk")
+            phone_cols[tags_col] = ", ".join(tag_parts)
+        else:
+            phone_cols[type_col] = ""
+            phone_cols[status_col] = ""
+            phone_cols[tags_col] = ""
+
     # Per-phone Trestle tier breakdown (operator request 2026-06-12). The
     # record-level "best tier" tag in the TAGS section answers "is this
     # record worth dialing" but not "WHICH Phone N to dial first". This
@@ -1279,16 +1341,10 @@ def _build_row(
         "Mailing City": contact["city"],
         "Mailing State": contact["state"],
         "Mailing ZIP Code": contact["zip"],
-        # ── Phone/Email (Tracerfy → DataSift generic Phone N format) ──
-        "Phone 1": notice.primary_phone,
-        "Phone 2": notice.mobile_1,
-        "Phone 3": notice.mobile_2,
-        "Phone 4": notice.mobile_3,
-        "Phone 5": notice.mobile_4,
-        "Phone 6": notice.mobile_5,
-        "Phone 7": notice.landline_1,
-        "Phone 8": notice.landline_2,
-        "Phone 9": notice.landline_3,
+        # ── Phone/Email — Phone N populated via phone_cols dict above,
+        # which also fills Phone Type N / Phone Status N / Phone Tags N
+        # from the per-phone Trestle data. Merged into the row dict via
+        # **phone_cols at return time below.
         "Email 1": notice.email_1,
         "Email 2": notice.email_2,
         "Email 3": notice.email_3,
@@ -1355,6 +1411,9 @@ def _build_row(
         "Hearing Date": _format_date(notice.hearing_date),
         "Creditor Claim Deadline": _format_date(notice.creditor_deadline),
         "Total Estate Value": notice.total_estate_value,
+        # Merge in Phone N / Phone Type N / Phone Status N / Phone Tags N
+        # from the phone_cols dict built above.
+        **phone_cols,
     }
 
 
