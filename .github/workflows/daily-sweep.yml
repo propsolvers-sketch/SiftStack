@@ -74,6 +74,18 @@ jobs:
       DATASIFT_PASSWORD: ${{ secrets.DATASIFT_PASSWORD }}
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
+      # ── Dropbox archive sync (added 2026-06-12) ─
+      # Used by scripts/daily_finalize.py → dropbox_archive_uploader to
+      # ship each run's archive + per-distressor CSVs into the operator's
+      # Dropbox/SiftStack/Archives/ folder for local-Mac access via the
+      # Dropbox desktop client. Re-uses the existing Dropbox OAuth2 app
+      # credentials already configured for src/dropbox_watcher.py. If any
+      # are missing/expired, the upload step soft-fails (logs a warning
+      # but the workflow still succeeds based on DataSift upload outcomes).
+      DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+      DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+      DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+
       # ── LLM backend ─────────────────────────────
       LLM_BACKEND: anthropic
 

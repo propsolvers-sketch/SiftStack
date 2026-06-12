@@ -499,6 +499,7 @@ def _build_slack_message(
     pre_f: PreProbateFunnel,
     results: list[dict],
     csv_count: int,
+    dropbox_results: list[dict] | None = None,
 ) -> str:
     today = datetime.now().strftime("%Y-%m-%d")
     out = str(OUT)
@@ -564,6 +565,27 @@ def _build_slack_message(
         # these files, so showing the on-disk path is correct here.
         lines.append(f"_Output dir: {out}_")
 
+    # Dropbox archive sync status (2026-06-12). One line so the operator
+    # knows whether today's archive is already on their Mac via Dropbox.
+    if dropbox_results:
+        ok = sum(1 for r in dropbox_results if r["success"])
+        total = len(dropbox_results)
+        if ok == total:
+            lines.append(
+                f"_:open_file_folder: Dropbox: {ok}/{total} archives synced "
+                f"to SiftStack/Archives/_"
+            )
+        elif ok > 0:
+            lines.append(
+                f"_:warning: Dropbox: {ok}/{total} archives synced "
+                f"({total - ok} failed — see logs)_"
+            )
+        else:
+            lines.append(
+                f"_:warning: Dropbox sync failed for all {total} files "
+                f"— check DROPBOX_* env vars_"
+            )
+
     return "\n".join(lines)
 
 
@@ -599,8 +621,43 @@ async def main() -> int:
             continue
         results.append(await _upload_one(p, label))
 
+    # ── Dropbox archive sync ────────────────────────────────────────
+    # Operator request 2026-06-12: upload the archive + per-distressor
+    # files to Dropbox/SiftStack/Archives/ so they sync to the operator's
+    # Mac automatically. Replaces the manual "download artifact ZIP"
+    # workflow for daily auditing. Non-fatal if Dropbox is unreachable —
+    # the run still succeeds based on DataSift upload outcomes.
+    dropbox_results: list[dict] = []
+    try:
+        from dropbox_archive_uploader import upload_files as _dbx_upload
+        # Upload BOTH the archive file (audit) AND every per-distressor
+        # upload CSV (in case the operator wants to re-upload one by
+        # hand later). All fresh files from this run, sourced from the
+        # same output/leads/ directory.
+        leads_dir = OUT / "leads"
+        if leads_dir.exists():
+            start_ts = RUN_MARKER.stat().st_mtime if RUN_MARKER.exists() else 0
+            to_sync = sorted(
+                p for p in leads_dir.glob("datasift_*.csv")
+                if p.stat().st_mtime > start_ts
+            )
+            if to_sync:
+                print(
+                    f"\n=== Dropbox archive sync ({len(to_sync)} files) ===",
+                    flush=True,
+                )
+                dropbox_results = _dbx_upload(to_sync)
+                ok = sum(1 for r in dropbox_results if r["success"])
+                print(
+                    f"Dropbox: {ok}/{len(dropbox_results)} files synced",
+                    flush=True,
+                )
+    except Exception as e:
+        print(f"Dropbox archive sync skipped: {e}", flush=True)
+
     msg = _build_slack_message(
         main_funnel, apn_funnel, pre_funnel, results, len(csvs),
+        dropbox_results=dropbox_results,
     )
     print("\n--- SLACK ---", flush=True)
     print(msg, flush=True)
