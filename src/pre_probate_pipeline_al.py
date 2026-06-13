@@ -1355,7 +1355,17 @@ def _cli() -> int:
             rate_tracker=rate_tracker,
         )
         if notices:
-            csv_path = datasift_formatter.write_datasift_csv(notices)
+            # Trestle phone scoring before CSV write — operator review
+            # 2026-06-13 found pre-probate records arriving in DataSift
+            # with empty Phone Tags N columns because this pipeline
+            # never ran Trestle (only main.py daily via full_pipeline.py
+            # did). Shared helper returns {} if TRESTLE_API_KEY isn't
+            # set OR no record has phones, so the call is safe either way.
+            from phone_validator import score_phones_for_pipeline
+            phone_tiers = score_phones_for_pipeline(notices)
+            csv_path = datasift_formatter.write_datasift_csv(
+                notices, phone_tiers=phone_tiers,
+            )
             # Funnel: datasift_uploaded gate — D-01 final stage.
             funnel.set("datasift_uploaded", len(notices))
             print(f"\n✓ DataSift CSV written: {csv_path}")

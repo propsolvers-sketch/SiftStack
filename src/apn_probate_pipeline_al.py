@@ -677,7 +677,14 @@ def _cli() -> int:
             rate_tracker=rate_tracker,
         )
         if notices:
-            csv_path = datasift_formatter.write_datasift_csv(notices)
+            # Trestle phone scoring — same gap fix as pre_probate (2026-06-13).
+            # apn_probate runs Tracerfy too but had no scoring step, so
+            # Phone Tags N columns were empty on uploaded records.
+            from phone_validator import score_phones_for_pipeline
+            phone_tiers = score_phones_for_pipeline(notices)
+            csv_path = datasift_formatter.write_datasift_csv(
+                notices, phone_tiers=phone_tiers,
+            )
             # Funnel: datasift_uploaded gate — D-01 final stage.
             funnel.set("datasift_uploaded", len(notices))
             print(f"\n✓ DataSift CSV written: {csv_path}")

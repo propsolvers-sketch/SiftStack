@@ -355,6 +355,63 @@ DM_PHONE_FIELDS = [
 ]
 
 
+def score_phones_for_pipeline(notices: list) -> dict[str, dict]:
+    """Trestle-score every notice that has phones populated, then return the
+    phone_tiers dict ready to pass to write_datasift_csv / write_datasift_
+    split_csvs.
+
+    Shared helper extracted 2026-06-13 — operator reported pre-probate
+    records were missing phone tier tags. Root cause: full_pipeline.py
+    (used by main.py daily) ran score_record_phones at Step 3, but
+    pre_probate_pipeline_al.py + apn_probate_pipeline_al.py + code_
+    violation_pipeline.py never called it. Pre-probate phones populated
+    via Tracerfy then went out to DataSift without tiers.
+
+    Returns {} when TRESTLE_API_KEY is unset or no notice has phones —
+    callers can safely pass the result through to write_datasift_*
+    regardless.
+
+    Litigator-check intentionally OFF here (operator request 2026-06-12).
+    """
+    import config as cfg
+
+    api_key = getattr(cfg, "TRESTLE_API_KEY", "")
+    if not api_key:
+        logger.info(
+            "Trestle API key not set — pipeline phones will go to DataSift "
+            "unscored. Set TRESTLE_API_KEY to enable per-phone tier tags."
+        )
+        return {}
+
+    phone_attrs = (
+        "primary_phone", "mobile_1", "mobile_2", "mobile_3", "mobile_4",
+        "mobile_5", "landline_1", "landline_2", "landline_3",
+    )
+    phone_candidates = [
+        n for n in notices
+        if any((getattr(n, attr, "") or "").strip() for attr in phone_attrs)
+    ]
+    if not phone_candidates:
+        return {}
+
+    try:
+        tiers = score_record_phones(
+            phone_candidates, api_key, add_litigator=False,
+        )
+        logger.info(
+            "Trestle scored %d unique phones across %d records "
+            "(litigator-check OFF)",
+            len(tiers), len(phone_candidates),
+        )
+        return tiers
+    except Exception as e:
+        logger.warning(
+            "Per-record Trestle scoring failed (%s) — DataSift CSV will "
+            "ship with empty Phone Tags columns", e,
+        )
+        return {}
+
+
 def _collect_phones_from_notice(notice) -> list[str]:
     """Return all cleaned phones on a notice — DM #1 flat fields + heir_map_json."""
     out: list[str] = []
