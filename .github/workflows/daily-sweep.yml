@@ -270,10 +270,11 @@ jobs:
           git add -f \
             seen_ids.json \
             last_run.json \
+            seen_code_violations.json \
             output/observability/service_rates.json \
             2>/dev/null || true
           if ! git diff --cached --quiet; then
-            git commit -m "chore(bot): update seen_ids + last_run + rolling rates after daily sweep"
+            git commit -m "chore(bot): update seen_ids + last_run + rolling rates + code-violation dedup after daily sweep"
             # Rebase-pull in case another commit landed during the run
             git pull --rebase origin main || true
             git push origin HEAD:main

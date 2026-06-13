@@ -66,11 +66,13 @@ CLI
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
+import config
 from notice_parser import NoticeData
 from observability import (
     FunnelCounter,
@@ -372,7 +374,111 @@ def fetch_code_violations(
         )
         notices = deduped
 
+    # ── Cross-run dedup via seen_code_violations.json ────────────────
+    # Operator review 2026-06-13: same ~218 records re-uploaded every day.
+    # Huntsville Unsafe Buildings PDF + Birmingham Accela publish
+    # persistent rosters that stay populated for years; without state
+    # tracking we burn ~$0.36/day of Tracerfy budget re-skip-tracing
+    # already-known cases AND clutter the operator's DataSift queue with
+    # daily duplicates. Track case_number → last_seen_date in
+    # seen_code_violations.json. Cases whose last_seen is within
+    # SEEN_CODE_VIOLATIONS_PRUNE_DAYS (default 180) are filtered out
+    # BEFORE enrichment. Returning to a case after 180 days re-uploads
+    # it (rare reactivation case).
+    notices = _filter_seen_code_violations(notices)
+
     return notices, funnel, rate_tracker
+
+
+def _load_seen_code_violations() -> dict[str, str]:
+    """Load case_number → last_seen YYYY-MM-DD mapping from state file.
+    Returns empty dict if file missing/corrupt — caller treats every
+    case as new on first run, which is the desired behavior."""
+    path = config.SEEN_CODE_VIOLATIONS_FILE
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(
+            "seen_code_violations.json unreadable (%s) — treating all "
+            "cases as new for this run", e,
+        )
+    return {}
+
+
+def _save_seen_code_violations(data: dict[str, str]) -> None:
+    """Persist case_number → last_seen mapping, pruning entries older
+    than SEEN_CODE_VIOLATIONS_PRUNE_DAYS so the file stays bounded."""
+    from datetime import datetime as _dt, timedelta as _td
+    cutoff = (_dt.utcnow() - _td(days=config.SEEN_CODE_VIOLATIONS_PRUNE_DAYS)).date().isoformat()
+    pruned = {k: v for k, v in data.items() if v >= cutoff}
+    dropped = len(data) - len(pruned)
+    try:
+        with open(config.SEEN_CODE_VIOLATIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(pruned, f, indent=2, sort_keys=True)
+        if dropped:
+            logger.info(
+                "seen_code_violations.json: pruned %d entries older than %d days",
+                dropped, config.SEEN_CODE_VIOLATIONS_PRUNE_DAYS,
+            )
+    except OSError as e:
+        logger.warning("Could not save seen_code_violations.json: %s", e)
+
+
+def _filter_seen_code_violations(
+    notices: list[NoticeData],
+) -> list[NoticeData]:
+    """Drop notices whose case_number was already uploaded within the
+    last SEEN_CODE_VIOLATIONS_PRUNE_DAYS window. Update state for both
+    surviving cases AND skipped-but-still-active cases (so the prune
+    window resets while the case stays on the source feed)."""
+    from datetime import datetime as _dt
+    today_iso = _dt.utcnow().date().isoformat()
+
+    seen_state = _load_seen_code_violations()
+    cutoff_dt = _dt.utcnow().date() - timedelta(days=config.SEEN_CODE_VIOLATIONS_PRUNE_DAYS)
+
+    fresh: list[NoticeData] = []
+    skipped = 0
+    no_case = 0
+    for n in notices:
+        case = (n.case_number or "").strip()
+        if not case:
+            # No case number — can't dedup; let it through.
+            no_case += 1
+            fresh.append(n)
+            continue
+
+        last_seen = seen_state.get(case, "")
+        try:
+            last_seen_dt = _dt.fromisoformat(last_seen).date() if last_seen else None
+        except ValueError:
+            last_seen_dt = None
+
+        if last_seen_dt and last_seen_dt > cutoff_dt:
+            # Seen within prune window → skip, but refresh the timestamp
+            # so the case keeps getting deduped while it stays active.
+            seen_state[case] = today_iso
+            skipped += 1
+            continue
+
+        # First time we've seen it (or it's been > prune_days since)
+        seen_state[case] = today_iso
+        fresh.append(n)
+
+    if skipped or no_case:
+        logger.info(
+            "Cross-run dedup: %d → %d (skipped %d already-seen, "
+            "%d had no case# and passed through)",
+            len(notices), len(fresh), skipped, no_case,
+        )
+
+    _save_seen_code_violations(seen_state)
+    return fresh
 
 
 # ── Phase 2: Slack notification ──────────────────────────────────────

@@ -26,6 +26,15 @@ LOG_DIR = PROJECT_ROOT / "logs"
 STATE_FILE = PROJECT_ROOT / "last_run.json"
 SEEN_IDS_FILE = PROJECT_ROOT / "seen_ids.json"
 SEEN_IDS_PRUNE_DAYS = 90
+# Code-violation cases (Huntsville Unsafe Buildings PDF, Birmingham Accela,
+# Hoover SeeClickFix) re-publish persistent rosters that stay populated
+# for years. Without cross-run dedup we re-upload the same ~220 records
+# every day. State file maps case_number → last-seen YYYY-MM-DD; pipeline
+# skips any case whose last_seen is within SEEN_CODE_VIOLATIONS_PRUNE_DAYS.
+# Default 180 days is conservative — even if a case "reactivates" (rare),
+# we re-upload it after 6 months.
+SEEN_CODE_VIOLATIONS_FILE = PROJECT_ROOT / "seen_code_violations.json"
+SEEN_CODE_VIOLATIONS_PRUNE_DAYS = 180
 # Notices that exhausted all CAPTCHA retries during scraping.
 # Persisted so the next run's summary can surface them instead of
 # silently dropping — and a future retry pass can prioritize them.
