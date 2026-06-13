@@ -114,6 +114,11 @@ _PARTNER_DOMAIN_PRIORITY = [
     "arringtonfuneralhome.com",
     "valhallafuneralhome.com",
     "obituaries.valhallafuneralhome.com",
+    # AL funeral homes added 2026-06-13 — operator reported records
+    # sourced from these sites had missing survivor data. Also added to
+    # KNOWN_403_DOMAINS in obituary_enricher.py so they route via
+    # Firecrawl (Etowah returns HTTP 403 to direct fetches).
+    "etowahmemorialchapel.com",
 ]
 
 # Patterns to SKIP (CDN, social, analytics, ads).

@@ -97,6 +97,11 @@ KNOWN_403_DOMAINS = {
     "tributearchive.com",
     "echovita.com",
     "funeralhomes.com",
+    # AL funeral homes added 2026-06-13 after operator reported obit
+    # extraction missing next-of-kin on records sourced from these sites.
+    # All verified to return HTTP 403 to direct requests.get() but return
+    # full obit content via Firecrawl.
+    "etowahmemorialchapel.com",
 }
 
 # Known obituary domains — filter search results to these
@@ -577,7 +582,120 @@ def _extract_structured_text(html: str, url: str) -> str:
     except Exception:
         pass
 
+    # Method 3: SURVIVOR-MARKER EXTRACTION (2026-06-13 fix for legacy.com)
+    # Legacy.com's current /person/ pages bury the actual obit text inside
+    # Next.js __NEXT_DATA__ as escaped JSON strings rather than exposing it
+    # via JSON-LD's articleBody. The JSON-LD they DO ship is a CreativeWork
+    # wrapper with a generic "Online Memorial for X" description — useless
+    # for survivor extraction. But the real obit content ("survived by his
+    # companion, Carol Morrow; daughters, ...") IS present in the raw HTML
+    # as an escaped JSON string. Operator reported 3 specific URLs missing
+    # survivor data (Alan-Richard-Wood, David-Bruce-Miller, etowahmemorial-
+    # chapel Ruby-Johnson) on the 2026-06-13 daily run; this pass recovers
+    # them by scanning for obit-body marker phrases anywhere in the HTML
+    # and pulling a window around each hit.
+    survivor_text = _extract_survivor_windows(html)
+    if survivor_text and len(survivor_text) >= 200:
+        logger.debug(
+            "Survivor-marker extraction recovered %d chars from %s",
+            len(survivor_text), url,
+        )
+        return survivor_text
+
     return ""
+
+
+# Obit-body marker phrases — tiered to avoid React/nav false positives.
+#
+# STRONG markers basically only appear in real obit prose. Required:
+# the extractor refuses to return anything if no STRONG marker hit. This
+# prevents the "Plan a Memorial Service" button label (in legacy.com's
+# nav chrome) from triggering a 6KB window capture of CSS/JSX strings.
+#
+# SUPPORTING markers expand the window once a strong marker has fired —
+# captures more context around a confirmed obit body.
+_SURVIVOR_MARKERS_STRONG = (
+    "survived by", "leaves behind", "is left to cherish",
+    "preceded in death", "predeceased",
+    "is the son of", "is the daughter of",
+)
+_SURVIVOR_MARKERS_SUPPORTING = (
+    "passed away", "passed peacefully", "passed quietly",
+    "born on", "born in",
+    "celebration of life", "memorial service", "funeral service",
+    "in lieu of flowers",
+)
+_SURVIVOR_MARKERS = _SURVIVOR_MARKERS_STRONG + _SURVIVOR_MARKERS_SUPPORTING
+
+
+def _extract_survivor_windows(html: str) -> str:
+    """Scan raw HTML for obit-body marker phrases and pull a window of
+    text around each hit. Tolerant of Next.js / React state escaping
+    (\\n, \\", \\u003c, \\/) so escaped-JSON-string obit bodies become
+    LLM-readable.
+
+    Two-pass filter so React component / nav-chrome false positives don't
+    poison the output:
+      1. First scan for STRONG markers only ("survived by", "preceded
+         in death", "is the son of", etc.) — text proven to appear only
+         in real obit prose. Return empty if NO strong marker hit.
+      2. If at least one strong marker fired, also fold in SUPPORTING
+         marker windows ("memorial service", "celebration of life", etc.)
+         which expand the captured context.
+
+    Output is deduplicated by leading chars (overlapping windows often
+    share a leading sentence boundary) and capped at 8000 chars total.
+    """
+    if not html:
+        return ""
+
+    def _capture_for(marker: str) -> list[str]:
+        out: list[str] = []
+        for m in re.finditer(re.escape(marker), html, re.IGNORECASE):
+            start = max(0, m.start() - 200)
+            end = min(len(html), m.start() + 1500)
+            chunk = html[start:end]
+            # Unescape common JSON/Next.js encodings
+            chunk = chunk.replace("\\n", "\n").replace('\\"', '"')
+            chunk = chunk.replace("\\'", "'").replace("\\/", "/")
+            chunk = chunk.replace("\\u003c", "<").replace("\\u003e", ">")
+            chunk = chunk.replace("\\u0026", "&")
+            # Strip HTML tags and JSON syntax noise
+            chunk = re.sub(r"<[^>]+>", " ", chunk)
+            chunk = re.sub(r'[\{\}\[\]]', " ", chunk)
+            chunk = re.sub(r'"\s*:\s*"', ": ", chunk)
+            chunk = re.sub(r'",\s*"', ", ", chunk)
+            chunk = re.sub(r"\s+", " ", chunk).strip()
+            if len(chunk) >= 100:
+                out.append(chunk[:1500])
+        return out
+
+    # Pass 1 — strong markers (gating)
+    strong_chunks: list[str] = []
+    for marker in _SURVIVOR_MARKERS_STRONG:
+        strong_chunks.extend(_capture_for(marker))
+
+    if not strong_chunks:
+        # No strong markers → bail rather than return React/nav noise
+        return ""
+
+    chunks = list(strong_chunks)
+
+    # Pass 2 — supporting markers (additive context)
+    for marker in _SURVIVOR_MARKERS_SUPPORTING:
+        chunks.extend(_capture_for(marker))
+
+    # Dedupe by leading 80 chars
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in chunks:
+        prefix = c[:80]
+        if prefix in seen:
+            continue
+        seen.add(prefix)
+        out.append(c)
+
+    return "\n\n---\n\n".join(out)[:8000]
 
 
 def _fetch_cached_text(url: str) -> str:
