@@ -175,7 +175,7 @@ def _lookup_missing_heir_addresses(
         if addr and addr.get("street"):
             heir["street"] = addr.get("street", "")
             heir["city"] = addr.get("city", "") or city_hint
-            heir["state"] = addr.get("state", "") or notice.state or "TN"
+            heir["state"] = addr.get("state", "") or notice.state or "AL"
             heir["zip"] = addr.get("zip", "")
             heir["address_source"] = addr.get("source", "")
             filled += 1

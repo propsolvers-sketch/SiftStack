@@ -1261,11 +1261,18 @@ def _lookup_dm_address_serper_firecrawl(
 
 
 def _lookup_dm_address_tracerfy(name: str, city: str,
-                                 address: str = "", zip_code: str = "") -> dict | None:
+                                 address: str = "", zip_code: str = "",
+                                 state: str = "AL") -> dict | None:
     """Look up DM mailing address via Tracerfy Instant Trace API.
 
     Uses POST /v1/api/trace/lookup/ (synchronous, single-record).
     Cost: 5 credits ($0.10) per hit, 0 on miss. Rate limit: 500 RPM.
+
+    state defaults to "AL" since every active SiftStack pipeline is
+    Alabama (Jefferson/Madison/Marshall). Callers handling a different
+    state should pass it explicitly. Operator review 2026-06-13 flagged
+    11/21 probate records where TN was being hardcoded here — Tracerfy
+    couldn't find AL executors when searching "Jane Smith, Knoxville, TN".
     """
     import config as cfg
 
@@ -1289,7 +1296,7 @@ def _lookup_dm_address_tracerfy(name: str, city: str,
             json={
                 "address": address or "",
                 "city": city or "",
-                "state": "TN",
+                "state": (state or "AL").upper(),
                 "zip": zip_code or "",
                 "find_owner": False,
                 "first_name": first_name,
@@ -1320,7 +1327,7 @@ def _lookup_dm_address_tracerfy(name: str, city: str,
             return {
                 "street": street,
                 "city": (mail.get("city") or "").strip(),
-                "state": (mail.get("state") or "TN").strip(),
+                "state": (mail.get("state") or state or "AL").strip(),
                 "zip": (mail.get("zip") or "").strip(),
             }
         return None
@@ -1359,7 +1366,7 @@ def _batch_tracerfy_lookup(notices: list) -> None:
         addr = n.address.strip()
         city_hint = n.city.strip() or _default_city_for_county(n.county)
         zip_code = n.zip.strip()
-        state_code = (n.state or "TN").strip().upper() or "TN"
+        state_code = (n.state or "AL").strip().upper() or "AL"
         writer.writerow([first_name, last_name, addr, city_hint, state_code,
                          zip_code, "", "", ""])
         lookup_map.append((n, first_name, last_name))
@@ -1442,7 +1449,7 @@ def _batch_tracerfy_lookup(notices: list) -> None:
                             and not notice.decision_maker_street):
                         notice.decision_maker_street = street
                         notice.decision_maker_city = (rec.get("mail_city") or "").strip()
-                        notice.decision_maker_state = (rec.get("mail_state") or notice.state or "TN").strip()
+                        notice.decision_maker_state = (rec.get("mail_state") or notice.state or "AL").strip()
                         notice.decision_maker_zip = (rec.get("mail_zip") or "").strip()
                         matched += 1
                         logger.info(
@@ -1482,7 +1489,8 @@ def _lookup_dm_address(
         import config as cfg
         if cfg.TRACERFY_API_KEY:
             tf_result = _lookup_dm_address_tracerfy(
-                name, city or "Knoxville", address="", zip_code=""
+                name, city or "", address="", zip_code="",
+                state=state_code or "AL",
             )
             if tf_result and tf_result.get("street"):
                 result.update(tf_result)
@@ -2420,7 +2428,7 @@ def enrich_obituary_data(
 
         city = notice.city.strip() or _default_city_for_county(notice.county)
         state_full = _state_full_name(notice.state)
-        state_code = (notice.state or "TN").strip().upper() or "TN"
+        state_code = (notice.state or "AL").strip().upper() or "AL"
         found = False
 
         for search_name in search_names[:2]:  # Primary + secondary (joint owner)
@@ -2681,7 +2689,7 @@ def enrich_obituary_data(
                         search_name = names[0]
                         city = notice.city.strip() or _default_city_for_county(notice.county)
                         state_full = _state_full_name(notice.state)
-                        state_code = (notice.state or "TN").strip().upper() or "TN"
+                        state_code = (notice.state or "AL").strip().upper() or "AL"
 
                         result = await ancestry_enricher.lookup_deceased(
                             page, name=search_name, city=city, state=state_code
@@ -2712,7 +2720,7 @@ def enrich_obituary_data(
                         confirmed_name = result.get("full_name", "")
                         city = notice.city.strip() or _default_city_for_county(notice.county)
                         state_full = _state_full_name(notice.state)
-                        state_code = (notice.state or "TN").strip().upper() or "TN"
+                        state_code = (notice.state or "AL").strip().upper() or "AL"
                         source_url = result.get("source_url", "")
                         source_type = "ancestry"
 
@@ -2794,7 +2802,7 @@ def enrich_obituary_data(
     for j, (notice, parsed, url, source_type, raw_name, is_tax_name) in enumerate(matches, 1):
         city = notice.city.strip() or _default_city_for_county(notice.county)
         state_full = _state_full_name(notice.state)
-        state_code = (notice.state or "TN").strip().upper() or "TN"
+        state_code = (notice.state or "AL").strip().upper() or "AL"
         survivors = parsed.get("survivors", [])
         has_survivors = bool(survivors) or bool(parsed.get("executor_named", ""))
 
@@ -2861,6 +2869,25 @@ def enrich_obituary_data(
 
         # Path 0: Probate preset — executor is the DM, address from notice
         if parsed.get("_probate_preset"):
+            # Operator review 2026-06-13: 11 of 21 probate records had
+            # mailing city/state wrong (TN/Knoxville) because the PR
+            # mailing-address regex failed to extract from those specific
+            # notices and the fallback defaulted to a Knox-County-era
+            # constant. Tracerfy then couldn't locate the executor
+            # ("Jane Smith, Knoxville, TN" matches no one in AL probate
+            # rolls) → no phones, no Trestle scoring, dead record.
+            #
+            # Fix: use notice.state (AL for every active pipeline) as
+            # the state fallback. Leave city BLANK when not extracted —
+            # an empty city + correct state + ZIP is searchable; a wrong
+            # city + wrong state is not. Tracerfy and downstream people-
+            # search tolerate empty city better than the wrong city.
+            dm_state = (
+                (notice.owner_state or "").strip()
+                or (notice.state or "").strip()
+                or "AL"
+            )
+            dm_city = (notice.owner_city or "").strip()
             ranked_dms = [{
                 "name": notice.owner_name,
                 "relationship": "executor",
@@ -2875,8 +2902,8 @@ def enrich_obituary_data(
                 # SIGNING CHAIN section instead of "Other Family".
                 "signing_authority": True,
                 "street": notice.owner_street,
-                "city": notice.owner_city or "Knoxville",
-                "state": "TN",
+                "city": dm_city,
+                "state": dm_state,
                 "zip": notice.owner_zip,
             }]
             error_info = {
@@ -3211,6 +3238,7 @@ def enrich_obituary_data(
                     tracerfy_result = _lookup_dm_address_tracerfy(
                         dm_name, dm_city_hint or city,
                         address=notice.address, zip_code=notice.zip,
+                        state=(notice.state or "AL").upper(),
                     )
                     if tracerfy_result and tracerfy_result.get("street"):
                         dm.update(tracerfy_result)
