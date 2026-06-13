@@ -24,25 +24,34 @@ logger = logging.getLogger(__name__)
 # Other regions scale relative to that anchor (the user's investor sheet provides
 # Birmingham-specific numbers; this pivot lets us read them verbatim).
 REGIONAL_MULTIPLIERS = {
-    # Alabama
+    # ── Alabama (full statewide coverage, 2026-06-13) ──
     "birmingham": 1.00,      # Jefferson + Shelby (Hoover, Vestavia, Alabaster) — BASELINE
     "huntsville": 1.04,      # Madison — tech/aerospace labor premium
-    "albertville": 0.95,     # Marshall County — rural
-    # Tennessee
+    "albertville": 0.95,     # Marshall — rural NE AL
+    "mobile": 1.05,          # Mobile + Baldwin — coastal hurricane code + port materials
+    "montgomery": 0.97,      # Montgomery + Elmore + Autauga — state capital metro
+    "tuscaloosa": 0.99,      # Tuscaloosa + Hale + Greene — university town
+    "auburn": 1.00,          # Lee + Russell + Macon — university + Kia plant labor
+    "shoals": 0.93,          # Lauderdale + Colbert + Franklin — Florence/Muscle Shoals
+    "dothan": 0.92,          # Houston + Henry + Geneva + Dale + Coffee — south AL hub
+    "gadsden": 0.94,         # Etowah + Cherokee + DeKalb — NE AL
+    "decatur": 0.98,         # Morgan + Limestone + Lawrence — Tennessee Valley
+    "cullman": 0.96,         # Cullman — between Birmingham and Huntsville
+    # ── Tennessee ──
     "knoxville": 0.96,       # ~4% below Birmingham
     "blount": 0.93,
     "nashville": 1.03,
     "chattanooga": 0.98,
-    # Default fallback
+    # ── Default fallback ──
     "national": 1.09,        # ~9% above Birmingham (national avg)
 }
 DEFAULT_REGION = "auto"  # resolver picks the right region from city+state
 
-# City → region routing. Covers all cities active in the SiftStack pipeline today
-# (Jefferson + Shelby + Madison + Marshall AL, Knox + Blount TN). Unknown cities
-# fall back to the state-level default in resolve_region().
+# City → region routing. Covers all cities active in the SiftStack pipeline plus
+# full statewide AL coverage (2026-06-13 expansion). Unknown cities fall back
+# to the state-level default in resolve_region().
 _CITY_TO_REGION = {
-    # Jefferson County AL (Birmingham metro)
+    # ── Jefferson County AL (Birmingham metro) ──
     "birmingham": "birmingham", "bessemer": "birmingham", "hoover": "birmingham",
     "vestavia hills": "birmingham", "mountain brook": "birmingham", "homewood": "birmingham",
     "trussville": "birmingham", "hueytown": "birmingham", "pinson": "birmingham",
@@ -50,23 +59,79 @@ _CITY_TO_REGION = {
     "gardendale": "birmingham", "adamsville": "birmingham", "tarrant": "birmingham",
     "forestdale": "birmingham", "brighton": "birmingham", "irondale": "birmingham",
     "leeds": "birmingham", "midfield": "birmingham", "fairfield": "birmingham",
+    "warrior": "birmingham", "graysville": "birmingham", "kimberly": "birmingham",
+    "morris": "birmingham", "mount olive": "birmingham", "clay": "birmingham",
+    "moody": "birmingham", "argo": "birmingham", "odenville": "birmingham",
+    "springville": "birmingham", "pell city": "birmingham", "ragland": "birmingham",
     # Shelby County AL (Birmingham southern bedroom communities — same labor pool)
     "alabaster": "birmingham", "helena": "birmingham", "pelham": "birmingham",
     "calera": "birmingham", "columbiana": "birmingham", "chelsea": "birmingham",
     "indian springs": "birmingham", "vincent": "birmingham", "wilsonville": "birmingham",
-    "montevallo": "birmingham",
-    # Madison County AL (Huntsville metro)
+    "montevallo": "birmingham", "westover": "birmingham", "harpersville": "birmingham",
+    # Walker County AL (rolls into Birmingham labor market)
+    "jasper": "birmingham", "sumiton": "birmingham", "dora": "birmingham",
+    "cordova": "birmingham", "parrish": "birmingham",
+    # ── Madison County AL (Huntsville metro) ──
     "huntsville": "huntsville", "madison": "huntsville", "owens cross roads": "huntsville",
     "gurley": "huntsville", "new hope": "huntsville", "new market": "huntsville",
     "triana": "huntsville", "harvest": "huntsville", "meridianville": "huntsville",
-    # Marshall County AL (Albertville/Boaz/Guntersville/Arab)
+    # ── Marshall County AL (Albertville/Boaz/Guntersville/Arab) ──
     "albertville": "albertville", "boaz": "albertville", "guntersville": "albertville",
     "arab": "albertville", "union grove": "albertville", "douglas": "albertville",
     "grant": "albertville", "horton": "albertville",
-    # Knox County TN
+    # ── Mobile + Baldwin (Mobile metro — coastal premium) ──
+    "mobile": "mobile", "saraland": "mobile", "satsuma": "mobile",
+    "chickasaw": "mobile", "prichard": "mobile", "tillmans corner": "mobile",
+    "theodore": "mobile", "semmes": "mobile", "creola": "mobile",
+    "daphne": "mobile", "fairhope": "mobile", "spanish fort": "mobile",
+    "foley": "mobile", "gulf shores": "mobile", "orange beach": "mobile",
+    "bay minette": "mobile", "loxley": "mobile", "robertsdale": "mobile",
+    "summerdale": "mobile", "elberta": "mobile",
+    # ── Montgomery + Elmore + Autauga (state capital metro) ──
+    "montgomery": "montgomery", "prattville": "montgomery", "wetumpka": "montgomery",
+    "millbrook": "montgomery", "pike road": "montgomery", "tallassee": "montgomery",
+    "deatsville": "montgomery", "elmore": "montgomery", "eclectic": "montgomery",
+    "autaugaville": "montgomery", "billingsley": "montgomery",
+    # ── Tuscaloosa + Hale + Greene (university market) ──
+    "tuscaloosa": "tuscaloosa", "northport": "tuscaloosa", "moundville": "tuscaloosa",
+    "coker": "tuscaloosa", "vance": "tuscaloosa", "brookwood": "tuscaloosa",
+    "holt": "tuscaloosa", "cottondale": "tuscaloosa", "greensboro": "tuscaloosa",
+    "eutaw": "tuscaloosa",
+    # ── Auburn / Opelika (Lee + Russell + Macon) ──
+    "auburn": "auburn", "opelika": "auburn", "smiths station": "auburn",
+    "phenix city": "auburn", "loachapoka": "auburn", "notasulga": "auburn",
+    "salem": "auburn", "valley": "auburn", "lanett": "auburn",
+    "lafayette": "auburn", "tuskegee": "auburn",
+    # ── Shoals (Lauderdale + Colbert + Franklin — Florence/Muscle Shoals) ──
+    "florence": "shoals", "muscle shoals": "shoals", "sheffield": "shoals",
+    "tuscumbia": "shoals", "russellville": "shoals", "rogersville": "shoals",
+    "killen": "shoals", "lexington": "shoals", "anderson": "shoals",
+    "leighton": "shoals", "cherokee": "shoals", "red bay": "shoals",
+    # ── Dothan + Houston + Henry + Geneva + Dale + Coffee (south AL hub) ──
+    "dothan": "dothan", "enterprise": "dothan", "ozark": "dothan",
+    "headland": "dothan", "geneva": "dothan", "hartford": "dothan",
+    "elba": "dothan", "abbeville": "dothan", "eufaula": "dothan",
+    "fort rucker": "dothan", "daleville": "dothan", "midland city": "dothan",
+    "ashford": "dothan", "cottonwood": "dothan",
+    # ── Gadsden + Etowah + Cherokee + DeKalb (NE AL) ──
+    "gadsden": "gadsden", "rainbow city": "gadsden", "southside": "gadsden",
+    "attalla": "gadsden", "glencoe": "gadsden", "hokes bluff": "gadsden",
+    "centre": "gadsden", "leesburg": "gadsden", "fort payne": "gadsden",
+    "rainsville": "gadsden", "henagar": "gadsden", "ider": "gadsden",
+    "mentone": "gadsden", "valley head": "gadsden",
+    # ── Decatur + Morgan + Limestone + Lawrence (Tennessee Valley) ──
+    "decatur": "decatur", "hartselle": "decatur", "athens": "decatur",
+    "ardmore": "decatur", "elkmont": "decatur", "moulton": "decatur",
+    "courtland": "decatur", "town creek": "decatur", "trinity": "decatur",
+    "priceville": "decatur", "somerville": "decatur", "falkville": "decatur",
+    # ── Cullman (between Birmingham and Huntsville) ──
+    "cullman": "cullman", "hanceville": "cullman", "good hope": "cullman",
+    "vinemont": "cullman", "fairview": "cullman", "holly pond": "cullman",
+    "west point": "cullman", "garden city": "cullman",
+    # ── Knox County TN ──
     "knoxville": "knoxville", "powell": "knoxville", "farragut": "knoxville",
     "karns": "knoxville", "halls": "knoxville", "corryton": "knoxville",
-    # Blount County TN
+    # ── Blount County TN ──
     "maryville": "blount", "alcoa": "blount", "friendsville": "blount",
     "louisville": "blount", "rockford": "blount", "townsend": "blount",
 }

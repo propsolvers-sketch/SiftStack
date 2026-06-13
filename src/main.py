@@ -1492,7 +1492,7 @@ def cli_main() -> None:
     parser.add_argument("--scope", type=str, default="full", choices=["full", "wholetail"],
                         help="Rehab scope (rehab mode, default: full)")
     parser.add_argument("--region", type=str, default="auto",
-                        help="Regional pricing override (rehab/analyze-deal). Default 'auto' resolves from city+state. Explicit values: knoxville, blount, birmingham, huntsville, albertville, nashville, chattanooga, national")
+                        help="Regional pricing override (rehab/analyze-deal). Default 'auto' resolves from city+state. AL: birmingham, huntsville, albertville, mobile, montgomery, tuscaloosa, auburn, shoals, dothan, gadsden, decatur, cullman. TN: knoxville, blount, nashville, chattanooga. Fallback: national.")
     parser.add_argument("--sqft", type=int, default=0,
                         help="Property sqft override (rehab mode)")
     parser.add_argument("--bedrooms", type=int, default=0,
