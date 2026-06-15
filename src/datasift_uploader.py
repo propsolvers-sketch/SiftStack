@@ -1680,10 +1680,26 @@ async def upload_to_datasift_per_distressor(
         rows = list(reader)
 
     if not rows:
+        # Operator runs 2026-06-14 + 2026-06-15: the cross-run code-
+        # violation dedup (seen_code_violations.json) correctly filtered
+        # ALL 211-213 cases as already-uploaded, so the per-distressor
+        # CSV ended up header-only. Returning success=False here cascaded
+        # the entire workflow to FAILED even though the pipeline did
+        # exactly what it was supposed to do. Treat "header-only CSV" as
+        # an expected, successful no-op so the workflow stays green.
+        logger.info(
+            "Empty CSV (no rows after dedup) — skipping upload of %s",
+            csv_path.name,
+        )
         return {
-            "success": False,
-            "message": f"CSV is empty (header only): {csv_path}",
+            "success": True,
+            "message": (
+                f"No new records to upload — all candidates were filtered "
+                f"by cross-run dedup (already in DataSift)."
+            ),
             "uploads": [],
+            "skipped_empty": True,
+            "csv": csv_path.name,
         }
 
     notice_type = (rows[0].get("Notice Type") or "").strip()

@@ -527,6 +527,16 @@ def _build_slack_message(
         lines.append("*DataSift Uploads*")
         for r in results:
             ok = r.get("success", False)
+            # Empty-CSV results (everything filtered by cross-run dedup) are
+            # legitimate successes — show ⏭️ instead of ✅ so the operator
+            # sees the difference at a glance, plus a tailored "no new
+            # records" message instead of the upload count.
+            if r.get("skipped_empty"):
+                lines.append(
+                    f"  ⏭️  {r['csv']}: no new records "
+                    f"(all candidates already in DataSift via dedup)"
+                )
+                continue
             emoji = "✅" if ok else "❌"
             is_heir_csv = "_Heirs_" in r["csv"]
             sub = r.get("uploads", [])
