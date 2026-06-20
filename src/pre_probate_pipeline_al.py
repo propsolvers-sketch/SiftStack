@@ -270,6 +270,93 @@ def _extract_curated_partner_urls(html: str) -> list[str]:
     return ordered
 
 
+def _extract_partner_urls_via_playwright(
+    legacy_person_url: str, timeout_ms: int = 15000,
+) -> list[str]:
+    """Use a real headless browser to read legacy.com's partner URLs that
+    only appear after JS hydration.
+
+    Background (2026-06-20): legacy.com's "Obituary partner sites"
+    box is empty in the server-rendered HTML for many records — the
+    funeral home links (Patterson-Forest Grove for Mark Jerome Green,
+    etc.) are fetched from a separate API by client-side JavaScript
+    AFTER the initial render. Raw `requests` and Firecrawl's normal
+    render both return the empty box. Only a real Chromium browser
+    waiting on the hydration call sees the populated grid.
+
+    Used as a FALLBACK when _extract_curated_partner_urls() (raw HTML)
+    returns nothing. Browser launch is ~1-2s + a configurable wait
+    for the partner box to populate — acceptable for the ~30% of
+    records where it's needed.
+
+    Returns URLs in document order (= visual left-to-right). Empty
+    list when Playwright isn't installed, the page errors, or the
+    partner box truly is empty.
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+    except ImportError:
+        logger.debug("Playwright not installed — skipping browser fallback")
+        return []
+
+    urls: list[str] = []
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                context = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                    locale="en-US",
+                )
+                page = context.new_page()
+                # domcontentloaded is enough — we don't need every ad pixel
+                # to finish, just the React tree to mount.
+                page.goto(legacy_person_url,
+                          wait_until="domcontentloaded", timeout=timeout_ms)
+                # Wait specifically for the partner box to have at least one
+                # anchor. Short timeout because many pages legitimately have
+                # no partner sites (Mark/James/Gregory pattern), and we
+                # don't want to block 15s waiting for content that won't
+                # appear. 6s is long enough for the API call to complete.
+                try:
+                    page.wait_for_selector(
+                        '[aria-label="Obituary partner sites"] a',
+                        timeout=6000,
+                    )
+                except PwTimeout:
+                    # No partner anchors appeared — page genuinely has none
+                    pass
+                # Extract hrefs in document order (= visual left-to-right)
+                urls = page.evaluate("""() => {
+                    const region = document.querySelector(
+                        '[aria-label="Obituary partner sites"]'
+                    );
+                    if (!region) return [];
+                    return Array.from(region.querySelectorAll('a[href]'))
+                        .map(a => a.href)
+                        .filter(h => h.startsWith('http'));
+                }""")
+            finally:
+                browser.close()
+    except Exception as e:
+        logger.debug("Playwright partner fetch failed for %s: %s",
+                     legacy_person_url, e)
+        return []
+
+    # Dedup while preserving order
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            ordered.append(u)
+    return ordered
+
+
 def _extract_partner_urls(legacy_person_url: str) -> list[str]:
     """Pull the raw legacy.com HTML and extract candidate partner-site URLs.
 
@@ -318,9 +405,25 @@ def _extract_partner_urls(legacy_person_url: str) -> list[str]:
     curated = _extract_curated_partner_urls(r.text)
     if curated:
         logger.debug(
-            "Found %d curated partner URL(s) in 'Obituary partner sites' region",
+            "Found %d curated partner URL(s) in 'Obituary partner sites' region (raw HTML)",
             len(curated),
         )
+    else:
+        # Raw HTML's curated region was empty — the partner box exists
+        # but legacy.com hydrates the funeral home links via a client-
+        # side API call AFTER initial render. Fall back to a real
+        # browser via Playwright. ~5s overhead per call but recovers
+        # records like Mark Jerome Green where the Patterson-Forest
+        # Grove link is JS-only.
+        logger.debug(
+            "Raw HTML partner region empty — trying Playwright JS-render fallback"
+        )
+        curated = _extract_partner_urls_via_playwright(legacy_person_url)
+        if curated:
+            logger.info(
+                "Playwright recovered %d partner URL(s) from JS-hydrated region",
+                len(curated),
+            )
 
     # All hrefs — we used to exclude every legacy.com URL because the
     # original intent was "follow only EXTERNAL partner sites". That
