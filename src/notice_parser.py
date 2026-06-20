@@ -1272,7 +1272,23 @@ async def parse_notice_page(
             if not notice.owner_street and llm_result.get("owner_street"):
                 notice.owner_street = llm_result["owner_street"]
                 notice.owner_city = llm_result.get("owner_city") or notice.owner_city
-                notice.owner_state = llm_result.get("owner_state") or notice.state or "AL"
+                # County-trust the state instead of accepting whatever the LLM
+                # extracted. AL probate notices were getting `owner_state="TN"`
+                # written by Claude (2026-06-20: 8/20 probate records in today's
+                # CSV had Mailing State=TN despite being Jefferson County AL
+                # probates — Trussville/Birmingham/Knoxville mailing cities all
+                # incorrectly stamped TN). For the active AL counties, the PR
+                # mailing address is always in-state. Fall back to the LLM
+                # value only when the notice's county isn't AL-active.
+                _AL_COUNTIES = {"jefferson", "madison", "marshall"}
+                _TN_COUNTIES = {"knox", "blount"}
+                _county_lc = (notice.county or "").lower().strip()
+                if _county_lc in _AL_COUNTIES:
+                    notice.owner_state = "AL"
+                elif _county_lc in _TN_COUNTIES:
+                    notice.owner_state = "TN"
+                else:
+                    notice.owner_state = llm_result.get("owner_state") or notice.state or "AL"
                 notice.owner_zip = llm_result.get("owner_zip") or notice.owner_zip
                 logger.info("LLM filled PR address: %s", notice.owner_street)
             # Probate metadata (case#, judge, granted date)
@@ -1989,9 +2005,22 @@ def _parse_pr_address(notice: NoticeData) -> None:
             street = street.title()
         notice.owner_street = street
         notice.owner_city = _clean_city(match.group(2))
-        # Use the notice's state if known (set at scrape time, e.g. "AL");
-        # fall back to AL since all active pipelines are Alabama.
-        notice.owner_state = notice.state or "AL"
+        # County-trust the state. The regex regex doesn't capture the state
+        # literal — it just matches "TN|AL" between city and zip — so a
+        # Jefferson County AL probate whose text says "Birmingham, TN"
+        # (corruption / typo in the source) would parse cleanly, then the
+        # owner_state fallback would inherit whatever notice.state happens
+        # to be. Anchor on county instead so cross-state leakage is
+        # impossible for the active pipelines.
+        _AL_COUNTIES = {"jefferson", "madison", "marshall"}
+        _TN_COUNTIES = {"knox", "blount"}
+        _county_lc = (notice.county or "").lower().strip()
+        if _county_lc in _AL_COUNTIES:
+            notice.owner_state = "AL"
+        elif _county_lc in _TN_COUNTIES:
+            notice.owner_state = "TN"
+        else:
+            notice.owner_state = notice.state or "AL"
         notice.owner_zip = match.group(3)
         logger.debug(
             "PR address: %s, %s, %s %s",
