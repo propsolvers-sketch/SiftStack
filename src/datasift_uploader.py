@@ -72,6 +72,15 @@ async def _click_next_step(page: Page, timeout: int = 20000) -> bool:
 
     Default timeout is 20s to handle slow SPA rendering in headless/cloud
     environments (Apify containers take longer than local desktop).
+
+    Two-pass: Playwright text selectors first (fast path), then a JS
+    DOM walk that finds ANY clickable element whose visible text is
+    "Next Step" / "Next" / "Continue". DataSift's wizard re-renders the
+    Next button as `<div role="button">` on certain steps — observed on
+    2026-06-20 when the Step 2 Enrichment → Step 3 transition started
+    failing every run despite the button being visually present. The
+    walk climbs to the nearest clickable ancestor (button, role=button,
+    or cursor:pointer) so we don't click an inert text span.
     """
     try:
         btn = page.locator(
@@ -84,8 +93,52 @@ async def _click_next_step(page: Page, timeout: int = 20000) -> bool:
         await page.wait_for_timeout(2000)
         return True
     except PwTimeout:
-        logger.warning("Next Step button not found within %dms", timeout)
-        return False
+        pass
+
+    try:
+        clicked = await page.evaluate("""() => {
+            const wanted = ['next step', 'next', 'continue'];
+            const isClickable = (el) => {
+                if (!el) return false;
+                if (el.tagName === 'BUTTON' || el.tagName === 'A') return true;
+                if (el.getAttribute && el.getAttribute('role') === 'button') return true;
+                const cs = window.getComputedStyle(el);
+                return cs && cs.cursor === 'pointer';
+            };
+            const climb = (el) => {
+                let cur = el;
+                for (let i = 0; i < 6 && cur; i++, cur = cur.parentElement) {
+                    if (isClickable(cur)) return cur;
+                }
+                return null;
+            };
+            const candidates = [];
+            for (const el of document.querySelectorAll('*')) {
+                const txt = (el.textContent || '').trim().toLowerCase();
+                if (!wanted.includes(txt)) continue;
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) continue;
+                const target = climb(el);
+                if (!target) continue;
+                // Prefer "Next Step" (priority 0) > "Continue" (1) > "Next" (2).
+                const priority = txt === 'next step' ? 0 : (txt === 'continue' ? 1 : 2);
+                candidates.push({ el: target, priority, x: rect.x });
+            }
+            if (!candidates.length) return false;
+            // Wizard Next buttons live bottom-right, so prefer rightmost.
+            candidates.sort((a, b) => a.priority - b.priority || b.x - a.x);
+            candidates[0].el.click();
+            return true;
+        }""")
+        if clicked:
+            await page.wait_for_timeout(2000)
+            logger.info("Next Step clicked via JS DOM-walk fallback")
+            return True
+    except Exception as e:
+        logger.debug("JS fallback for Next Step failed: %s", e)
+
+    logger.warning("Next Step button not found within %dms", timeout)
+    return False
 
 
 async def upload_csv(
