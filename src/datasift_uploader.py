@@ -1092,6 +1092,104 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
         return False
 
 
+async def _switch_to_all_tab(page: Page) -> bool:
+    """Switch the Records page tab from "Clean" to "All".
+
+    Newly uploaded records frequently land in "Incomplete" before
+    DataSift finishes validating them — the default "Clean" tab
+    shows zero rows in that window. Switching to "All" makes both
+    Clean and Incomplete records visible immediately, which is what
+    we want for enrich + skip-trace (they should run on every
+    just-uploaded row regardless of completeness state).
+
+    Returns True if the tab switch was attempted (best-effort; some
+    page layouts hide the tabs depending on context — that's fine,
+    select_all will still work against whatever's showing).
+    """
+    try:
+        await _dismiss_popups(page)
+        # The "All" tab is a button labeled "All" in the same tab
+        # group as "Clean" and "Incomplete". Targeting via text is
+        # reliable because DataSift uses these exact labels.
+        all_tab = page.locator(
+            'button:has-text("All"), '
+            '[role="tab"]:has-text("All"), '
+            '[data-testid*="all-tab"]'
+        )
+        # Prefer the SHORTER match — "All" alone, not "Show All" or
+        # other long buttons that happen to contain the word.
+        count = await all_tab.count()
+        if count == 0:
+            logger.debug("All tab not found — staying on default")
+            return False
+        # Iterate to find the one with exact "All" text (or shortest)
+        clicked = False
+        for i in range(min(count, 5)):
+            try:
+                btn = all_tab.nth(i)
+                txt = (await btn.inner_text()).strip()
+                if txt == "All":
+                    await btn.click(timeout=3000)
+                    await page.wait_for_timeout(1500)
+                    logger.debug("Switched to All tab")
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        return clicked
+    except Exception as e:
+        logger.debug("Switch to All tab failed: %s", e)
+        return False
+
+
+async def _wait_for_records_to_appear(
+    page: Page, list_name: str = "", timeout_ms: int = 60000, poll_ms: int = 3000,
+) -> bool:
+    """Poll until at least one record row appears in the table.
+
+    Newly uploaded records take time to ingest — DataSift's backend
+    has to process the CSV, validate each row, and write to the
+    records table. For typical uploads (10-50 rows) this completes
+    in 5-30s but can take up to 60s under load. Without this wait,
+    `_select_all_records` fires against an empty table and returns
+    False with "Could not select records" — exactly today's
+    2026-06-20 failure mode where the post-upload step crashed for
+    all 3 distressor uploads despite the wizard step succeeding.
+
+    Returns True when records appear, False on timeout. Polling looks
+    for non-toggle checkboxes (each record row has one); a count > 1
+    means at least 1 row beyond the header checkbox.
+    """
+    import time as _time
+    deadline = _time.monotonic() + timeout_ms / 1000.0
+    elapsed_s = 0
+    while _time.monotonic() < deadline:
+        try:
+            count = await page.evaluate("""() => {
+                return Array.from(
+                    document.querySelectorAll('input[type="checkbox"]')
+                ).filter(cb =>
+                    !cb.classList.contains('react-toggle-screenreader-only')
+                ).length;
+            }""")
+            if count > 1:
+                logger.info(
+                    "Records appeared after %ds (%s)%s",
+                    elapsed_s, f"{count - 1} row checkbox(es) + 1 header",
+                    f" — list '{list_name}'" if list_name else "",
+                )
+                return True
+        except Exception as e:
+            logger.debug("Record-count poll failed: %s", e)
+        await page.wait_for_timeout(poll_ms)
+        elapsed_s += poll_ms // 1000
+    logger.warning(
+        "Records did NOT appear within %ds — table empty (list=%r)",
+        timeout_ms // 1000, list_name,
+    )
+    return False
+
+
 async def _select_all_records(page: Page) -> bool:
     """Select all records on the current page. Returns True if selected."""
     try:
@@ -1225,6 +1323,20 @@ async def enrich_records(
             result["message"] = "Could not filter to list for enrichment"
             logger.warning(result["message"])
             # Continue anyway — may enrich whatever is showing
+
+        # Switch to "All" tab so records in Incomplete state also show.
+        # Newly uploaded records often land in Incomplete before
+        # DataSift's backend finishes filling derived fields.
+        await _switch_to_all_tab(page)
+
+        # Wait for records to actually appear in the table — DataSift's
+        # ingestion queue can take 5-60s after upload completes. Without
+        # this poll, _select_all_records fires against an empty table.
+        # 2026-06-20 failure mode: all 3 distressor post-uploads logged
+        # "Could not select records for enrichment" because the records
+        # page rendered "No property records found" at the moment we
+        # tried to select.
+        await _wait_for_records_to_appear(page, list_name=list_name)
 
         # Select all records
         selected = await _select_all_records(page)
@@ -1380,6 +1492,11 @@ async def skip_trace_records(page: Page, list_name: str) -> dict:
         filtered = await _filter_by_list(page, list_name)
         if not filtered:
             logger.warning("Could not filter to list for skip trace — continuing anyway")
+
+        # Switch to "All" tab + wait for records (same timing fix as
+        # enrich_records — see that function's comments for the why).
+        await _switch_to_all_tab(page)
+        await _wait_for_records_to_appear(page, list_name=list_name)
 
         # Select all records
         selected = await _select_all_records(page)
