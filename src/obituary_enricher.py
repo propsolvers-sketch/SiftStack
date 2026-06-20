@@ -150,21 +150,39 @@ _ESTATE_OF_RE = _cfg.ESTATE_OF_RE
 # enrich_obituary_data into every helper that builds a search query or
 # LLM prompt. Default fallback is "Tennessee" to preserve historic Knox/
 # Blount behavior when state code is missing or unknown.
-_STATE_FULL_NAMES = {
-    "AL": "Alabama", "TN": "Tennessee",
-    "GA": "Georgia", "MS": "Mississippi", "FL": "Florida",
-    "KY": "Kentucky", "NC": "North Carolina", "SC": "South Carolina",
-    "VA": "Virginia", "AR": "Arkansas", "MO": "Missouri",
-}
-
-
 def _state_full_name(state_code: str) -> str:
     """Map a 2-letter state code to its full name for search queries.
 
-    Falls back to "Tennessee" for unknown/empty codes — preserves the
-    historic default behavior since SiftStack started as a TN-only tool.
+    Thin wrapper around state_resolver.state_full_name — kept as a
+    local name so existing internal call sites don't need updating.
+    Empty/unknown input falls back to DEFAULT_PROPERTY_STATE's full
+    name (currently "Alabama") instead of the legacy "Tennessee" default.
     """
-    return _STATE_FULL_NAMES.get((state_code or "").strip().upper(), "Tennessee")
+    from state_resolver import state_full_name
+    return state_full_name(state_code)
+
+
+def _resolve_state_args(state_full: str, state_code: str) -> tuple[str, str]:
+    """Fill in empty state args from state_resolver.DEFAULT_PROPERTY_STATE.
+
+    Many obituary-enricher functions take ``state_full`` ("Alabama") +
+    ``state_code`` ("AL") to weave into search queries / LLM prompts /
+    people-search URLs. After the Knox sweep, the function-signature
+    defaults are "" (no hardcoded TN bias). This helper resolves both
+    to safe defaults at the top of each function body so downstream
+    query construction doesn't end up with `" obituary  "` (empty
+    state literal) or broken slugs.
+
+    Use at the top of every public function that takes these args:
+
+        state_full, state_code = _resolve_state_args(state_full, state_code)
+    """
+    from state_resolver import DEFAULT_PROPERTY_STATE, state_full_name
+    if not state_code:
+        state_code = DEFAULT_PROPERTY_STATE
+    if not state_full:
+        state_full = state_full_name(state_code)
+    return state_full, state_code
 
 
 # Default city-hint per county for people-search/skip-trace lookups when
@@ -467,7 +485,7 @@ def _is_obituary_url(url: str) -> bool:
 
 def _search_obituary(
     name: str, city: str, extra_terms: str = "",
-    state_full: str = "Tennessee",
+    state_full: str = "",
 ) -> list[dict]:
     """Search DuckDuckGo for obituary pages matching the person.
 
@@ -755,7 +773,7 @@ def _refetch_specific_obituary(
     original_url: str,
     api_key: str,
     address: str = "",
-    state_full: str = "Tennessee",
+    state_full: str = "",
 ) -> tuple[dict | None, str, str]:
     """Re-search for a specific obituary page when original match was a listing page.
 
@@ -846,7 +864,7 @@ def _search_survivors_targeted(
     name: str,
     city: str,
     api_key: str,
-    state_full: str = "Tennessee",
+    state_full: str = "",
 ) -> list[dict]:
     """Run targeted searches for survivor names when standard snippet lacks them.
 
@@ -1061,14 +1079,15 @@ def _lookup_dm_address_jefferson_tax(name: str) -> dict | None:
 
 def _lookup_dm_address_web(
     name: str, city: str, api_key: str,
-    state_full: str = "Tennessee",
-    state_code: str = "TN",
+    state_full: str = "",
+    state_code: str = "",
 ) -> dict | None:
     """Search free people search sites for DM's residential address.
 
     Uses DuckDuckGo to find pages on people search sites, then Claude Haiku
     to extract the address from page content.
     """
+    state_full, state_code = _resolve_state_args(state_full, state_code)
     # Targeted people search query
     site_filter = " OR ".join(f"site:{d}" for d in list(PEOPLE_SEARCH_DOMAINS)[:4])
     queries = [
@@ -1099,7 +1118,7 @@ def _lookup_dm_address_web(
             # LLM extraction
             prompt = ADDRESS_EXTRACT_PROMPT.format(
                 name=name,
-                city=city or "Knoxville",
+                city=city or "",
                 state_full=state_full,
                 state_code=state_code,
                 page_text=page_text[:MAX_OBITUARY_TEXT],
@@ -1137,25 +1156,40 @@ def _lookup_dm_address_web(
     return None
 
 
-def _build_people_search_urls(name: str, city: str) -> list[str]:
+def _build_people_search_urls(name: str, city: str, state_code: str = "") -> list[str]:
     """Build direct URLs for free people search sites that show addresses.
 
     CyberBackgroundChecks is the only reliable free site — Firecrawl
     renders it successfully with full address history, phones, and relatives.
     TruePeopleSearch times out and FastPeopleSearch is Cloudflare-blocked.
     Uses first + last name only (no middle name) for best match rates.
+
+    URL slug is `{city}-{state_lowercase}` (e.g. "birmingham-al"). The
+    state was previously hardcoded "-tn" which made every AL pipeline
+    lookup hit a wrong-state slug (returns 0 results or wrong people).
+    Empty state_code falls back to DEFAULT_PROPERTY_STATE.
     """
     parts = name.strip().split()
     if len(parts) < 2:
         return []
     first = parts[0].lower()
     last = parts[-1].lower()
-    city_clean = (city or "Knoxville").strip().lower().replace(" ", "-")
+    city_clean = (city or "").strip().lower().replace(" ", "-")
+    if not city_clean:
+        # No city → can't build a useful CyberBackgroundChecks URL
+        # (the site requires city in the path). Return empty so the
+        # caller falls through to the Serper / DDG tiers which handle
+        # state-only queries.
+        return []
+    if not state_code:
+        from state_resolver import DEFAULT_PROPERTY_STATE
+        state_code = DEFAULT_PROPERTY_STATE
+    state_slug = state_code.strip().lower()
 
     urls = [
         # CyberBackgroundChecks — shows full address history, phones, relatives
         f"https://www.cyberbackgroundchecks.com/people/"
-        f"{first}-{last}/{city_clean}-tn",
+        f"{first}-{last}/{city_clean}-{state_slug}",
     ]
     return urls
 
@@ -1179,7 +1213,7 @@ def _search_serper(name: str, city: str) -> list[str]:
 
     # CyberBackgroundChecks is the only free site Firecrawl can scrape reliably.
     # TruePeopleSearch times out, FastPeopleSearch is Cloudflare-blocked.
-    city_clean = (city or "Knoxville").strip()
+    city_clean = (city or "").strip()
     query = f'"{first} {last}" {city_clean} TN site:cyberbackgroundchecks.com'
 
     try:
@@ -1347,7 +1381,7 @@ def _fetch_firecrawl(
 
 def _extract_address_from_page(
     page_text: str, name: str, city: str, api_key: str,
-    state_full: str = "Tennessee", state_code: str = "TN",
+    state_full: str = "", state_code: str = "",
 ) -> dict | None:
     """Use Claude Haiku to extract a mailing address from page text.
 
@@ -1362,9 +1396,10 @@ def _extract_address_from_page(
     in the printed people-search address. Falls back to state_code on
     rejection (the lookup's county-context default).
     """
+    state_full, state_code = _resolve_state_args(state_full, state_code)
     prompt = ADDRESS_EXTRACT_PROMPT.format(
         name=name,
-        city=city or "Knoxville",
+        city=city or "",
         state_full=state_full,
         state_code=state_code,
         page_text=page_text[:MAX_ADDRESS_TEXT],
@@ -1395,7 +1430,7 @@ def _extract_address_from_page(
 
 def _lookup_dm_address_serper_firecrawl(
     name: str, city: str, api_key: str,
-    state_full: str = "Tennessee", state_code: str = "TN",
+    state_full: str = "", state_code: str = "",
 ) -> dict | None:
     """Look up DM address via direct people search URLs + Firecrawl rendering.
 
@@ -1404,8 +1439,11 @@ def _lookup_dm_address_serper_firecrawl(
     search for additional people search sites. Uses Claude Haiku to extract
     the address from rendered page content.
     """
-    # Phase 1: Direct people search URLs (no Google search needed)
-    direct_urls = _build_people_search_urls(name, city)
+    state_full, state_code = _resolve_state_args(state_full, state_code)
+    # Phase 1: Direct people search URLs (no Google search needed).
+    # Pass state_code through so URL slugs match the correct state
+    # (cyberbackgroundchecks.com/people/.../{city}-{state}).
+    direct_urls = _build_people_search_urls(name, city, state_code=state_code)
     for url in direct_urls:
         page_text = _fetch_firecrawl(url, max_text=MAX_ADDRESS_TEXT, priority="low")
         if not page_text or len(page_text) < 100:
@@ -1651,7 +1689,7 @@ def _batch_tracerfy_lookup(notices: list) -> None:
 
 def _lookup_dm_address(
     name: str, city: str, api_key: str, tracerfy_tier1: bool = False,
-    state_full: str = "Tennessee", state_code: str = "TN",
+    state_full: str = "", state_code: str = "",
     county: str = "",
 ) -> dict:
     """Look up decision-maker's mailing address using tiered sources.
@@ -1726,7 +1764,7 @@ def _lookup_dm_address(
     # Tier 2: Direct people search URLs + Firecrawl + LLM
     import config as cfg
     sf_result = _lookup_dm_address_serper_firecrawl(
-        name, city or "Knoxville", api_key,
+        name, city or "", api_key,
         state_full=state_full, state_code=state_code,
     )
     if sf_result and sf_result.get("street"):
@@ -1739,7 +1777,7 @@ def _lookup_dm_address(
     # Tier 2b: DuckDuckGo fallback (when Serper/Firecrawl not configured)
     if not cfg.SERPER_API_KEY and not cfg.FIRECRAWL_API_KEY:
         web_result = _lookup_dm_address_web(
-            name, city or "Knoxville", api_key,
+            name, city or "", api_key,
             state_full=state_full, state_code=state_code,
         )
         if web_result and web_result.get("street"):
@@ -1847,7 +1885,7 @@ def _parse_obituary_with_llm(
     city: str,
     address: str,
     api_key: str,
-    state_full: str = "Tennessee",
+    state_full: str = "",
 ) -> dict | None:
     """Use Claude Haiku to validate and parse an obituary.
 
@@ -2187,7 +2225,7 @@ def verify_heir_status(
     api_key: str,
     depth: int = 0,
     max_depth: int = 2,
-    state_full: str = "Tennessee",
+    state_full: str = "",
 ) -> dict:
     """Search for an obituary for a single heir to verify alive/dead.
 
@@ -2277,7 +2315,7 @@ def build_heir_map(
     api_key: str,
     raw_name: str = "",
     max_depth: int = 2,
-    state_full: str = "Tennessee",
+    state_full: str = "",
 ) -> tuple[list[dict], dict]:
     """Build heir map with verification, return (ranked_dms, error_info).
 
@@ -3357,6 +3395,7 @@ def enrich_obituary_data(
         # Path 5: Estate-of fallback — no survivors, mail to property address
         if not has_survivors and not ranked_dms:
             estate_name = f"Estate of {notice.owner_name}"
+            from state_resolver import state_for_county
             ranked_dms = [{
                 "name": estate_name,
                 "relationship": "estate",
@@ -3364,8 +3403,13 @@ def enrich_obituary_data(
                 "source": "estate_fallback",
                 "rank": 1,
                 "street": notice.address,
-                "city": notice.city or "Knoxville",
-                "state": "TN",
+                # No DM was identified — fall back to the property as the
+                # mailing target. State derived from the notice's county
+                # (Jefferson AL → AL, Madison AL → AL, etc.) so AL probates
+                # don't get silently TN-stamped (2026-06-20 audit found
+                # this hardcoded as "TN" when SiftStack was Knox-only).
+                "city": notice.city or "",
+                "state": notice.state or state_for_county(notice.county),
                 "zip": notice.zip,
             }]
             error_info = {
@@ -3461,9 +3505,14 @@ def enrich_obituary_data(
 
                 # Tier 4: Property address fallback (DM #1 only — others left empty)
                 if dm is ranked_dms[0] and dm.get("source") != "estate_fallback":
+                    from state_resolver import state_for_county
                     dm["street"] = notice.address
-                    dm["city"] = notice.city or "Knoxville"
-                    dm["state"] = "TN"
+                    # 2026-06-20: was hardcoded "Knoxville"/"TN" from the
+                    # Knox-only era. Derive city from notice (empty if
+                    # unknown — better than guessing Knoxville for AL
+                    # records) and state from notice.county.
+                    dm["city"] = notice.city or ""
+                    dm["state"] = notice.state or state_for_county(notice.county)
                     dm["zip"] = notice.zip
                     dm_addr_sources["property_fallback"] = (
                         dm_addr_sources.get("property_fallback", 0) + 1
