@@ -229,11 +229,62 @@ def _decedent_surname(legacy_person_url: str) -> str:
     return tokens[-1] if tokens else ""
 
 
+def _extract_curated_partner_urls(html: str) -> list[str]:
+    """Extract partner URLs from legacy.com's curated "Obituary partner
+    sites" region — in DOCUMENT ORDER (= visual left-to-right).
+
+    Operator instruction 2026-06-20: the curated region (visible to the
+    user as boxes labeled "Carr Funeral Home", "Guntersville Memorial
+    Chapel & Crematory", etc.) ALWAYS lists the most-complete obit
+    source first. The leftmost box typically links to the funeral home
+    that actually handled services — their syndicated obit at
+    legacy.com/us/obituaries/... has the full text + survivor list.
+
+    Document order matters: legacy.com renders the partner boxes
+    left-to-right in the same order they appear in HTML, so the first
+    `<a href>` inside the region is the leftmost / primary partner.
+    """
+    # Find the region by its aria-label. Grab everything up to the
+    # closing </div> that matches the region's opening tag. The exact
+    # nesting depth varies, so we use a loose terminator: the partner
+    # region is always followed by either ANOTHER section, a closing
+    # main wrapper, or end-of-body — grabbing up to the next
+    # role="region" or 200 chars past the last </a> in the block is
+    # safest.
+    m = _re.search(
+        r'aria-label="Obituary partner sites".*?(?=role="region"|</main>|</body>|$)',
+        html, _re.DOTALL | _re.IGNORECASE,
+    )
+    if not m:
+        return []
+    region = m.group(0)
+    # Extract hrefs in document order (left → right in the rendered grid).
+    hrefs = _re.findall(r'<a\s+href="(https?://[^"]+)"', region)
+    # Dedup while preserving order
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for h in hrefs:
+        if h not in seen:
+            seen.add(h)
+            ordered.append(h)
+    return ordered
+
+
 def _extract_partner_urls(legacy_person_url: str) -> list[str]:
     """Pull the raw legacy.com HTML and extract candidate partner-site URLs.
 
-    Returns a list of URLs sorted by priority (obits.al.com first, then
-    known funeral-home domains, then anything else that looks obit-related).
+    Two-source extraction:
+      1. CURATED partner region — legacy.com's "Obituary partner sites"
+         box, in document order. Leftmost = primary partner (typically
+         the actual funeral home that handled services). These are
+         the highest-priority candidates and tried first.
+      2. WHOLE-PAGE href scan — fallback when the curated region is
+         empty or absent (older legacy.com layouts, partner-less
+         pages). Filtered + priority-sorted by domain.
+
+    The two lists are concatenated with curated URLs first, then
+    duplicates removed (preserving order). This guarantees the
+    curated picks win whenever legacy.com provides them.
 
     Filters out wrong-person sidebar suggestions: when the source URL
     slug yields a decedent name (e.g. "Clara-Geneva-Butler"), partner
@@ -262,6 +313,15 @@ def _extract_partner_urls(legacy_person_url: str) -> list[str]:
     if r.status_code != 200:
         return []
 
+    # CURATED region first — these are the user-visible "partner sites"
+    # boxes, in document order (= left-to-right). Highest priority.
+    curated = _extract_curated_partner_urls(r.text)
+    if curated:
+        logger.debug(
+            "Found %d curated partner URL(s) in 'Obituary partner sites' region",
+            len(curated),
+        )
+
     # All hrefs — we used to exclude every legacy.com URL because the
     # original intent was "follow only EXTERNAL partner sites". That
     # broke the most common upgrade path: legacy.com/person/* (preview)
@@ -274,10 +334,46 @@ def _extract_partner_urls(legacy_person_url: str) -> list[str]:
     # to weed out the unhelpful legacy.com URLs (preview pages, sympathy
     # flower ads, asset CDN, etc.) while keeping the listing pages.
     hrefs = _re.findall(r'href=["\'](https?://[^"\']+)["\']', r.text)
-    candidates: list[str] = []
+    fallback_candidates: list[str] = []
     seen: set[str] = set()
     legacy_url_lower = legacy_person_url.lower()
     decedent_tokens = _decedent_slug_tokens(legacy_person_url)
+
+    # Curated URLs already in `curated` (from _extract_curated_partner_urls)
+    # are processed FIRST below — they preserve document order (leftmost
+    # = primary funeral home) and bypass the priority sort. We still need
+    # to apply the wrong-person filter to them as a safety check.
+    curated_validated: list[str] = []
+    for h in curated:
+        if h in seen:
+            continue
+        seen.add(h)
+        h_lower = h.lower()
+        if h_lower == legacy_url_lower:
+            continue
+        if "/person/" in h_lower:
+            continue
+        # Wrong-person filter (same as the main loop below)
+        if decedent_tokens:
+            slug_match = None
+            for pattern in (
+                r"/name/([a-z][a-z\-]+?)(?:-obituary|/|\?|$)",
+                r"/tribute/([a-z][a-z\-]+?)(?:/|\?|$)",
+                r"/obituaries/[a-z\-]+/([a-z][a-z\-]+?)-\d",
+            ):
+                slug_match = _re.search(pattern, h_lower)
+                if slug_match:
+                    break
+            if slug_match:
+                slug_tokens = {t for t in slug_match.group(1).split("-") if len(t) > 2}
+                if not (slug_tokens & decedent_tokens):
+                    logger.debug(
+                        "Curated partner rejected (wrong decedent slug): %s",
+                        h,
+                    )
+                    continue
+        curated_validated.append(h)
+
     for h in hrefs:
         if h in seen:
             continue
@@ -345,15 +441,11 @@ def _extract_partner_urls(legacy_person_url: str) -> list[str]:
                 if not (slug_tokens & decedent_tokens):
                     continue
 
-        candidates.append(h)
+        fallback_candidates.append(h)
 
-    # Sort by priority — known obit domains first, then everything else.
-    # Within the same domain, prefer URLs containing "/name/" (individual
-    # obituary pages) over "/local/" or "/category/" (regional/topical
-    # listings that don't have a survivor list). Was a real bug for
-    # legacy.com: regional listing pages share the same domain as the
-    # individual obit pages, so without this secondary sort the listings
-    # used up the per-URL retry budget before the right page was tried.
+    # Sort the fallback (regex-scanned) candidates by domain + path priority.
+    # Then return curated FIRST (document order preserved) + fallback after.
+    # Final order: [curated leftmost, curated next, ..., best-priority fallback, ...]
     def _priority(u: str) -> tuple[int, int, str]:
         u_lower = u.lower()
         domain_rank = len(_PARTNER_DOMAIN_PRIORITY)
@@ -374,8 +466,8 @@ def _extract_partner_urls(legacy_person_url: str) -> list[str]:
             path_rank = 1
         return (domain_rank, path_rank, u_lower)
 
-    candidates.sort(key=_priority)
-    return candidates
+    fallback_candidates.sort(key=_priority)
+    return curated_validated + fallback_candidates
 
 
 def _fetch_full_obit_text(url: str) -> tuple[str, str]:
