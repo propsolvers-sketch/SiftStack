@@ -101,9 +101,15 @@ import re as _re
 import requests as _requests
 
 # Domains we KNOW are obit/funeral sources and want to follow when we see
-# them linked from a legacy.com preview. obits.al.com is highest priority
-# (richest data + we have working parser); others sorted alphabetically.
+# them linked from a legacy.com preview. Higher priority = tried first.
+# legacy.com/us/obituaries/ tops the list because: the partner panel on
+# every modern legacy.com/person/ preview links to the matching FULL-obit
+# listing at the same domain — this is where Clara Geneva Butler's 11
+# survivors (and most other "0-heir" records) actually live. Before
+# 2026-06-20 our regex explicitly EXCLUDED www.legacy.com URLs, so every
+# legacy-to-legacy upgrade silently failed.
 _PARTNER_DOMAIN_PRIORITY = [
+    "legacy.com/us/obituaries",  # Same-site obit listing — has full text + survivor list
     "obits.al.com",          # AL.com syndication — full obit + survivor list
     "dignitymemorial.com",   # Major funeral chain; KNOWN_403, routes via Firecrawl
     "jmgardens.com",
@@ -125,21 +131,43 @@ _PARTNER_DOMAIN_PRIORITY = [
 # memoriams.com is a "place an obituary anywhere" advertising service legacy
 # links to as cross-promotion — its pages contain marketing copy that's
 # 6000+ chars (full length) but ZERO obit content. Always skip.
+# sympathy.legacy.com is flowers/gifts ad pages — never has obit content.
+# cdn.legacy.com / static.legacy.com are CSS/JS asset hosts.
 _PARTNER_SKIP_KEYWORDS = (
     "legacy.net", "memoriams.com", "facebook.com", "twitter.com",
     "googleapis", "tracking", "cloudfront", "amazonaws", "doubleclick",
-    "media.legacy", "cache.legacy",
+    "media.legacy", "cache.legacy", "sympathy.legacy", "cdn.legacy",
+    "static.legacy", "fundingchoices", "pub.network", "doubleclick",
+    "googletagmanager", "btloader", "confiant", "youtube.com",
+    "instagram.com", "tiktok.com", "pinterest.com",
 )
 
 # Phrases that indicate the fetched text is a REAL obituary, not navigation
 # chrome or an ad page. We require at least one match before accepting a
-# partner-site fetch.
+# partner-site fetch. Expanded 2026-06-20 to cover regional/religious
+# funeral-page phrasings that don't use the legalistic "survived by" wording
+# (common on smaller AL funeral homes and DignityMemorial chapter pages).
 _OBIT_MARKERS = (
-    "survived by", "preceded in death", "predeceased",
-    "passed away", "passed peacefully", "passed quietly",
-    "born on", "born in", "leaves behind",
+    # Standard obit headers
+    "survived by", "preceded in death", "predeceased", "leaves behind",
+    # Death phrasings — secular
+    "passed away", "passed peacefully", "passed quietly", "passed from",
+    "passed into", "went to be with", "departed this life",
+    "entered into rest", "entered into eternal rest",
+    # Death phrasings — religious
+    "went home to be with", "called home", "received her heavenly",
+    "received his heavenly", "joined her Lord", "joined his Lord",
+    "joined the Lord", "in the presence of", "to be with the Lord",
+    # Biographical
+    "born on", "born in", "was born", "the daughter of", "the son of",
+    "the wife of", "the husband of",
+    # Service / arrangement language (often present even without survivor list)
     "celebration of life", "funeral service", "memorial service",
-    "in lieu of flowers",
+    "graveside service", "visitation will be", "in lieu of flowers",
+    "interment", "burial will", "officiating",
+    # Survivors plural keyword used by some smaller funeral homes
+    "she leaves to cherish", "he leaves to cherish",
+    "loving memory of",
 )
 
 
@@ -156,11 +184,64 @@ def _looks_like_obituary(text: str, min_chars: int = 500) -> bool:
     return any(marker in text_lc for marker in _OBIT_MARKERS)
 
 
+_NAME_PARTS_FROM_SLUG_RE = _re.compile(
+    r"/person/([A-Za-z][A-Za-z\-]+?)-(\d+)/?",
+    _re.IGNORECASE,
+)
+
+
+def _decedent_slug_tokens(legacy_person_url: str) -> set[str]:
+    """Extract lowercase name tokens from a legacy.com/person/* URL slug.
+
+    Example: "/person/Clara-Geneva-Butler-61553980" → {"clara","geneva","butler"}
+
+    Used to filter out wrong-person URLs from legacy.com's "more
+    obituaries you might like" sidebar — without this filter the
+    refresh could pull e.g. `name/emma-claros-obituary` for a James
+    Ronald McFarland record (sidebar suggestion), passing all the
+    real-obituary heuristics but for the wrong decedent.
+
+    Returns empty set when the URL doesn't match the expected pattern
+    (lets the caller skip the name-match filter and accept all).
+    """
+    m = _NAME_PARTS_FROM_SLUG_RE.search(legacy_person_url)
+    if not m:
+        return set()
+    name_part = m.group(1)
+    return {tok.lower() for tok in name_part.split("-") if len(tok) > 2}
+
+
+def _decedent_surname(legacy_person_url: str) -> str:
+    """Extract the lowercase surname (last name token) from a /person/ URL.
+
+    Used for in-text decedent verification — surnames are far more
+    discriminating than first names. "Gregory" or "James" appear on
+    almost every obit page; "Segrest" or "McFarland" don't.
+
+    Example: "/person/Clara-Geneva-Butler-61553980" → "butler"
+    Returns empty string when the URL doesn't match the pattern OR
+    the last token is too short (≤ 3 chars).
+    """
+    m = _NAME_PARTS_FROM_SLUG_RE.search(legacy_person_url)
+    if not m:
+        return ""
+    tokens = [t.lower() for t in m.group(1).split("-") if len(t) > 3]
+    return tokens[-1] if tokens else ""
+
+
 def _extract_partner_urls(legacy_person_url: str) -> list[str]:
     """Pull the raw legacy.com HTML and extract candidate partner-site URLs.
 
     Returns a list of URLs sorted by priority (obits.al.com first, then
     known funeral-home domains, then anything else that looks obit-related).
+
+    Filters out wrong-person sidebar suggestions: when the source URL
+    slug yields a decedent name (e.g. "Clara-Geneva-Butler"), partner
+    URLs whose slug doesn't share at least the last-name token are
+    rejected. legacy.com aggressively cross-links unrelated obits in a
+    "More Obituaries" sidebar; without this filter we'd happily upgrade
+    James Ronald McFarland → "emma-claros-obituary" because both pass
+    the keyword + obit-marker validation.
     """
     try:
         r = _requests.get(
@@ -181,36 +262,117 @@ def _extract_partner_urls(legacy_person_url: str) -> list[str]:
     if r.status_code != 200:
         return []
 
-    # External hrefs (excluding legacy.com itself)
-    hrefs = _re.findall(
-        r'href=["\'](https?://(?!www\.legacy\.com)(?![\w\-]+\.legacy\.com)'
-        r'(?!sympathy\.legacy)[^"\']+)["\']',
-        r.text,
-    )
+    # All hrefs — we used to exclude every legacy.com URL because the
+    # original intent was "follow only EXTERNAL partner sites". That
+    # broke the most common upgrade path: legacy.com/person/* (preview)
+    # links to legacy.com/us/obituaries/name/* (full obit listing on the
+    # same domain — Clara Geneva Butler's 11 survivors were here all
+    # along, 2026-06-20). Now we include same-site URLs and rely on:
+    #   (1) the URL != legacy_person_url skip below (no self-loops)
+    #   (2) _PARTNER_SKIP_KEYWORDS (sympathy.legacy, cdn.legacy, ads)
+    #   (3) the obit-related keyword filter
+    # to weed out the unhelpful legacy.com URLs (preview pages, sympathy
+    # flower ads, asset CDN, etc.) while keeping the listing pages.
+    hrefs = _re.findall(r'href=["\'](https?://[^"\']+)["\']', r.text)
     candidates: list[str] = []
     seen: set[str] = set()
+    legacy_url_lower = legacy_person_url.lower()
+    decedent_tokens = _decedent_slug_tokens(legacy_person_url)
     for h in hrefs:
         if h in seen:
             continue
         seen.add(h)
         h_lower = h.lower()
+        # No self-loops — don't follow the URL we just fetched
+        if h_lower == legacy_url_lower:
+            continue
+        # No other /person/ preview pages — they're the same data we already have
+        if "/person/" in h_lower:
+            continue
         if any(skip in h_lower for skip in _PARTNER_SKIP_KEYWORDS):
             continue
-        # Must look obit-related
-        if not any(k in h_lower for k in (
-            "obituar", "memorial", "funeral", "tribute", "death",
+        # Skip listing / FAQ / advice / charity / topic pages — they
+        # contain obit-like text (lots of "survived by" etc.) but for
+        # OTHER decedents or generic content. Without this filter,
+        # legacy.com pages like /us/obituaries/local/north-carolina/durham
+        # pass the obit-marker check (they list real Durham obits) and
+        # become the "effective URL" for an AL decedent. Hard-reject.
+        if any(seg in h_lower for seg in (
+            "/local/", "/category/", "/advice/", "/charity/",
+            "/groups/", "/memorial-writing/", "/contact/",
+            "/funeral-homes/",          # listing of funeral homes, not an obit
+            "/articles/", "/blog/",
         )):
             continue
+        # Skip the root listing pages (no slug after /us/obituaries)
+        if h_lower.rstrip("/").endswith("/us/obituaries"):
+            continue
+        # Must look obit-related (the URL slug or path mentions it)
+        if not any(k in h_lower for k in (
+            "obituar", "memorial", "funeral", "tribute", "death",
+            "in-memory", "tribute-archive",
+        )):
+            continue
+
+        # Wrong-decedent filter: legacy.com aggressively cross-links
+        # OTHER decedents' obit pages in a "More Obituaries" sidebar on
+        # every /person/ preview. Without this filter we'd happily
+        # upgrade James Ronald McFarland → `name/emma-claros-obituary`
+        # because emma-claros's page passes every other validity check.
+        #
+        # Three URL patterns expose the slug we can name-check against:
+        #   legacy.com:           /name/{first-last}-obituary?id=...
+        #   dignitymemorial.com:  /obituaries/{city-state}/{first-last}-{id}
+        #   tribute-archive:      /tribute/{first-last}/...
+        # Funeral home roots / regional listings / FAQ pages skip this
+        # check (no decedent slug present, so name-mismatch is moot).
+        if decedent_tokens:
+            slug_match = None
+            for pattern in (
+                r"/name/([a-z][a-z\-]+?)(?:-obituary|/|\?|$)",        # legacy
+                r"/tribute/([a-z][a-z\-]+?)(?:/|\?|$)",                # tribute-archive
+                r"/obituaries/[a-z\-]+/([a-z][a-z\-]+?)-\d",           # dignitymemorial /obituaries/{city}/{first-last}-{id}
+            ):
+                slug_match = _re.search(pattern, h_lower)
+                if slug_match:
+                    break
+            if slug_match:
+                slug_tokens = {t for t in slug_match.group(1).split("-") if len(t) > 2}
+                # Require at least one shared name token (typically the
+                # last name — first names are sometimes nicknamed e.g.
+                # "Jenny" vs "Clara Geneva", so last-name overlap is
+                # the strongest signal).
+                if not (slug_tokens & decedent_tokens):
+                    continue
+
         candidates.append(h)
 
-    # Sort by priority — obits.al.com first, then known funeral-home domains
-    # in priority order, then everything else alphabetically.
-    def _priority(u: str) -> tuple[int, str]:
+    # Sort by priority — known obit domains first, then everything else.
+    # Within the same domain, prefer URLs containing "/name/" (individual
+    # obituary pages) over "/local/" or "/category/" (regional/topical
+    # listings that don't have a survivor list). Was a real bug for
+    # legacy.com: regional listing pages share the same domain as the
+    # individual obit pages, so without this secondary sort the listings
+    # used up the per-URL retry budget before the right page was tried.
+    def _priority(u: str) -> tuple[int, int, str]:
         u_lower = u.lower()
+        domain_rank = len(_PARTNER_DOMAIN_PRIORITY)
         for i, dom in enumerate(_PARTNER_DOMAIN_PRIORITY):
             if dom in u_lower:
-                return (i, u_lower)
-        return (len(_PARTNER_DOMAIN_PRIORITY), u_lower)
+                domain_rank = i
+                break
+        # Secondary rank: individual-obit URL patterns beat listing pages.
+        # 0 = individual obit (/name/, /obituary?id=, /tribute/)
+        # 1 = catch-all
+        # 2 = listing pages (/local/, /category/, /advice/, /us/obituaries/ root)
+        if "/name/" in u_lower or "obituary?id=" in u_lower or "/tribute/" in u_lower:
+            path_rank = 0
+        elif any(seg in u_lower for seg in ("/local/", "/category/", "/advice/",
+                                              "/local-obituaries/", "/regional/")):
+            path_rank = 2
+        else:
+            path_rank = 1
+        return (domain_rank, path_rank, u_lower)
 
     candidates.sort(key=_priority)
     return candidates
@@ -235,17 +397,39 @@ def _fetch_full_obit_text(url: str) -> tuple[str, str]:
         partner_urls = _extract_partner_urls(url)
         if partner_urls:
             logger.debug("Legacy person-page: %d partner URL(s) found", len(partner_urls))
-        for partner_url in partner_urls[:4]:
+        decedent_tokens = _decedent_slug_tokens(url)
+        # Bumped to 6 attempts (was 4): the same-site legacy.com upgrade
+        # path 2026-06-20 can include 2-3 regional/listing pages BEFORE
+        # the actual obit listing, and the secondary path_rank sort fixes
+        # ordering but doesn't guarantee position 1 (some funeral home
+        # URLs may share priority slot). 6 attempts at ~3s each = 18s
+        # worst-case per record, acceptable for a per-day pipeline.
+        for partner_url in partner_urls[:6]:
             partner_text = _fetch_page_text(partner_url)
-            if _looks_like_obituary(partner_text, min_chars=500):
-                logger.debug("Partner-page upgrade: %s → %s (%d chars, obit-marker matched)",
-                             url[-50:], partner_url[-60:], len(partner_text))
-                return (partner_text, partner_url)
-            else:
+            if not _looks_like_obituary(partner_text, min_chars=500):
                 logger.debug(
-                    "Partner-page rejected (len=%d, no obit markers): %s — trying next",
+                    "Partner-page rejected (len=%d, no obit markers): %s",
                     len(partner_text) if partner_text else 0, partner_url,
                 )
+                continue
+            # In-text decedent-name check — last line of defense against
+            # a page that has obit markers but is about somebody else
+            # (the generic /funeral-homes lobby page, a regional listing
+            # that slipped through, etc.). Require the SURNAME (last
+            # slug token) to appear in the page text. Surnames like
+            # "Segrest" or "McFarland" are discriminating; first names
+            # like "James" or "Gregory" appear on too many unrelated
+            # obit pages to be useful filters.
+            decedent_surname = _decedent_surname(url)
+            if decedent_surname and decedent_surname not in partner_text.lower():
+                logger.debug(
+                    "Partner-page rejected (decedent surname '%s' absent): %s",
+                    decedent_surname, partner_url,
+                )
+                continue
+            logger.debug("Partner-page upgrade: %s → %s (%d chars, obit-marker matched)",
+                         url[-50:], partner_url[-60:], len(partner_text))
+            return (partner_text, partner_url)
 
     return (text or "", url)
 
