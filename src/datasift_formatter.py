@@ -1417,6 +1417,82 @@ def _build_row(
     }
 
 
+def _merge_dm_heir_for_upload(dm_row: dict, heir_row: dict) -> dict:
+    """Collapse a (DM, Heir) row pair into one row for the upload CSV.
+
+    DataSift's upload merges incoming rows that share the same Property
+    Street Address — only one survives, and the columns from the loser
+    are silently discarded. The DM row carries the right contact fields
+    (Owner First/Last, Mailing Address, Phone N) but a leaner TAGS
+    footer; the Heir row carries the richer TAGS footer including
+    filter-preset-critical tags (tier_1, in_tier, municipality_*,
+    signing_chain_*, phone_dial_first, heir_of_*) and a SIGNING CHAIN
+    Notes section absent from the DM row. We keep all DM contact
+    columns, splice the heir's SIGNING CHAIN section into the Notes
+    just above the TAGS footer, and replace the TAGS footer with the
+    union of both rows' tag lists.
+
+    Returns a new dict — neither input is mutated.
+    """
+    merged = dict(dm_row)
+
+    dm_notes = dm_row.get("Notes", "") or ""
+    heir_notes = heir_row.get("Notes", "") or ""
+
+    # Split Notes on the "=== TAGS ===" marker so we can rebuild the
+    # footer from the union. Everything before the marker is the
+    # notes body (sections like DECEASED OWNER / DECISION MAKERS /
+    # PROPERTY / PHONE TIERS). Everything after is the comma-separated
+    # tag list (one line, no further sections).
+    def _split_at_tags(notes: str) -> tuple[str, str]:
+        marker = "=== TAGS ==="
+        idx = notes.find(marker)
+        if idx < 0:
+            return notes, ""
+        body = notes[:idx].rstrip("\n")
+        tag_line = notes[idx + len(marker):].lstrip("\n").rstrip()
+        return body, tag_line
+
+    dm_body, dm_tags_line = _split_at_tags(dm_notes)
+    heir_body, heir_tags_line = _split_at_tags(heir_notes)
+
+    # Extract the SIGNING CHAIN section from the heir body and append
+    # it to the DM body. The DM body already has DECEASED OWNER /
+    # DECISION MAKERS / PROPERTY / PHONE TIERS — we only need to add
+    # the SIGNING CHAIN piece that's exclusively on the heir row.
+    signing_section = ""
+    sc_marker = "=== SIGNING CHAIN"
+    sc_start = heir_body.find(sc_marker)
+    if sc_start >= 0:
+        # Section runs until the next "=== " or end of body
+        nxt = heir_body.find("\n=== ", sc_start + 1)
+        signing_section = heir_body[sc_start:nxt if nxt >= 0 else len(heir_body)].rstrip()
+
+    body_parts = [dm_body.rstrip()] if dm_body else []
+    if signing_section and signing_section not in dm_body:
+        body_parts.append(signing_section)
+    merged_body = "\n\n".join(p for p in body_parts if p)
+
+    # Union the two TAGS lines, preserving order, deduping.
+    seen: set[str] = set()
+    merged_tags: list[str] = []
+    for tag_line in (dm_tags_line, heir_tags_line):
+        for tag in (t.strip() for t in tag_line.split(",")):
+            if tag and tag not in seen:
+                seen.add(tag)
+                merged_tags.append(tag)
+
+    merged_notes = merged_body
+    if merged_tags:
+        merged_notes = (
+            f"{merged_body}\n\n=== TAGS ===\n{','.join(merged_tags)}"
+            if merged_body else f"=== TAGS ===\n{','.join(merged_tags)}"
+        )
+
+    merged["Notes"] = merged_notes
+    return merged
+
+
 def write_datasift_csv(
     notices: list[NoticeData],
     filename: str | None = None,
@@ -1516,9 +1592,24 @@ def write_datasift_split_csvs(
 
     # Pre-build every row (DM + heir variants). Each row carries its
     # notice_type so we can sort it into the right per-distressor bucket.
+    #
+    # We build BOTH rows as we always did so the archive CSV preserves
+    # the full picture, but the upload CSV writer below collapses each
+    # (DM, Heir) pair into a SINGLE merged row per notice. Reason: as
+    # of 2026-06-20 the operator confirmed DataSift dedupes uploaded
+    # rows by Property Address — when both DM and Heir rows landed for
+    # the same property, only one survived. The surviving row had the
+    # leaner DM tag footer; the richer Heir-row tags (tier_1, in_tier,
+    # municipality_*, signing_chain_*, phone_dial_first, heir_of_*)
+    # were silently lost, breaking every filter preset that relied on
+    # them. Merging into one row preserves the full TAGS footer and
+    # both notes sections in a single DataSift record.
+    #
+    # `pairs_by_type` keeps DM and Heir rows for the same notice
+    # paired together so the upload writer can merge them deterministically.
     dm_rows_by_type: dict[str, list[dict]] = {}
-    heir_rows_by_type: dict[str, list[dict]] = {}
-    archive_rows: list[dict] = []  # everything, archive only
+    pairs_by_type: dict[str, list[tuple[dict, dict | None]]] = {}
+    archive_rows: list[dict] = []  # everything, archive only — DM + heir
     incomplete = 0
     issue_counts: dict[str, int] = {}
 
@@ -1539,7 +1630,9 @@ def write_datasift_split_csvs(
         dm_rows_by_type.setdefault(nt, []).append(dm_row)
         archive_rows.append(dm_row)
 
-        # Heir rows — only for deceased records with heir_map_json
+        # Heir row — only for deceased records with heir_map_json. Stored
+        # alongside its DM row in pairs_by_type for the merge step below.
+        heir_row: dict | None = None
         if notice.owner_deceased == "yes" and notice.heir_map_json:
             heir_row = _build_row(
                 notice,
@@ -1547,8 +1640,9 @@ def write_datasift_split_csvs(
                 is_heir_row=True,
                 phone_tiers=phone_tiers,
             )
-            heir_rows_by_type.setdefault(nt, []).append(heir_row)
             archive_rows.append(heir_row)
+
+        pairs_by_type.setdefault(nt, []).append((dm_row, heir_row))
 
     results: list[dict] = []
 
@@ -1597,26 +1691,34 @@ def write_datasift_split_csvs(
             continue
 
         upload_path = LEADS_DIR / f"datasift_upload_{nt}_{timestamp}.csv"
-        dm_rows = dm_rows_by_type.get(nt, [])
-        heir_rows = heir_rows_by_type.get(nt, [])
-        total = len(dm_rows) + len(heir_rows)
+        pairs = pairs_by_type.get(nt, [])
+
+        # One row per notice: collapse (DM, Heir) pair into one merged
+        # row when both exist; otherwise just write the DM row alone.
+        # See _merge_dm_heir_for_upload() docstring for why.
+        merged_rows: list[dict] = []
+        merged_with_heir = 0
+        for dm_row, heir_row in pairs:
+            if heir_row is None:
+                merged_rows.append(dm_row)
+            else:
+                merged_rows.append(_merge_dm_heir_for_upload(dm_row, heir_row))
+                merged_with_heir += 1
 
         with open(upload_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
             writer.writeheader()
-            # DM rows first, then heir rows — consistent within each file
-            for row in dm_rows:
-                writer.writerow(row)
-            for row in heir_rows:
+            for row in merged_rows:
                 writer.writerow(row)
 
         swap = should_swap_owners(nt)
         priority = distressor_sort_key(nt)
         logger.info(
             "Upload CSV (%s, list=%s, prio=%d, swap=%s): "
-            "%d DM + %d heir = %d rows → %s",
+            "%d row(s) (%d merged DM+Heir, %d DM-only) → %s",
             nt, list_name, priority, swap,
-            len(dm_rows), len(heir_rows), total, upload_path,
+            len(merged_rows), merged_with_heir,
+            len(merged_rows) - merged_with_heir, upload_path,
         )
 
         results.append({
@@ -1627,8 +1729,8 @@ def write_datasift_split_csvs(
             "list_name": list_name,
             "priority": priority,
             "swap_owners": swap,
-            "dm_count": len(dm_rows),
-            "heir_count": len(heir_rows),
+            "dm_count": len(merged_rows),
+            "heir_count": merged_with_heir,
         })
 
     return results
