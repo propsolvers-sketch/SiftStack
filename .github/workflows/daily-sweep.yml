@@ -30,6 +30,7 @@ on:
 
 permissions:
   contents: write  # required so the job can commit seen_ids.json back
+  actions: read    # Sunday obit-refresh step lists + downloads prior artifacts
 
 jobs:
   daily-sweep:
@@ -189,6 +190,45 @@ jobs:
             --enrich-owner \
             --output-datasift-csv output/leads/datasift_upload_code_violations_${{ steps.run_start.outputs.ts }}.csv \
             2>&1 | tee logs/daily_code_${{ steps.run_start.outputs.ts }}.log
+
+      # ── Sunday-only: obit refresh pass (Mark Jerome Green pattern) ──
+      # Families update legacy.com obituaries after initial publication
+      # (heirs added days/weeks later). Live measurement on 2026-06-19
+      # found 24/37 (65%) of past-week pre-probate obits had MORE
+      # survivors today than when we first extracted them.
+      #
+      # Sundays only:
+      #   - Adds ~3-5 min when it runs (re-fetch + LLM re-extract ~40 obits)
+      #   - Mon-Sat is a no-op
+      #   - Downloads last 14 days of own GHA artifacts so the refresh
+      #     has historical archives to compare against (today's daily
+      #     run alone only produces TODAY's archive)
+      # Delta lands in output/leads/datasift_upload_pre_probate_refresh_*.csv
+      # — daily_finalize globs it + uploads to the Pre-Probate list
+      # automatically (Notice Type column = "pre_probate" routes it).
+      - name: Sunday obit refresh (weekly)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "$(date +%u)" != "7" ]; then
+            echo "Not Sunday ($(date +%A)) - skipping obit refresh pass"
+            exit 0
+          fi
+          echo "Sunday - running obit refresh pass on last 14 days of archives"
+          mkdir -p /tmp/refresh_archives
+          # Pull the last ~15 successful daily-sweep artifacts (covers
+          # ~14 days even if some days were skipped/failed).
+          for RUN in $(gh run list --workflow=daily-sweep.yml --status=success --limit=15 --json databaseId --jq '.[].databaseId'); do
+            gh run download "$RUN" --name "siftstack-output-$RUN" \
+              --dir "/tmp/refresh_archives/run-$RUN" 2>/dev/null \
+              && echo "  pulled run $RUN" \
+              || echo "  skipped run $RUN (no matching artifact)"
+          done
+          python src/obit_refresh_pass.py \
+            --archive-dir /tmp/refresh_archives \
+            --days-back 14 \
+            2>&1 | tee logs/daily_obit_refresh_${{ steps.run_start.outputs.ts }}.log
 
       # ── DataSift session cookies (fixes Loom-modal failure mode) ──
       # Fresh GHA browsers have no DataSift session cookies → DataSift treats
