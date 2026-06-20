@@ -933,9 +933,21 @@ async def upload_csv(
 DATASIFT_RECORDS_URL = "https://app.reisift.io/records/properties"
 
 
-async def _navigate_to_records(page: Page) -> None:
-    """Navigate to the Records page and wait for SPA to render."""
-    if "/records" not in page.url:
+async def _navigate_to_records(page: Page, force: bool = False) -> None:
+    """Navigate to the Records page and wait for SPA to render.
+
+    Args:
+        force: When True, always navigate even if the URL already
+            contains '/records'. Use after upload / enrich / skip-trace
+            actions — those can leave the page on a sub-route or in a
+            broken state (e.g. blank white page after skip-trace dispatch,
+            observed 2026-06-20 when iterating multiple lists) while
+            still showing '/records' in the URL. Forcing a fresh
+            navigation resets the SPA state cleanly. Default False
+            preserves the original "skip nav if already there" behavior
+            for callers that need it.
+    """
+    if force or "/records" not in page.url:
         await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded")
     await page.wait_for_timeout(5000)
     await _dismiss_popups(page)
@@ -1314,8 +1326,16 @@ async def enrich_records(
     logger.info("Starting DataSift enrichment for list: %s", list_name)
 
     try:
-        # Navigate to Records
-        await _navigate_to_records(page)
+        # Navigate to Records — force a fresh page load. Without
+        # force=True, multi-list runs (e.g. Foreclosure → Probate →
+        # Pre-Probate in sequence) leave the page on /records/... in
+        # a broken / blank state after each list's skip-trace
+        # dispatch. The URL still contains "/records" so the
+        # conditional skip in _navigate_to_records short-circuits
+        # and the next list iteration runs against the broken page.
+        # Observed 2026-06-20: Foreclosure succeeded, Probate +
+        # Pre-Probate failed with empty white-page screenshots.
+        await _navigate_to_records(page, force=True)
 
         # Filter to the uploaded list
         filtered = await _filter_by_list(page, list_name)
@@ -1485,8 +1505,9 @@ async def skip_trace_records(page: Page, list_name: str) -> dict:
     logger.info("Starting DataSift skip trace for list: %s", list_name)
 
     try:
-        # Navigate to Records (may already be there from enrichment)
-        await _navigate_to_records(page)
+        # Navigate to Records — force a fresh page load (see
+        # enrich_records for the multi-list iteration rationale).
+        await _navigate_to_records(page, force=True)
 
         # Filter to the uploaded list
         filtered = await _filter_by_list(page, list_name)
