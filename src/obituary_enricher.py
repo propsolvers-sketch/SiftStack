@@ -987,43 +987,76 @@ Web page text:
 {page_text}"""
 
 
-def _lookup_dm_address_knox_tax(name: str) -> dict | None:
-    """Search Knox County tax API by DM name for a property address.
+def _lookup_dm_address_jefferson_tax(name: str) -> dict | None:
+    """Search Jefferson County E-Ring API by DM name for mailing address.
 
-    The /parcels/ endpoint accepts owner name searches.
-    Returns {street, city, state, zip} or None.
+    Unlike the Knox/Madison/Marshall adapters whose responses only expose
+    the situs (property) address, Jefferson's E-Ring response includes
+    BOTH situs_address (where the property is) AND mailing_address
+    (where the tax bill goes). For DM-lookup purposes, mailing_address
+    is what we want — it's where the owner actually receives mail, often
+    where they live.
+
+    Match priority:
+      1. Homestead-flagged record (owner-occupied — mailing_address is
+         almost certainly where they live)
+      2. First record with a non-empty mailing_address
+
+    Returns {street, city, state, zip, source} or None.
     """
-    from urllib.parse import quote
-
-    search_url = f"{KNOX_TAX_API}/parcels/{quote(name)}?detail_level=public&start=0&length=3"
     try:
-        resp = requests.get(search_url, timeout=10)
-        if resp.status_code == 404:
-            return None
-        resp.raise_for_status()
-        data = resp.json()
-        parcels = data.get("parcels", [])
-        if not parcels:
-            return None
-
-        # Take first result — check owner name roughly matches
-        p = parcels[0]
-        addr = p.get("parcel_address", "").strip()
-        if not addr:
-            return None
-
-        # parcel_address is just the street — we need city/zip from other sources
-        # The tax API doesn't provide city/zip reliably, so return street only
-        # and let Smarty fill in city/state/zip later
-        logger.debug("Knox tax API found address for %s: %s", name, addr)
-        # Knox is in TN — derive via state_for_county() to keep the
-        # county→state mapping centralized.
-        from state_resolver import state_for_county
-        return {"street": addr, "city": "Knoxville",
-                "state": state_for_county("knox"), "zip": ""}
-    except Exception as e:
-        logger.debug("Knox tax API DM lookup failed for %s: %s", name, e)
+        from jefferson_property_api import search_by_owner_name
+    except ImportError:
+        logger.debug("jefferson_property_api not available — skipping JC tax DM tier")
         return None
+
+    name_clean = (name or "").strip()
+    if not name_clean:
+        return None
+
+    # Jefferson search expects last-name-first format. Convert "Jane Doe"
+    # → "DOE JANE" (the API normalizes whitespace internally). Single-word
+    # input is searched as-is.
+    parts = name_clean.split()
+    if len(parts) >= 2:
+        last_first = f"{parts[-1]} {' '.join(parts[:-1])}"
+    else:
+        last_first = name_clean
+
+    try:
+        records = search_by_owner_name(last_first)
+    except Exception as e:
+        logger.debug("Jefferson tax DM lookup failed for %s: %s", name, e)
+        return None
+
+    if not records:
+        return None
+
+    # Pick the best record: prefer homestead-flagged (owner-occupied);
+    # otherwise first one with a populated mailing_address.
+    chosen = None
+    for r in records:
+        if r.is_homestead and (r.mailing_address or "").strip():
+            chosen = r
+            break
+    if chosen is None:
+        for r in records:
+            if (r.mailing_address or "").strip():
+                chosen = r
+                break
+    if chosen is None:
+        return None
+
+    from state_resolver import state_for_county
+    return {
+        "street": (chosen.mailing_address or "").strip(),
+        "city": (chosen.mailing_city or "").strip(),
+        # Jefferson's mailing_state can be any US state (out-of-state
+        # landlords are common). Trust the assessor's printed value but
+        # default to AL via state_for_county when it's missing.
+        "state": (chosen.mailing_state or "").strip() or state_for_county("jefferson"),
+        "zip": (chosen.mailing_zip or "").strip(),
+    }
 
 
 def _lookup_dm_address_web(
@@ -1078,10 +1111,20 @@ def _lookup_dm_address_web(
                     if street and parsed.get("confidence") in ("high", "medium"):
                         logger.info("  People search found address for %s: %s, %s",
                                     name, street, parsed.get("city", ""))
+                        # Layer 3 (2026-06-20): validate LLM-extracted
+                        # state against page text. See
+                        # _extract_address_from_page() docstring for the
+                        # full rationale — same rule.
+                        from state_resolver import validate_person_state
+                        validated_state = validate_person_state(
+                            parsed.get("state"),
+                            page_text,
+                            fallback_state=state_code or "",
+                        )
                         return {
                             "street": street,
                             "city": parsed.get("city", ""),
-                            "state": parsed.get("state", state_code),
+                            "state": validated_state,
                             "zip": parsed.get("zip", ""),
                         }
             except Exception as e:
@@ -1306,7 +1349,19 @@ def _extract_address_from_page(
     page_text: str, name: str, city: str, api_key: str,
     state_full: str = "Tennessee", state_code: str = "TN",
 ) -> dict | None:
-    """Use Claude Haiku to extract a mailing address from page text."""
+    """Use Claude Haiku to extract a mailing address from page text.
+
+    Layer 3 boundary validation (2026-06-20): the LLM's extracted state
+    is validated against the source page_text via
+    state_resolver.validate_person_state(). Trusts the LLM's state ONLY
+    when it literally appears in the page text (the 2-letter abbrev or
+    full name like "Tennessee", "California", "N.Y."). This catches
+    Claude hallucinations — same rule used for owner_state in the AL
+    probate parser. Real out-of-state addresses (CA executor, TN heir
+    of an AL decedent) pass cleanly because their state always appears
+    in the printed people-search address. Falls back to state_code on
+    rejection (the lookup's county-context default).
+    """
     prompt = ADDRESS_EXTRACT_PROMPT.format(
         name=name,
         city=city or "Knoxville",
@@ -1321,10 +1376,16 @@ def _extract_address_from_page(
 
         street = parsed.get("street", "").strip()
         if street and parsed.get("confidence") in ("high", "medium"):
+            from state_resolver import validate_person_state
+            validated_state = validate_person_state(
+                parsed.get("state"),
+                page_text,
+                fallback_state=state_code or "",
+            )
             return {
                 "street": street,
                 "city": parsed.get("city", ""),
-                "state": parsed.get("state", state_code),
+                "state": validated_state,
                 "zip": parsed.get("zip", ""),
             }
     except Exception as e:
@@ -1591,15 +1652,36 @@ def _batch_tracerfy_lookup(notices: list) -> None:
 def _lookup_dm_address(
     name: str, city: str, api_key: str, tracerfy_tier1: bool = False,
     state_full: str = "Tennessee", state_code: str = "TN",
+    county: str = "",
 ) -> dict:
     """Look up decision-maker's mailing address using tiered sources.
 
     Tier 0 (opt-in): Tracerfy skip tracing (paid, highest hit rate)
-    Tier 1: Knox County Tax API (free, fast, Knox only)
+    Tier 1: County-routed tax-API lookup. Jefferson is the only active
+              county with a usable tier here — its E-Ring API returns
+              real mailing address (separate from situs). Madison and
+              Marshall fall through because their AssuranceWeb adapters
+              only return situs (property address), not mailing.
     Tier 2: Serper.dev + Firecrawl + LLM (cheap, national)
-    Tier 2b: DuckDuckGo fallback (free, unreliable -- used when Serper not configured)
+    Tier 2b: DuckDuckGo fallback (free, unreliable — when Serper not set)
 
-    Returns {street, city, state, zip, source} (may have empty values).
+    Args:
+        name: Decision-maker / heir full name.
+        city: City hint (optional). Used as a search-narrow argument
+            for the LLM tiers.
+        api_key: Anthropic API key for the LLM extraction tiers.
+        tracerfy_tier1: Opt into Tier 0 Tracerfy lookup. Off by default.
+        state_full / state_code: Expected state for the LLM-tier search
+            (e.g. "Alabama" / "AL"). Drives the people-search query
+            narrowing AND the Layer 3 fallback when LLM returns a
+            hallucinated / missing state.
+        county: The decedent's / notice's county. Drives Tier 1 routing.
+            Empty / non-Jefferson values skip Tier 1 and go straight
+            to the LLM-based national people-search tiers.
+
+    Returns:
+        {street, city, state, zip, source} dict — fields may be empty
+        when no tier hit.
     """
     result = {"street": "", "city": "", "state": "", "zip": "", "source": ""}
 
@@ -1621,20 +1703,24 @@ def _lookup_dm_address(
                             result["street"], result["city"])
                 return result
 
-    # Tier 1: Knox County Tax API (free, fast)
-    knox_cities = {"knoxville", "powell", "corryton", "mascot", "halls",
-                   "farragut", "karns", "gibbs", "fountain city"}
-    dm_city = (city or "").lower().strip()
-    if not dm_city or dm_city in knox_cities:
-        name_parts = name.split()
-        if len(name_parts) >= 2:
-            tax_name = f"{name_parts[-1]} {' '.join(name_parts[:-1])}"
-            tax_result = _lookup_dm_address_knox_tax(tax_name)
-            if tax_result and tax_result.get("street"):
-                result.update(tax_result)
-                result["source"] = "knox_tax_api"
-                logger.info("    Tier 1 (Knox Tax): %s", result["street"])
-                return result
+    # Tier 1: County-routed tax-API lookup. Jefferson today; future AL
+    # counties drop in by adding a branch + their own _lookup_dm_address_*
+    # helper. Madison/Marshall don't qualify — their search responses
+    # lack mailing_address, so they'd return situs (the property's
+    # location), which lies when the heir inherited property they don't
+    # live in. Per operator decision 2026-06-20, those counties skip
+    # Tier 1 and let the LLM-based people-search find where the person
+    # actually lives.
+    county_lc = (county or "").lower().strip()
+    if county_lc == "jefferson":
+        jc_result = _lookup_dm_address_jefferson_tax(name)
+        if jc_result and jc_result.get("street"):
+            result.update(jc_result)
+            result["source"] = "jefferson_tax_api"
+            logger.info("    Tier 1 (Jefferson Tax): %s, %s %s %s",
+                        result["street"], result["city"],
+                        result["state"], result["zip"])
+            return result
         time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
 
     # Tier 2: Direct people search URLs + Firecrawl + LLM
@@ -1666,7 +1752,6 @@ def _lookup_dm_address(
     return result
 
 
-KNOX_TAX_API = "https://knox-tn.mygovonline.com/api/v2"
 REQUEST_DELAY_MIN = 1.0
 REQUEST_DELAY_MAX = 2.0
 
@@ -3340,7 +3425,8 @@ def enrich_obituary_data(
                 addr = _lookup_dm_address(dm_name, dm_city_hint, api_key,
                                           tracerfy_tier1=tracerfy_tier1,
                                           state_full=state_full,
-                                          state_code=state_code)
+                                          state_code=state_code,
+                                          county=(notice.county or ""))
                 if addr.get("street"):
                     dm.update(addr)
                     source = addr.get("source", "unknown")

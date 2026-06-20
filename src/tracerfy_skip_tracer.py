@@ -168,6 +168,7 @@ def _lookup_missing_heir_addresses(
         try:
             addr = _lookup_dm_address(
                 heir_name, city_hint, api_key or "", tracerfy_tier1=False,
+                county=(notice.county or ""),
             )
         except Exception as e:
             logger.debug("Heir address lookup failed for %s: %s", heir_name, e)
