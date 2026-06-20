@@ -484,8 +484,17 @@ def calculate_holding_costs(purchase_price: float, rehab_months: float,
     )
 
 
-def calculate_selling_costs(sale_price: float, state: str = "TN") -> SellingCosts:
-    """Calculate costs to sell the property."""
+def calculate_selling_costs(sale_price: float, state: str = "") -> SellingCosts:
+    """Calculate costs to sell the property.
+
+    Empty state falls back to DEFAULT_PROPERTY_STATE (currently AL).
+    SiftStack pipeline callers pass state explicitly from the record;
+    the fallback is for REI Skill plugin callers (Co-Work sessions)
+    where state may be omitted.
+    """
+    if not state:
+        from state_resolver import DEFAULT_PROPERTY_STATE
+        state = DEFAULT_PROPERTY_STATE
     commission = sale_price * DEFAULT_AGENT_COMMISSION
     closing = sale_price * DEFAULT_CLOSING_COSTS_PCT
     transfer = sale_price * transfer_tax_pct(state)
@@ -2246,7 +2255,7 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
 
 # ── Main entry point ──────────────────────────────────────────────────
 
-def run_deal_analysis(address: str, city: str = "", state: str = "TN",
+def run_deal_analysis(address: str, city: str = "", state: str = "",
                       zip_code: str = "", purchase_price: float = 0,
                       rehab_tier: int = 2, exit_strategy: str = "flip",
                       region: str = DEFAULT_REGION,
@@ -2255,8 +2264,13 @@ def run_deal_analysis(address: str, city: str = "", state: str = "TN",
                       output_path: str = "") -> dict:
     """Run complete deal analysis: comp → rehab → MAO → projections → report.
 
-    Returns dict with the DealPackage and report path.
+    Returns dict with the DealPackage and report path. Empty state
+    falls back to DEFAULT_PROPERTY_STATE (currently AL — single knob
+    to flip when scaling to new states).
     """
+    if not state:
+        from state_resolver import DEFAULT_PROPERTY_STATE
+        state = DEFAULT_PROPERTY_STATE
     logger.info("Starting deal analysis for: %s", address)
 
     # Step 1: Fetch subject property

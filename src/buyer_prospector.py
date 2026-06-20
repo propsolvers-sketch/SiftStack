@@ -377,13 +377,19 @@ def export_buyers_csv(investors: list[InvestorProfile], output_path: str = "") -
     headers = ["owner_name", "address", "city", "state", "zip", "tags", "lists", "notes"]
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=headers)
+        # Buyer state defaults to the active primary state — buyers in
+        # this list invest in that state's properties (primary_zip is
+        # in-market). DEFAULT_PROPERTY_STATE is the single knob for
+        # scaling to new states.
+        from state_resolver import DEFAULT_PROPERTY_STATE
+        buyer_state = DEFAULT_PROPERTY_STATE
         writer.writeheader()
         for inv in investors[:100]:
             writer.writerow({
                 "owner_name": inv.person_behind or inv.name,
                 "address": "",
                 "city": "",
-                "state": "TN",
+                "state": buyer_state,
                 "zip": inv.primary_zip,
                 "tags": f"buyer,{inv.buyer_type},buyer_score_{round(inv.score)}",
                 "lists": "Cash Buyers",

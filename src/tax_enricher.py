@@ -570,17 +570,25 @@ def _probate_property_lookup(notices: list[NoticeData]) -> None:
             logger.info("  Tier 3 (People Search): %s", people_addr)
             notice.address = people_addr
             notice.city = "Knoxville"
-            notice.state = "TN"
+            # Knox is in TN — this path is upstream-gated on county.lower()
+            # == "knox", so notice.state = "TN" here is intentional, not a
+            # leftover default. Derive via state_for_county() so the
+            # mapping is centralized rather than hardcoded.
+            from state_resolver import state_for_county
+            notice.state = state_for_county("knox")
             continue
 
         logger.warning("  No property found for decedent: %s (all tiers exhausted)", decedent)
 
 
 def _apply_parcel_to_notice(notice: NoticeData, parcel: dict) -> None:
-    """Apply parcel data from Knox Tax API to a notice."""
+    """Apply parcel data from Knox Tax API to a notice. Knox is in TN
+    — state is derived via state_for_county() rather than hardcoded
+    so the county→state mapping stays centralized."""
     notice.address = parcel.get("parcel_address", "")
     notice.city = "Knoxville"
-    notice.state = "TN"
+    from state_resolver import state_for_county
+    notice.state = state_for_county("knox")
     account = parcel.get("account_number", "")
     if account:
         notice.parcel_id = account

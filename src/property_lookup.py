@@ -508,7 +508,12 @@ async def lookup_decedent_properties(notices: list) -> None:
                         raw_addr = _normalize_tpad_address(raw_addr)
 
                     notice.address = raw_addr
-                    notice.state = "TN"
+                    # Knox + Blount are both TN — this branch is gated on
+                    # `notice.county.lower() in ("knox","blount")`. Derive
+                    # via state_for_county() so the mapping stays in one
+                    # place; either county resolves to "TN".
+                    from state_resolver import state_for_county
+                    notice.state = state_for_county(notice.county)
 
                     # For Knox, KGIS results don't include city/zip in search list
                     # We'll rely on Smarty standardization to fill those in

@@ -253,8 +253,15 @@ def export_mail_list(records: list[dict], output_path: str = "") -> str:
                            rec.get("address") or rec.get("Property Street") or "")
             mail_city = (rec.get("owner_city") or rec.get("decision_maker_city") or
                          rec.get("city") or rec.get("Property City") or "")
-            mail_state = (rec.get("owner_state") or rec.get("decision_maker_state") or
-                          rec.get("state") or "TN")
+            # Fall through chain: prefer mailing state, then DM state, then
+            # property state, then derive from County via state_resolver
+            # (single knob for active primary state). Avoids silently
+            # stamping every state-less record TN as the legacy code did.
+            from state_resolver import state_for_county
+            mail_state = (
+                rec.get("owner_state") or rec.get("decision_maker_state") or
+                rec.get("state") or state_for_county(rec.get("county") or rec.get("County"))
+            )
             mail_zip = (rec.get("owner_zip") or rec.get("decision_maker_zip") or
                         rec.get("zip") or rec.get("Property ZIP") or "")
 

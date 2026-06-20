@@ -76,7 +76,10 @@ class SubjectProperty:
     """The property being analyzed."""
     address: str = ""
     city: str = ""
-    state: str = "TN"
+    # Empty default — populated by fetch_subject_property() from the
+    # property record or CLI args. Was "TN" historically; emptied so
+    # missing-state isn't silently TN-stamped on AL properties.
+    state: str = ""
     zip_code: str = ""
     latitude: float = 0.0
     longitude: float = 0.0
@@ -99,7 +102,9 @@ class CompProperty:
     """A comparable property with sale data."""
     address: str = ""
     city: str = ""
-    state: str = "TN"
+    # Empty default — populated by the API response (OpenWeb Ninja
+    # returns the actual state per comparable). Was "TN" historically.
+    state: str = ""
     zip_code: str = ""
     latitude: float = 0.0
     longitude: float = 0.0
@@ -190,9 +195,15 @@ def _api_get(endpoint: str, params: dict, api_key: str) -> dict | None:
     return None
 
 
-def fetch_subject_property(address: str, city: str = "", state: str = "TN",
+def fetch_subject_property(address: str, city: str = "", state: str = "",
                            zip_code: str = "", api_key: str = "") -> SubjectProperty | None:
-    """Fetch full property details for the subject property."""
+    """Fetch full property details for the subject property.
+
+    Empty state falls back to DEFAULT_PROPERTY_STATE (currently AL).
+    """
+    if not state:
+        from state_resolver import DEFAULT_PROPERTY_STATE
+        state = DEFAULT_PROPERTY_STATE
     api_key = api_key or config.OPENWEBNINJA_API_KEY
     if not api_key:
         logger.error("No OpenWeb Ninja API key configured")
@@ -1415,14 +1426,18 @@ def generate_comp_report(subject: SubjectProperty, comps: list[CompProperty],
 
 # ── Main entry point ──────────────────────────────────────────────────
 
-def run_comp_analysis(address: str, city: str = "", state: str = "TN",
+def run_comp_analysis(address: str, city: str = "", state: str = "",
                       zip_code: str = "", radius: float = DEFAULT_RADIUS_MILES,
                       months: int = DEFAULT_MONTHS_BACK,
                       output_path: str = "") -> dict:
     """Run a full comp analysis for a property and generate the report.
 
-    Returns a dict with ARV results and the output file path.
+    Returns a dict with ARV results and the output file path. Empty
+    state falls back to DEFAULT_PROPERTY_STATE (currently AL).
     """
+    if not state:
+        from state_resolver import DEFAULT_PROPERTY_STATE
+        state = DEFAULT_PROPERTY_STATE
     logger.info("Starting comp analysis for: %s %s %s %s", address, city, state, zip_code)
 
     # Step 1: Fetch subject property details

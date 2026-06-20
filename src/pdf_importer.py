@@ -266,13 +266,17 @@ def process_pdf(
         # Free memory
         del corrected, image
 
-    # Convert to NoticeData
+    # Convert to NoticeData. PDF importer was originally Knox-only (TN),
+    # but is now county-parameterized — derive state from county via
+    # the resolver so AL PDFs land with AL state, etc.
+    from state_resolver import state_for_county
+    pdf_state = state_for_county(county)
     notices = []
     for row in all_rows:
         notice = NoticeData(
             address=row["address"],
             city=default_city,
-            state="TN",
+            state=pdf_state,
             owner_name=row.get("owner_name", ""),
             notice_type="tax_sale",
             county=county,

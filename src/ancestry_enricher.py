@@ -259,9 +259,15 @@ async def close_browser(pw, context):
 # ── Search: SSDI ────────────────────────────────────────────────────
 
 
-async def _search_ssdi(page, first_name: str, last_name: str, state: str = "TN",
+async def _search_ssdi(page, first_name: str, last_name: str, state: str = "",
                        middle_initial: str = "", city: str = "") -> dict | None:
-    """Search SSDI death index. Returns structured result or None."""
+    """Search SSDI death index. Returns structured result or None.
+
+    Empty state falls back to DEFAULT_PROPERTY_STATE (currently AL).
+    """
+    if not state:
+        from state_resolver import DEFAULT_PROPERTY_STATE
+        state = DEFAULT_PROPERTY_STATE
     if not _can_load_page() or _circuit_broken:
         return None
 
@@ -499,7 +505,7 @@ async def _parse_ssdi_results(page) -> list[dict]:
 # ── Search: Ancestry obituary collection ────────────────────────────
 
 
-async def _search_obituaries(page, first_name: str, last_name: str, state: str = "TN",
+async def _search_obituaries(page, first_name: str, last_name: str, state: str = "",
                              city: str = "", middle_initial: str = "") -> dict | None:
     """Search Ancestry obituary collection via direct URL. Returns result or None."""
     if not _can_load_page() or _circuit_broken:
@@ -624,7 +630,7 @@ async def _search_obituaries(page, first_name: str, last_name: str, state: str =
     }
 
 
-async def _search_newspapers(page, first_name: str, last_name: str, state: str = "TN",
+async def _search_newspapers(page, first_name: str, last_name: str, state: str = "",
                               city: str = "", middle_initial: str = "") -> dict | None:
     """Search Newspapers.com obituary index via All-Access SSO (Tier 3).
 
@@ -1064,13 +1070,19 @@ def _name_matches(first: str, last: str, full_name: str, middle_initial: str = "
     return True
 
 
-def _location_matches(location: str, state: str = "TN", city: str = "") -> tuple[bool, int]:
+def _location_matches(location: str, state: str = "", city: str = "") -> tuple[bool, int]:
     """Check if an SSDI result location matches our target area.
 
     Returns (matches, score):
       - matches: False if location contradicts target (wrong state)
       - score: 0 = no location data, 1 = right state, 2 = right county/city
     """
+    # Empty state would make the substring check at line 1092 always pass
+    # ("" in any string == True), defeating the state filter. Fall back
+    # to active primary state when caller omits.
+    if not state:
+        from state_resolver import DEFAULT_PROPERTY_STATE
+        state = DEFAULT_PROPERTY_STATE
     loc_lower = location.lower().strip()
     state_names = {
         "TN": "tennessee", "AL": "alabama", "GA": "georgia",
@@ -1152,7 +1164,7 @@ async def lookup_deceased(
     page,
     name: str,
     city: str = "",
-    state: str = "TN",
+    state: str = "",
 ) -> dict | None:
     """Search Ancestry for a deceased person. Returns structured result or None.
 
@@ -1172,6 +1184,15 @@ async def lookup_deceased(
     """
     if _circuit_broken or not _can_load_page():
         return None
+
+    # Resolve empty state to DEFAULT_PROPERTY_STATE — Ancestry's
+    # search forms need a value to populate the "Lived In Location"
+    # narrowing field. Both real callers (benchmark_obituary_match,
+    # obituary_enricher) pass state="AL" explicitly today, but the
+    # fallback keeps standalone test invocations working.
+    if not state:
+        from state_resolver import DEFAULT_PROPERTY_STATE
+        state = DEFAULT_PROPERTY_STATE
 
     # Parse name into components
     first_name, middle_initial, last_name = _parse_owner_name(name)

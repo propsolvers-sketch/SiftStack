@@ -219,3 +219,26 @@ def _normalize_state_name(name: str) -> str | None:
             if upper == lit.upper():
                 return abbrev
     return None
+
+
+def state_full_name(abbrev: str | None) -> str:
+    """Return the full state name for a 2-letter abbreviation.
+
+    Used by obituary / SSDI / Ancestry search code where the form
+    field accepts the full state name ("Alabama" not "AL"). Falls
+    back to the full name of DEFAULT_PROPERTY_STATE when input is
+    empty or unrecognized.
+    """
+    if not abbrev:
+        abbrev = DEFAULT_PROPERTY_STATE
+    abbrev_upper = abbrev.strip().upper()
+    # The first non-abbrev entry in _STATE_LITERALS is the canonical
+    # full name (e.g. "Alabama"). Skip the 2-letter abbrev itself.
+    literals = _STATE_LITERALS.get(abbrev_upper)
+    if not literals:
+        # Unknown abbrev — fall back to the default's full name.
+        literals = _STATE_LITERALS[DEFAULT_PROPERTY_STATE]
+    for lit in literals:
+        if len(lit) > 2:
+            return lit
+    return abbrev_upper

@@ -1016,7 +1016,11 @@ def _lookup_dm_address_knox_tax(name: str) -> dict | None:
         # The tax API doesn't provide city/zip reliably, so return street only
         # and let Smarty fill in city/state/zip later
         logger.debug("Knox tax API found address for %s: %s", name, addr)
-        return {"street": addr, "city": "Knoxville", "state": "TN", "zip": ""}
+        # Knox is in TN — derive via state_for_county() to keep the
+        # county→state mapping centralized.
+        from state_resolver import state_for_county
+        return {"street": addr, "city": "Knoxville",
+                "state": state_for_county("knox"), "zip": ""}
     except Exception as e:
         logger.debug("Knox tax API DM lookup failed for %s: %s", name, e)
         return None

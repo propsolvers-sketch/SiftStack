@@ -1476,8 +1476,10 @@ def cli_main() -> None:
                         help="Property address (comp/rehab/analyze-deal modes)")
     parser.add_argument("--city", type=str, default=None,
                         help="Property city (comp/rehab/analyze-deal modes)")
-    parser.add_argument("--state", type=str, default="TN",
-                        help="Property state (comp/analyze-deal modes, default: TN)")
+    parser.add_argument("--state", type=str, default=None,
+                        help="Property state (comp/analyze-deal modes). "
+                             "Default: state_resolver.DEFAULT_PROPERTY_STATE "
+                             "(currently AL — single knob to flip when scaling to new states).")
     parser.add_argument("--zip-code", type=str, default=None,
                         help="Property ZIP code (comp/rehab/analyze-deal modes)")
     parser.add_argument("--radius", type=float, default=0.5,
@@ -1563,6 +1565,15 @@ def cli_main() -> None:
                         help="Team size 1/2/5 (playbook mode)")
 
     args = parser.parse_args()
+
+    # Resolve --state default via the single state_resolver knob. None ←
+    # argparse default → DEFAULT_PROPERTY_STATE ("AL" today). When the
+    # business scales into TN/GA/MS/etc. next year, flip the constant
+    # and every comp/deal/analyze invocation gets the new default
+    # without touching argparse code here.
+    if hasattr(args, "state") and not args.state:
+        from state_resolver import DEFAULT_PROPERTY_STATE
+        args.state = DEFAULT_PROPERTY_STATE
 
     # Apply LLM backend override from CLI flag
     if hasattr(args, "llm_backend") and args.llm_backend:
@@ -1672,7 +1683,7 @@ def cli_main() -> None:
         else:
             # Fall back to CLI overrides if format doesn't match the canonical one
             city = args.city or ""
-            state = args.state if args.state != "TN" else (args.state or "")
+            state = args.state or ""
             zipc = args.zip_code or ""
             if not (city and state and zipc):
                 print("ERROR: Could not parse address. Use either:")

@@ -211,11 +211,16 @@ def process_photos(
             except Exception as e:
                 logger.warning("LLM parsing failed for %s: %s", path.name, e)
 
-        # Build NoticeData from parsed fields
+        # Build NoticeData from parsed fields. State falls through:
+        # LLM-extracted state → state_for_county(county). Centralized
+        # mapping replaces the legacy "TN" hardcode so AL photo imports
+        # (Jefferson/Madison/Marshall courthouse photos) land with the
+        # correct state automatically.
+        from state_resolver import state_for_county
         notice = NoticeData(
             address=parsed.get("address", ""),
             city=parsed.get("city", ""),
-            state=parsed.get("state", "TN"),
+            state=parsed.get("state") or state_for_county(county),
             zip=parsed.get("zip", ""),
             owner_name=parsed.get("owner_name", ""),
             notice_type=notice_type,
