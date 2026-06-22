@@ -1422,6 +1422,90 @@ def _to_notice_data(r: PreProbateResult) -> NoticeData:
     return notice
 
 
+def _fill_missing_dm_mailing(notices: list[NoticeData]) -> dict:
+    """Fill `decision_maker_street/city/state/zip` for notices where the
+    DM was identified from the obituary but no mailing address landed
+    via Tracerfy.
+
+    Pre-probate's only mailing-fill path was Tracerfy until 2026-06-21,
+    so when Tracerfy missed or returned partial data the row went out
+    with `Mailing Street Address` etc. empty — and downstream skip-
+    trace / Trestle / filter presets all need those columns. The
+    2026-06-20 Pre-Probate batch had 7/20 (35%) rows in that state.
+
+    Uses the same county-routed waterfall as post-probate
+    (``obituary_enricher._lookup_dm_address`` — Tier 1 Jefferson tax
+    API, Tier 2 Serper+Firecrawl+LLM with Layer 3 source-text-anchored
+    state validation, Tier 2b DDG fallback). County is threaded from
+    each notice so Jefferson notices hit Jefferson Tier 1 directly;
+    Madison/Marshall fall through to the LLM tiers (their tax APIs
+    only expose situs, not mailing, per the 2026-06-20 audit).
+
+    Returns a small stats dict for the caller's funnel.
+    """
+    import os
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        logger.debug("No ANTHROPIC_API_KEY — skipping DM-mailing fallback")
+        return {"attempted": 0, "filled": 0, "skipped_no_api_key": True}
+
+    try:
+        from obituary_enricher import _lookup_dm_address
+    except ImportError:
+        logger.debug("obituary_enricher import failed — skipping DM-mailing fallback")
+        return {"attempted": 0, "filled": 0, "skipped_import_failed": True}
+
+    attempted = 0
+    filled = 0
+    for notice in notices:
+        # Only fill when DM is known but mailing isn't
+        if not (notice.decision_maker_name or "").strip():
+            continue
+        if (notice.decision_maker_street or "").strip():
+            continue
+        attempted += 1
+        try:
+            addr = _lookup_dm_address(
+                notice.decision_maker_name,
+                notice.city or "",
+                api_key,
+                tracerfy_tier1=False,
+                county=(notice.county or ""),
+            )
+        except Exception as e:
+            logger.debug(
+                "DM-mailing lookup failed for %s: %s",
+                notice.decision_maker_name, e,
+            )
+            continue
+        street = (addr.get("street") or "").strip()
+        if not street:
+            continue
+        notice.decision_maker_street = street
+        notice.decision_maker_city = (addr.get("city") or "").strip()
+        # State falls back to notice.state (which goes through the
+        # state_resolver path at notice-creation time) when the
+        # waterfall didn't return one.
+        notice.decision_maker_state = (
+            (addr.get("state") or "").strip() or (notice.state or "AL")
+        )
+        notice.decision_maker_zip = (addr.get("zip") or "").strip()
+        filled += 1
+        logger.info(
+            "  DM-mailing fallback (%s): %s -> %s, %s %s %s",
+            addr.get("source", "?"), notice.decision_maker_name,
+            street, notice.decision_maker_city,
+            notice.decision_maker_state, notice.decision_maker_zip,
+        )
+
+    if attempted:
+        logger.info(
+            "DM-mailing fallback complete: %d/%d filled via _lookup_dm_address",
+            filled, attempted,
+        )
+    return {"attempted": attempted, "filled": filled}
+
+
 def prepare_notices(
     results: list[PreProbateResult],
     enriched_only: bool = True,
@@ -1452,6 +1536,14 @@ def prepare_notices(
                 stats.get("phones_found", 0), stats.get("emails_found", 0),
                 stats.get("cost", 0.0),
             )
+            # Tracerfy fills mailing on hits — for misses, fall through to
+            # the DM-lookup waterfall (Jefferson tax / Serper+LLM). Without
+            # this fallback, ~35% of pre-probate rows ship with empty
+            # Mailing Street Address (observed 2026-06-20) and downstream
+            # phone enrichment can't find them.
+            mailing_fill_stats = _fill_missing_dm_mailing(notices)
+            if mailing_fill_stats.get("attempted"):
+                stats["dm_mailing_fallback"] = mailing_fill_stats
             for n in notices:
                 _promote_heir_contacts_to_csv_slots(n)
             if funnel is not None:
