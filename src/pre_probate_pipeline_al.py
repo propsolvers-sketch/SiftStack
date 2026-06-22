@@ -1490,6 +1490,10 @@ def _fill_missing_dm_mailing(notices: list[NoticeData]) -> dict:
             (addr.get("state") or "").strip() or (notice.state or "AL")
         )
         notice.decision_maker_zip = (addr.get("zip") or "").strip()
+        # Record source — see notice_parser.NoticeData.dm_mailing_source.
+        # The formatter uses this to suppress has_dm_address for
+        # placeholders and to emit mailing_unverified for property_fallback.
+        notice.dm_mailing_source = (addr.get("source") or "people_search").strip()
         filled += 1
         logger.info(
             "  DM-mailing fallback (%s): %s -> %s, %s %s %s",
@@ -1504,6 +1508,56 @@ def _fill_missing_dm_mailing(notices: list[NoticeData]) -> dict:
             filled, attempted,
         )
     return {"attempted": attempted, "filled": filled}
+
+
+def _fallback_dm_mailing_to_property(notices: list[NoticeData]) -> dict:
+    """Last-resort: copy property address into DM mailing when both
+    Tracerfy AND the _lookup_dm_address waterfall came up empty.
+
+    Per operator decision 2026-06-21, every record should leave the
+    pipeline with SOMETHING populated in the Mailing fields so:
+      - Downstream Tracerfy retry / Trestle phone-tier scoring don't
+        skip rows for missing mailing
+      - CRM filter presets don't lose records to empty-field filters
+      - Operator can sequence "anything goes" outreach (door-knock,
+        Estate-of mail) on otherwise-orphaned records
+
+    Records filled by this path get ``dm_mailing_source = "property_fallback"``
+    so the formatter can emit a ``mailing_unverified`` tag — direct-mail
+    sequences can be configured to de-prioritize these (the mail goes
+    to the deceased's home, not the DM's actual residence). Door-knock
+    sequences are unaffected (the knocker drives to the property anyway).
+
+    Returns a stats dict for the caller's funnel.
+    """
+    filled = 0
+    for notice in notices:
+        # Only fill when DM is known but mailing is STILL empty after
+        # all prior tiers (Tracerfy + _lookup_dm_address waterfall).
+        if not (notice.decision_maker_name or "").strip():
+            continue
+        if (notice.decision_maker_street or "").strip():
+            continue
+        # Skip if no property address either (rare — would mean the
+        # property locator failed too; filling with empty is pointless)
+        if not (notice.address or "").strip():
+            continue
+        notice.decision_maker_street = notice.address
+        notice.decision_maker_city = notice.city or ""
+        notice.decision_maker_state = notice.state or "AL"
+        notice.decision_maker_zip = notice.zip or ""
+        notice.dm_mailing_source = "property_fallback"
+        filled += 1
+        logger.info(
+            "  DM-mailing property fallback: %s -> %s (placeholder)",
+            notice.decision_maker_name, notice.address,
+        )
+    if filled:
+        logger.info(
+            "DM-mailing property fallback complete: %d row(s) filled with placeholder",
+            filled,
+        )
+    return {"filled": filled}
 
 
 def prepare_notices(
@@ -1544,6 +1598,14 @@ def prepare_notices(
             mailing_fill_stats = _fill_missing_dm_mailing(notices)
             if mailing_fill_stats.get("attempted"):
                 stats["dm_mailing_fallback"] = mailing_fill_stats
+            # Final safety net: anything still empty gets the property
+            # address as a placeholder, tagged `mailing_unverified` so
+            # direct-mail sequences can de-prioritize. Ensures 100%
+            # mailing coverage downstream (Trestle / Tracerfy retry /
+            # filter presets all need SOMETHING in Mailing fields).
+            property_fb_stats = _fallback_dm_mailing_to_property(notices)
+            if property_fb_stats.get("filled"):
+                stats["dm_mailing_property_fallback"] = property_fb_stats
             for n in notices:
                 _promote_heir_contacts_to_csv_slots(n)
             if funnel is not None:

@@ -616,6 +616,16 @@ def _build_tags(notice: NoticeData, phone_tiers: dict | None = None) -> str:
             and notice.decision_maker_street != notice.address):
         tags.append("has_dm_address")
 
+    # Mailing-provenance flag (2026-06-21). When the DM-mailing pipeline
+    # falls all the way to "use the property address as a placeholder"
+    # (Tracerfy missed AND _lookup_dm_address waterfall missed too),
+    # mark the row so direct-mail filter presets can de-prioritize —
+    # mail goes to the deceased's home, not the DM's actual residence.
+    # Door-knock sequences don't care (the knocker drives to the
+    # property anyway).
+    if getattr(notice, "dm_mailing_source", "") == "property_fallback":
+        tags.append("mailing_unverified")
+
     # Signing chain tags
     if notice.signing_chain_count:
         try:

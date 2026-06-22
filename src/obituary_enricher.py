@@ -1672,6 +1672,8 @@ def _batch_tracerfy_lookup(notices: list) -> None:
                         notice.decision_maker_city = (rec.get("mail_city") or "").strip()
                         notice.decision_maker_state = (rec.get("mail_state") or notice.state or "AL").strip()
                         notice.decision_maker_zip = (rec.get("mail_zip") or "").strip()
+                        # Provenance — see NoticeData.dm_mailing_source
+                        notice.dm_mailing_source = "tracerfy"
                         matched += 1
                         logger.info(
                             "    Tracerfy batch: %s -> %s, %s %s",

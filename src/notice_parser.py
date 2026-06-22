@@ -140,6 +140,20 @@ class NoticeData:
     dm_confidence: str = ""                 # "high", "medium", "low"
     dm_confidence_reason: str = ""          # Brief explanation
     missing_data_flags: str = ""            # Pipe-separated: "no_survivors|snippet_only|common_name"
+    # Provenance for decision_maker_street/city/state/zip — added 2026-06-21
+    # so operator can tell apart real DM mailing addresses from
+    # property-fallback placeholders. Values:
+    #   ""                   — no DM mailing set
+    #   "tracerfy"           — from Tracerfy batch skip-trace
+    #   "jefferson_tax_api"  — from Jefferson E-Ring tax-roll mailing fields
+    #   "madison_tax_api"    — future: from Madison per-parcel detail
+    #   "marshall_tax_api"   — future: from Marshall per-parcel detail
+    #   "people_search"      — from Serper+Firecrawl+LLM (Tier 2)
+    #   "ddg_people_search"  — from DuckDuckGo+LLM (Tier 2b)
+    #   "property_fallback"  — copied from property address (safety net)
+    # The formatter emits a `mailing_unverified` tag for property_fallback
+    # so direct-mail filter presets can de-prioritize placeholder rows.
+    dm_mailing_source: str = ""
     # Mailability flag
     mailable: str = ""                 # "yes" or "" (unmailable)
     # Entity research fields
