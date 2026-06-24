@@ -854,7 +854,28 @@ async def upload_csv(
                 return False  # still on the left → mapping didn't take
         return True
 
-    for col_name in ["Tags", "Lists"]:
+    # Columns that need explicit mapping. Auto-map at Step 4 only catches
+    # core address fields (Property Street/City/State/ZIP + Owner First/
+    # Last Name + Mailing fields); custom-field columns get left on the
+    # LEFT panel unmapped → values never reach DataSift records.
+    #
+    # Operator request 2026-06-24: pre-probate records were missing the
+    # legacy.com obituary link in DataSift's record view even though
+    # the URL was present in the uploaded CSV. Root cause: "Obituary URL"
+    # wasn't in this list. Added Source URL, Decedent Name, Date of
+    # Death, Probate Case Number, Judge of Probate at the same time
+    # since they're the same class of high-signal custom fields.
+    COLUMNS_TO_MAP = [
+        "Tags",
+        "Lists",
+        "Obituary URL",
+        "Source URL",
+        "Decedent Name",
+        "Date of Death",
+        "Probate Case Number",
+        "Judge of Probate",
+    ]
+    for col_name in COLUMNS_TO_MAP:
         try:
             mapped = False
             for attempt in (1, 2, 3):
