@@ -55,6 +55,9 @@ _LEADING_DIRECTIONAL_RE = re.compile(
 # uppercase as a clear flag for downstream filters.
 _DISP_CODE_DISPLAY = {
     "BHAM": "Birmingham",
+    "B'HAM": "Birmingham",      # apostrophe variant observed in DispCode
+    "B'HAN": "Birmingham",      # likely typo of B'HAM — Ronald L. Brown record 2026-06-24
+    "BHM": "Birmingham",        # short-form variant
 }
 
 
@@ -77,6 +80,9 @@ def _normalize_municipality(disp_code: str) -> str:
 # that surfaces a Jefferson postal city should pipe it through this.
 _CITY_DISPLAY_MAP = {
     "BHAM": "Birmingham",
+    "B'HAM": "Birmingham",               # apostrophe variant from Jefferson's PostalCity
+    "B'HAN": "Birmingham",               # likely typo of B'HAM — observed 2026-06-24
+    "BHM": "Birmingham",                 # short-form variant
     "VESTAVIA": "Vestavia Hills",        # actual incorporated city name
     "MT OLIVE": "Mount Olive",
     "MOUNTAIN BRK": "Mountain Brook",    # abbreviation seen in mailing addresses
