@@ -1339,10 +1339,23 @@ def _build_row(
     estimated_value = notice.estimated_value or notice.assessed_value
     structure_type = notice.property_type or notice.property_use
 
+    # Property City fallback (2026-06-23): Jefferson E-Ring API sometimes
+    # returns a populated ZIP but EMPTY situs_city. Without this fallback,
+    # 8/19 pre-probate rows on 6/23 shipped with blank Property City.
+    # Lookup uses USPS-preferred city for the known Tier 1+2 ZIPs across
+    # Jefferson/Madison/Marshall — see target_zips.city_for_zip.
+    property_city = notice.city
+    if not property_city and notice.zip:
+        try:
+            from target_zips import city_for_zip
+            property_city = city_for_zip(notice.zip)
+        except Exception:
+            pass
+
     return {
         # ── Core auto-mapped ──
         "Property Street Address": notice.address,
-        "Property City": notice.city,
+        "Property City": property_city,
         "Property State": notice.state or "AL",
         "Property ZIP Code": notice.zip,
         "Owner First Name": contact["first"],

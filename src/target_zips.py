@@ -117,3 +117,69 @@ def zip_tier_county(zip_code: str | None) -> tuple[int | None, str | None]:
     if z in MARSHALL_TIER_1 or z in MARSHALL_TIER_2:
         return (tier, "Marshall")
     return (tier, None)
+
+
+# USPS-preferred city per Tier 1 + Tier 2 ZIP, used as a fallback when
+# the upstream property API returns a ZIP but no city. Added 2026-06-23
+# after 8/19 pre-probate rows shipped with empty Property City (Jefferson
+# E-Ring sometimes returns empty `situs_city` even when ZIP is populated).
+# Built from USPS preferred-city for each ZIP — for shared ZIPs (e.g.
+# 35226 spans Hoover + Vestavia Hills), the more populous community wins.
+_ZIP_TO_CITY: dict[str, str] = {
+    # Jefferson Tier 1
+    "35215": "Birmingham",       # Center Point area (Birmingham metro)
+    "35214": "Birmingham",       # Forestdale (Birmingham metro)
+    "35022": "Bessemer",
+    "35023": "Hueytown",
+    "35226": "Hoover",           # Also covers Vestavia; Hoover more populous
+    "35235": "Birmingham",       # Roebuck (Birmingham metro)
+    # Jefferson Tier 2
+    "35216": "Vestavia Hills",
+    "35126": "Pinson",
+    "35210": "Birmingham",       # East Lake (Birmingham metro)
+    "35173": "Trussville",
+    "35244": "Hoover",
+    # Madison Tier 1
+    "35810": "Huntsville",
+    "35811": "Huntsville",
+    "35803": "Huntsville",
+    "35758": "Madison",          # City of Madison (Madison County)
+    "35805": "Huntsville",
+    "35801": "Huntsville",
+    # Madison Tier 2
+    "35757": "Madison",
+    "35759": "Meridianville",
+    "35763": "Owens Cross Roads",
+    "35806": "Huntsville",
+    "35750": "Hazel Green",
+    # Marshall Tier 1
+    "35950": "Albertville",
+    "35976": "Guntersville",
+    "35016": "Arab",
+    "35961": "Boaz",
+    "35951": "Albertville",
+    "35957": "Crossville",
+    # Marshall Tier 2
+    "35962": "Boaz",
+    "35175": "Joppa",            # Joppa is the part of 35175 in Marshall County
+    "35747": "Grant",
+    "35769": "Scottsboro",
+    "35980": "Valley Head",      # DeKalb border ZIP
+}
+
+
+def city_for_zip(zip_code: str | None) -> str:
+    """USPS-preferred city for a known Tier 1+2 ZIP.
+
+    Returns empty string when the ZIP isn't in our table (off-target ZIPs,
+    less-common AL ZIPs, ZIP+4 with bad leading 5). Callers typically use
+    this as a fallback when the property API returned a ZIP but no city.
+
+    Note: for ZIPs that span multiple municipalities (e.g. 35226 = Hoover
+    AND Vestavia Hills), we return the larger/more-populous city. If finer
+    accuracy is needed, route through Smarty.
+    """
+    if not zip_code:
+        return ""
+    z = str(zip_code).strip()[:5]
+    return _ZIP_TO_CITY.get(z, "")

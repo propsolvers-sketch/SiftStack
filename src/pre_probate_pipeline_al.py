@@ -1481,6 +1481,30 @@ def _fill_missing_dm_mailing(notices: list[NoticeData]) -> dict:
         street = (addr.get("street") or "").strip()
         if not street:
             continue
+
+        # Spouse out-of-state guard (operator decision 2026-06-23 after
+        # Joyce Stephens / Charles Edward Stephens case: Tier 2 returned
+        # a mailing in Saint Albans WV for the spouse of a Jefferson AL
+        # decedent — almost certainly a stranger named Joyce Stephens,
+        # not Charles's wife). For SPOUSE relationship specifically, the
+        # DM lives at the property or at minimum in the same state in
+        # 95%+ of cases. Reject out-of-state Tier 2 matches and let the
+        # property-address fallback fire instead.
+        #
+        # Limited to spouse only — adult children + siblings legitimately
+        # live in other states, so applying this guard broadly would
+        # over-reject real out-of-state heirs.
+        rel = (notice.decision_maker_relationship or "").strip().lower()
+        addr_state = (addr.get("state") or "").strip().upper()
+        notice_state = (notice.state or "").strip().upper()
+        if rel in {"spouse", "wife", "husband"} and addr_state and notice_state and addr_state != notice_state:
+            logger.warning(
+                "  Spouse DM out-of-state reject: %s (%s) returned %s vs property %s — "
+                "likely wrong-person match, falling through to property fallback",
+                notice.decision_maker_name, rel, addr_state, notice_state,
+            )
+            continue
+
         notice.decision_maker_street = street
         notice.decision_maker_city = (addr.get("city") or "").strip()
         # State falls back to notice.state (which goes through the

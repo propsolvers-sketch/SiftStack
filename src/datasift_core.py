@@ -172,16 +172,38 @@ async def login(page, email: str = None, password: str = None) -> bool:
     # Click Sign In
     await page.get_by_role("button", name="Sign In").click()
 
-    # Wait for navigation away from login page
+    # Wait for navigation away from login page.
+    #
+    # Used to wait for `/dashboard/general` specifically — but as of
+    # 2026-06-23 DataSift no longer redirects there after login. The
+    # form submits, the session cookie gets set, and the page just
+    # SITS on /login (which now renders a "404 Oops" body with
+    # logged-in chrome — the avatar + sidebar are visible, proving
+    # the session is active). The old wait_for_url("**/dashboard/general**")
+    # would always timeout, see "/login" still in URL, and report
+    # login_failed even though the session was good.
+    #
+    # New approach: after submit, navigate explicitly to /records and
+    # check whether we land there (logged in) or bounce back to /login
+    # (login failed). This is what the cookie-restore path already
+    # does on line 147-153 — same check applied uniformly.
     try:
-        await page.wait_for_url("**/dashboard/general**", timeout=15000)
+        await page.wait_for_url(
+            lambda u: "/login" not in u, timeout=8000,
+        )
+        # Already left /login — we're in. Skip the navigation probe.
     except PwTimeout:
-        if "/login" in page.url:
-            logger.error("DataSift login failed — still on login page")
-            return False
+        pass
+    # Probe /records to confirm authenticated state (works whether or
+    # not the form did its own redirect)
+    await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded")
+    await page.wait_for_timeout(3000)
+    if "/login" in page.url:
+        logger.error("DataSift login failed — /records bounced back to /login")
+        return False
 
     await save_cookies(page)
-    logger.info("DataSift login successful")
+    logger.info("DataSift login successful (landed on %s)", page.url)
     await install_loom_auto_dismiss(page)
     return True
 
