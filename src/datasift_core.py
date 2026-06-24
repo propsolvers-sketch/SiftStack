@@ -141,13 +141,23 @@ async def login(page, email: str = None, password: str = None) -> bool:
     if not email or not password:
         email, password = get_credentials()
 
-    # Try cookies first
+    # Try cookies first.
+    # Detection: a valid cookie-restored session lands on /records/* or
+    # /dashboard/*. Anything else (including the sneaky `/?next=...`
+    # bounce) means cookies are expired/invalid → fall through to
+    # fresh login. The `?next=` exclude catches the case where the
+    # records URL technically resolves to root with a redirect-back
+    # hint — that's NOT an authenticated session.
     has_cookies = await load_cookies(page.context)
     if has_cookies:
         await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded")
         await page.wait_for_timeout(5000)
         current_url = page.url
-        if "/login" not in current_url and ("/dashboard" in current_url or "/records" in current_url):
+        is_logged_in = (
+            ("/records" in current_url or "/dashboard" in current_url)
+            and "?next=" not in current_url
+        )
+        if is_logged_in:
             logger.info("DataSift session restored from cookies")
             await install_loom_auto_dismiss(page)
             return True
@@ -172,38 +182,73 @@ async def login(page, email: str = None, password: str = None) -> bool:
     # Click Sign In
     await page.get_by_role("button", name="Sign In").click()
 
-    # Wait for navigation away from login page.
+    # Authentication detection (rewritten 2026-06-23 after two failure
+    # modes in one day):
     #
-    # Used to wait for `/dashboard/general` specifically — but as of
-    # 2026-06-23 DataSift no longer redirects there after login. The
-    # form submits, the session cookie gets set, and the page just
-    # SITS on /login (which now renders a "404 Oops" body with
-    # logged-in chrome — the avatar + sidebar are visible, proving
-    # the session is active). The old wait_for_url("**/dashboard/general**")
-    # would always timeout, see "/login" still in URL, and report
-    # login_failed even though the session was good.
+    # 1. DataSift no longer redirects to `/dashboard/general` after
+    #    login — sometimes stays on `/login` rendering a 404 with
+    #    logged-in chrome, sometimes bounces to `/` with a `?next=`
+    #    query param. The old wait_for_url("**/dashboard/general**")
+    #    always timed out.
     #
-    # New approach: after submit, navigate explicitly to /records and
-    # check whether we land there (logged in) or bounce back to /login
-    # (login failed). This is what the cookie-restore path already
-    # does on line 147-153 — same check applied uniformly.
+    # 2. Negative-URL-check ("/login not in URL → success") gives
+    #    false positives — `/?next=/records/properties` doesn't
+    #    contain "/login" but ISN'T authenticated. Tier 2 enrich
+    #    then bounces to the actual login form, breaking automation.
+    #
+    # Detection now requires POSITIVE confirmation: probe /records
+    # and require the final URL to contain "/records" or "/dashboard"
+    # (the only paths a real authenticated session can land on).
+    # Anything else (`/`, `/login`, `/?next=...`) means auth failed.
     try:
         await page.wait_for_url(
-            lambda u: "/login" not in u, timeout=8000,
+            lambda u: ("/records" in u or "/dashboard" in u) and "?next=" not in u,
+            timeout=15000,
         )
-        # Already left /login — we're in. Skip the navigation probe.
+        # Already on a logged-in page after submit. No probe needed.
     except PwTimeout:
         pass
-    # Probe /records to confirm authenticated state (works whether or
-    # not the form did its own redirect)
-    await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(3000)
-    if "/login" in page.url:
-        logger.error("DataSift login failed — /records bounced back to /login")
+
+    # Probe /records — but DataSift's auth flow sometimes needs TWO
+    # navigations to fully settle: the first request triggers the
+    # server to set the session cookie via a redirect chain (which
+    # may bounce to /login or `/?next=...` mid-flight), the second
+    # request actually uses that cookie. Verified locally 2026-06-23:
+    # one probe lands on /login (looks like failure), second probe
+    # lands on /records/properties (real authenticated). Retry once
+    # before declaring failure.
+    async def _probe_records() -> str:
+        await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded")
+        await page.wait_for_timeout(5000)
+        return page.url
+
+    final_url = await _probe_records()
+    if "/records" not in final_url and "/dashboard" not in final_url:
+        logger.info(
+            "DataSift login probe 1 landed on %s — retrying once "
+            "(auth cookie may need a second navigation to settle)",
+            final_url,
+        )
+        final_url = await _probe_records()
+
+    # Require positive match on a logged-in path.
+    if "/records" not in final_url and "/dashboard" not in final_url:
+        logger.error(
+            "DataSift login failed — landed on %s (expected /records/* or /dashboard/*)",
+            final_url,
+        )
+        return False
+    # Belt + suspenders: ?next= param means we got redirected to a
+    # login-gated path.
+    if "?next=" in final_url:
+        logger.error(
+            "DataSift login failed — ?next= param in URL indicates auth gate: %s",
+            final_url,
+        )
         return False
 
     await save_cookies(page)
-    logger.info("DataSift login successful (landed on %s)", page.url)
+    logger.info("DataSift login successful (landed on %s)", final_url)
     await install_loom_auto_dismiss(page)
     return True
 
