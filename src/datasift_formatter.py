@@ -1352,6 +1352,24 @@ def _build_row(
         except Exception:
             pass
 
+    # Mailing City fallback (2026-06-25): same shape as Property City —
+    # when contact["city"] is empty but contact["zip"] is in our Tier 1+2
+    # set, fall back to USPS-preferred city. Operator-reported case:
+    # 5933 SHILO RUN (probate) — DM (Linda Wanninger) inherited the
+    # property and mails there, but the probate notice parser captured
+    # the street + ZIP without a city → mailing landed as
+    # "5933 SHILO RUN, , AL 35126" → skip-trace requires Mailing City to
+    # find phones → Phone 1 shipped empty even though the DM is real and
+    # findable. Falling back via city_for_zip(35126)='Pinson' closes the
+    # gap for known target ZIPs without polluting off-target rows.
+    mailing_city = contact["city"]
+    if not mailing_city and contact["zip"]:
+        try:
+            from target_zips import city_for_zip
+            mailing_city = city_for_zip(contact["zip"])
+        except Exception:
+            pass
+
     return {
         # ── Core auto-mapped ──
         "Property Street Address": notice.address,
@@ -1361,7 +1379,7 @@ def _build_row(
         "Owner First Name": contact["first"],
         "Owner Last Name": contact["last"],
         "Mailing Street Address": contact["street"],
-        "Mailing City": contact["city"],
+        "Mailing City": mailing_city,
         "Mailing State": contact["state"],
         "Mailing ZIP Code": contact["zip"],
         # ── Phone/Email — Phone N populated via phone_cols dict above,

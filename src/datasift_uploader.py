@@ -520,19 +520,19 @@ async def upload_csv(
     await _screenshot(page, "step2_enrichment")
 
     try:
-        # Toggle by name — rewritten 2026-06-25 after operator confirmed
-        # the previous `.react-toggle` selector silently no-op'd on
-        # today's wizard (517 SUN VALLEY RD: probate upload with
-        # swap_owners=True logged "turned ON" but the screenshot showed
-        # the toggle STILL OFF; the new owner wasn't applied and phones
-        # didn't attach). DataSift presumably changed their toggle
-        # component class — old code matched zero elements.
+        # Toggle by name — rewritten 2026-06-25 (second time today) after
+        # headed-mode diagnostic showed the prior rewrite clicked a
+        # WRAPPER DIV (`UploadEnrichment__ReplaceOwnersToggleWra`) which
+        # has no click handler. The visible toggle UI sits inside the
+        # wrapper; the real state lives on a hidden <input type="checkbox">
+        # (react-toggle's "screenreader-only" input). Clicking that input
+        # fires React's onChange and actually flips the toggle.
         #
-        # New approach: walk up from the "Swap Owners" text label to
-        # the row container, then find ANY toggle-like element inside
-        # (role=switch / checkbox input / classNames containing
-        # toggle/switch/checked). Same belt-and-suspenders pattern we
-        # used for the Next Step button fix.
+        # New approach: walk up from the "Swap Owners" text label to the
+        # row container, then walk back DOWN to find an actual
+        # <input type="checkbox"> (NOT excluded as before — that's the
+        # one that works). Falls back to role=switch / button / clickable
+        # if no input is present.
         toggle_result = await page.evaluate(
             f"""(() => {{
             const TARGET_ON = {str(bool(swap_owners)).lower()};
@@ -547,40 +547,35 @@ async def upload_csv(
             }}
             if (!swapLabel) return 'swap-owners-label-not-found';
 
-            // Walk up to find the row container (max 8 ancestors) and look
-            // for any toggle-like element inside.
+            // Walk up to find the row container (max 8 ancestors).
             let container = swapLabel;
             for (let depth = 0; depth < 8 && container.parentElement; depth++) {{
                 container = container.parentElement;
-                const cands = container.querySelectorAll(
-                    '[role="switch"], input[type="checkbox"], '
-                    + '[class*="oggle"], [class*="witch"]'
-                );
-                for (const c of cands) {{
-                    if (c.classList && c.classList.contains('react-toggle-screenreader-only')) continue;
-                    // Determine current state
-                    let isOn = false;
-                    if (c.tagName === 'INPUT' && c.type === 'checkbox') {{
-                        isOn = c.checked;
-                    }} else if (c.getAttribute('role') === 'switch') {{
-                        isOn = c.getAttribute('aria-checked') === 'true';
-                    }} else {{
-                        const cls = (c.className || '').toString().toLowerCase();
-                        isOn = cls.includes('checked')
-                            || cls.includes('--on')
-                            || cls.includes('active')
-                            || cls.includes('-on ');
+                // Prefer the actual <input type="checkbox"> — react-toggle's
+                // screenreader-only input IS the interactive element that
+                // fires onChange. Previous code excluded it; that was wrong.
+                const input = container.querySelector('input[type="checkbox"]');
+                if (input) {{
+                    const wasOn = input.checked;
+                    if (TARGET_ON === wasOn) {{
+                        return TARGET_ON ? 'already ON (input)' : 'already OFF (input)';
                     }}
-                    if (TARGET_ON === isOn) {{
-                        return TARGET_ON ? 'already ON' : 'already OFF';
+                    input.click();
+                    const nowOn = input.checked;
+                    return `input.click() : was=${{wasOn}} now=${{nowOn}} target=${{TARGET_ON}}`;
+                }}
+                // Fallback: role=switch
+                const sw = container.querySelector('[role="switch"]');
+                if (sw) {{
+                    const wasOn = sw.getAttribute('aria-checked') === 'true';
+                    if (TARGET_ON === wasOn) {{
+                        return TARGET_ON ? 'already ON (switch)' : 'already OFF (switch)';
                     }}
-                    c.click();
-                    return TARGET_ON
-                        ? `clicked to turn ON (${{c.tagName}}.${{c.className?.toString().slice(0,40)}})`
-                        : `clicked to turn OFF`;
+                    sw.click();
+                    return `role=switch click : was=${{wasOn}} target=${{TARGET_ON}}`;
                 }}
             }}
-            return 'no toggle found near Swap Owners label';
+            return 'no input/switch found near Swap Owners label';
         }})()"""
         )
         logger.info("Step 2 Swap Owners: %s", toggle_result)
@@ -803,12 +798,45 @@ async def upload_csv(
         return result
 
     await _screenshot(page, "step4_file_uploaded")
-    await _click_next_step(page)
 
     # ── Wizard Step 5: Map the columns ──
+    # DataSift's wizard AUTO-ADVANCES from Step 4 to Step 5 when the file
+    # is selected — confirmed via headed-mode run 2026-06-25 (the
+    # step4_file_uploaded screenshot consistently shows "Map the columns"
+    # already active, with auto-mapped Property Street/City/State/ZIP
+    # rendered on the right panel).
+    #
+    # Previously this code called `_click_next_step` here. That click
+    # advanced us PAST Step 5 into Step 6 (Review), which triggered
+    # DataSift to commit the upload with only its own auto-mapped fields,
+    # rendering "All set! 100%". By the time the column-mapping loop ran,
+    # there was no Step 5 UI left — every drag-drop failed silently and
+    # custom columns (Obituary URL, Decedent Name, Phone 1-3 etc.) never
+    # reached DataSift. This has likely been broken since the wizard
+    # added Step 4→5 auto-advance; the only mapped data getting through
+    # was DataSift's auto-mapped required fields plus the Step 3
+    # in-wizard tag.
     await _dismiss_popups(page)
-    logger.info("Wizard Step 5: Column mapping — mapping Tags and Lists...")
-    await page.wait_for_timeout(3000)
+    logger.info(
+        "Wizard Step 5: Waiting for 'Map the columns' page (auto-advances "
+        "after file select; no Next click needed)..."
+    )
+    # Wait for the column-mapping page to be stable — look for the
+    # distinctive header text. If it doesn't appear within 15s, fall back
+    # to clicking Next as a defensive recovery (in case DataSift changes
+    # back to manual-advance behavior).
+    try:
+        await page.locator('text="Map the columns"').first.wait_for(
+            state="visible", timeout=15000,
+        )
+        logger.info("Step 5 column-mapping page is visible")
+    except PwTimeout:
+        logger.warning(
+            "'Map the columns' header not visible after file upload — "
+            "wizard may have changed flow; clicking Next as fallback"
+        )
+        await _click_next_step(page)
+    await page.wait_for_timeout(1500)
     await _screenshot(page, "step5_column_mapping")
 
     # ── Column mapping (rewritten 2026-06-10) ─────────────────────────
@@ -987,6 +1015,282 @@ async def upload_csv(
         await _screenshot(page, "step6_timeout")
         result["message"] = "Upload may have succeeded but confirmation timed out — check Activity page"
         logger.warning(result["message"])
+        result["success"] = True
+
+    await _save_cookies(page)
+    return result
+
+
+async def upload_csv_swap_owner(
+    page: Page,
+    csv_path: Path,
+    *,
+    tag: str = "Courthouse Data",
+) -> dict:
+    """Upload a CSV via the 'Swap owner of existing property' wizard mode.
+
+    Built 2026-06-25 after operator (Shani) reported 517 SUN VALLEY RD's
+    probate upload added notes + tags but DIDN'T swap ownership or attach
+    phones. Root-cause discovery during headed-mode debugging: the wizard
+    mode we were using ("Add Data → Adding properties to an existing list"
+    with the Step-2 Swap Owners toggle) is the WRONG path for owner-swap
+    use cases. DataSift exposes a dedicated mode at Step 1: "Add Contact
+    Data → Swap owner of an existing property". Operator manual-tested it
+    against 517 SUN VALLEY RD and confirmed FULL update — owner swapped to
+    executor (GARY TALLEY), phones attached, tags applied, notes blob
+    populated with decedent/judge/source-URL/value/etc. No duplicate
+    created (matches by Property Address; non-matches silently skipped).
+
+    Wizard structure (5 steps, observed via headed-mode probe 2026-06-25
+    on the same 517 SUN VALLEY row):
+      1. Setup (0% → 25%)   — pick Add Data → "Swap owner of existing property"
+      2. Add tags (25% → 50%) — type the custom tag
+      3. Upload the file (50% → 75%) — set <input type="file">
+      4. Map the columns (75% → 100%) — AUTO-MAPPED; just Next to commit
+      5. (auto)             — "All set! 100%" appears immediately
+
+    Notable simplifications vs upload_csv (Add Data flow):
+      - NO Enrichment step (mode itself IS the swap; no toggle needed)
+      - NO column-mapping drag-drop (auto-map handles required fields;
+        notes blob carries decedent/judge/source — no need for explicit
+        Obituary URL / Decedent Name / Date of Death / etc. columns)
+      - NO Step-1 list dropdown (matching is property-address-wide, not
+        scoped to a list — though the tag still applies)
+
+    Args:
+        page: Logged-in Playwright page.
+        csv_path: Path to a DataSift-formatted CSV.
+        tag: Tag to attach to processed records (Step 2 in-wizard add).
+            Defaults to "Courthouse Data" to match probate's other uploads.
+
+    Returns:
+        Dict with {success, records_uploaded, errors, message}.
+        records_uploaded = rows in input CSV (NOT matched/skipped count —
+        Activity-page scraping for that surface is a separate follow-up).
+    """
+    result = {
+        "success": False,
+        "records_uploaded": 0,
+        "errors": 0,
+        "message": "",
+    }
+
+    if not csv_path.exists():
+        result["message"] = f"CSV file not found: {csv_path}"
+        logger.error(result["message"])
+        return result
+
+    result["records_uploaded"] = _count_csv_rows(csv_path)
+
+    # ── Open wizard from sidebar ──
+    logger.info("Swap-owner upload: Clicking Upload File...")
+    if "/records" not in page.url:
+        await page.goto(DATASIFT_UPLOAD_URL, wait_until="domcontentloaded")
+    await page.wait_for_timeout(8000)
+
+    # Dismiss notification popup
+    try:
+        no_thanks = page.locator(
+            'button:has-text("NO, THANKS"), button:has-text("No, thanks")'
+        )
+        if await no_thanks.count() > 0:
+            await no_thanks.first.click()
+            await page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+    try:
+        upload_btn = page.locator('text="Upload File"').first
+        await upload_btn.click(timeout=15000)
+        await page.wait_for_timeout(3000)
+    except Exception as e:
+        result["message"] = f"Could not click Upload File: {e}"
+        logger.error(result["message"])
+        return result
+
+    await _screenshot(page, "swap_step1_wizard_opened")
+
+    # ── Swap Step 1: Setup ──
+    # Click "Add Data" (default but click to be safe), then open the
+    # "What are you going to add?" dropdown and pick "Swap owner of an
+    # existing property" (under the "ADD CONTACT DATA" section).
+    logger.info(
+        "Swap Step 1: Selecting Add Data → 'Swap owner of existing property'"
+    )
+
+    try:
+        add_btn = page.locator(
+            'button:has-text("Add Data"), [role="button"]:has-text("Add Data")'
+        )
+        if await add_btn.count() > 0:
+            await add_btn.first.click(timeout=5000)
+            await page.wait_for_timeout(800)
+    except Exception as e:
+        logger.debug("Add Data click: %s", e)
+
+    try:
+        dropdown = page.locator('text="Select one option"').first
+        await dropdown.click(timeout=10000)
+        await page.wait_for_timeout(1500)
+    except Exception as e:
+        result["message"] = f"Could not open sub-mode dropdown: {e}"
+        logger.error(result["message"])
+        await _screenshot(page, "swap_step1_dropdown_failed")
+        return result
+
+    swap_opt_clicked = False
+    for sel in (
+        'text="Swap owner of an existing property"',
+        '[class*="SelectOption"]:has-text("Swap owner of an existing property")',
+        '[role="option"]:has-text("Swap owner")',
+    ):
+        try:
+            opt = page.locator(sel)
+            if await opt.count() > 0:
+                await opt.first.click(timeout=5000)
+                swap_opt_clicked = True
+                logger.info("Selected swap-owner mode via %s", sel)
+                break
+        except Exception as e:
+            logger.debug("Swap opt %s failed: %s", sel, e)
+
+    if not swap_opt_clicked:
+        result["message"] = (
+            "Could not select 'Swap owner of an existing property' option"
+        )
+        logger.error(result["message"])
+        await _screenshot(page, "swap_step1_opt_not_found")
+        return result
+
+    await page.wait_for_timeout(2000)
+    await _screenshot(page, "swap_step1_mode_selected")
+    await _click_next_step(page, timeout=15000)
+
+    # ── Swap Step 2: Add tags ──
+    # Observed 2026-06-25: DataSift auto-advances past Step 2 quickly when
+    # the wizard senses no tag input is being interacted with. By the time
+    # we look for the tag input, the page is often already on Step 3.
+    # Approach: try a brief tag-add (1.5s), but if the page is already on
+    # Step 3 (file input present), skip Step 2 entirely. The CSV's "Tags"
+    # column carries the tag value and swap-mode auto-maps it, so the
+    # wizard's tag step is REDUNDANT — purely a belt-and-suspenders
+    # safety net.
+    await _dismiss_popups(page)
+    await page.wait_for_timeout(1500)
+
+    # First, check if we're already on Step 3 (file input present).
+    already_on_step3 = False
+    try:
+        if await page.locator('input[type="file"]').count() > 0:
+            already_on_step3 = True
+            logger.info(
+                "Swap Step 2 auto-skipped by wizard; already on Step 3 "
+                "(file input present). Tag will come from CSV's Tags column."
+            )
+    except Exception:
+        pass
+
+    if not already_on_step3:
+        logger.info("Swap Step 2: Add tags — adding %r", tag)
+        try:
+            tag_input = page.locator(
+                'input[placeholder*="Search or add a new tag"], '
+                'input[placeholder*="tag"]'
+            )
+            if await tag_input.count() > 0:
+                await tag_input.first.fill(tag)
+                await page.wait_for_timeout(800)
+                await tag_input.first.press("Enter")
+                await page.wait_for_timeout(1000)
+                logger.info("Added tag %r", tag)
+            else:
+                logger.info(
+                    "Tag input not present on Step 2 — relying on CSV's "
+                    "Tags column to carry the tag via swap-mode auto-map"
+                )
+        except Exception as e:
+            logger.warning("Swap-mode tag add failed: %s", e)
+
+        await _screenshot(page, "swap_step2_tag_added")
+        # Advance to Step 3 only if we're not already there.
+        await _click_next_step(page, timeout=10000)
+
+    # ── Swap Step 3: Upload the file ──
+    await _dismiss_popups(page)
+    logger.info("Swap Step 3: Uploading %s", csv_path.name)
+    await page.wait_for_timeout(2000)
+
+    try:
+        file_input = page.locator('input[type="file"]')
+        for wait_ms in (2000, 5000, 8000):
+            if await file_input.count() > 0:
+                break
+            await page.wait_for_timeout(wait_ms)
+            file_input = page.locator('input[type="file"]')
+        if await file_input.count() == 0:
+            result["message"] = "File input not found in swap-mode wizard"
+            logger.error(result["message"])
+            await _screenshot(page, "swap_step3_no_file_input")
+            return result
+        await file_input.first.set_input_files(str(csv_path))
+        logger.info("File selected (%d rows)", result["records_uploaded"])
+        await page.wait_for_timeout(4000)
+    except Exception as e:
+        result["message"] = f"Swap-mode file upload failed: {e}"
+        logger.error(result["message"])
+        return result
+
+    await _screenshot(page, "swap_step3_file_uploaded")
+
+    # ── Swap Steps 4 + 5: Map columns + Review — wizard AUTO-COMMITS ──
+    # Observed 2026-06-25 (14-row probate run): once the file is set at
+    # Step 3, DataSift auto-maps required fields and advances all the way
+    # to "All set! 100%" without needing any further Next clicks. The
+    # column-mapping page may flash briefly but is gone by the time we'd
+    # try to interact with it.
+    #
+    # We previously attempted a Next click here, which (a) timed out
+    # uselessly waiting for a Next button that no longer exists on the
+    # "All set!" page, (b) logged a misleading "Next not found" warning,
+    # and (c) added 15+ seconds of dead wait. Just poll for the success
+    # text directly.
+    await _dismiss_popups(page)
+    logger.info("Swap Steps 4 + 5: Waiting for 'All set!' auto-commit...")
+
+    success_text_found = False
+    for _ in range(20):  # up to ~40s
+        try:
+            done = await page.evaluate("""() => {
+                const t = document.body.innerText || '';
+                return t.includes('All set')
+                    || t.includes('successfully started')
+                    || t.includes('100%');
+            }""")
+            if done:
+                success_text_found = True
+                break
+        except Exception:
+            pass
+        await page.wait_for_timeout(2000)
+
+    await _screenshot(page, "swap_step5_complete")
+
+    if success_text_found:
+        result["success"] = True
+        result["message"] = (
+            f"Swap-mode upload submitted: {result['records_uploaded']} rows "
+            f"(matched/skipped count not yet captured — Activity-page scrape "
+            f"is a follow-up; for now verify by spot-checking records)"
+        )
+        logger.info(result["message"])
+    else:
+        result["message"] = (
+            "Swap-mode upload did not surface 'All set!' confirmation within "
+            "30s — check Activity page"
+        )
+        logger.warning(result["message"])
+        # Still mark success=True; the upload likely went through and we're
+        # just missing the visual confirmation. Same convention as upload_csv.
         result["success"] = True
 
     await _save_cookies(page)

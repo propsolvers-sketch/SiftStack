@@ -728,6 +728,26 @@ def _clean_decedent_name(name: str) -> str:
     return cleaned
 
 
+_FORBIDDEN_SINGLE_WORD_NAMES = frozenset({
+    # Operator-reported 2026-06-25: 2203 ASCOT LN probate row landed in
+    # DataSift with Owner First Name = "Letters" and no last name → no
+    # skip-trace match → no phones. The parser's PROBATE_NAME_RE grabbed
+    # "Letters" as the PR name (almost certainly from "Letters Testamentary"
+    # context where the surrounding capture mis-fired). _INVALID_NAMES
+    # already contains "letters testamentary" but the startswith check
+    # goes one direction only — "letters" alone doesn't start with
+    # "letters testamentary" so it slips through. Single-word "Letters" is
+    # never a real first name in AL probate context, so reject it.
+    "letters",
+    # Adjacent legal-term singletons that could leak via the same kind of
+    # narrow capture. Add as observed; keep the list conservative because
+    # this rule rejects single-word names ABSOLUTELY (won't catch a
+    # legitimately-named "John Personal" but will catch the bare token).
+    "personal", "executor", "executrix", "administrator", "administratrix",
+    "representative", "deceased", "estate", "petitioner",
+})
+
+
 def _is_valid_name(name: str) -> bool:
     """Reject names that are obviously not real person/entity names."""
     lower = name.strip().lower()
@@ -736,6 +756,9 @@ def _is_valid_name(name: str) -> bool:
     for bad in _INVALID_NAMES:
         if lower.startswith(bad):
             return False
+    # Single-word legal-term guard — see _FORBIDDEN_SINGLE_WORD_NAMES.
+    if " " not in lower and lower in _FORBIDDEN_SINGLE_WORD_NAMES:
+        return False
     if len(name) > 80 or len(name) < 3:
         return False
     return True
