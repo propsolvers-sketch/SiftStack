@@ -520,37 +520,67 @@ async def upload_csv(
     await _screenshot(page, "step2_enrichment")
 
     try:
-        # Toggle by name. Re-uses the same pattern as the post-upload
-        # Enrich Data modal (react-toggle component, sibling-label
-        # identification).
+        # Toggle by name — rewritten 2026-06-25 after operator confirmed
+        # the previous `.react-toggle` selector silently no-op'd on
+        # today's wizard (517 SUN VALLEY RD: probate upload with
+        # swap_owners=True logged "turned ON" but the screenshot showed
+        # the toggle STILL OFF; the new owner wasn't applied and phones
+        # didn't attach). DataSift presumably changed their toggle
+        # component class — old code matched zero elements.
+        #
+        # New approach: walk up from the "Swap Owners" text label to
+        # the row container, then find ANY toggle-like element inside
+        # (role=switch / checkbox input / classNames containing
+        # toggle/switch/checked). Same belt-and-suspenders pattern we
+        # used for the Next Step button fix.
         toggle_result = await page.evaluate(
             f"""(() => {{
             const TARGET_ON = {str(bool(swap_owners)).lower()};
-            const toggles = document.querySelectorAll('.react-toggle');
-            for (const toggle of toggles) {{
-                const prev = toggle.previousElementSibling;
-                const prevText = prev ? prev.textContent.trim() : '';
-                const next = toggle.nextElementSibling;
-                const nextText = next ? next.textContent.trim() : '';
-                if (
-                    prevText.includes('Swap Owners') ||
-                    nextText.includes('Swap Owners')
-                ) {{
-                    const isChecked = toggle.classList.contains(
-                        'react-toggle--checked',
-                    );
-                    if (TARGET_ON && !isChecked) {{
-                        toggle.click();
-                        return 'turned ON';
-                    }} else if (!TARGET_ON && isChecked) {{
-                        toggle.click();
-                        return 'turned OFF';
-                    }} else {{
-                        return TARGET_ON ? 'already ON' : 'already OFF';
-                    }}
+            // Find a leaf element whose visible text is exactly "Swap Owners"
+            let swapLabel = null;
+            for (const el of document.querySelectorAll('*')) {{
+                if (el.children.length === 0
+                    && (el.textContent || '').trim() === 'Swap Owners') {{
+                    swapLabel = el;
+                    break;
                 }}
             }}
-            return 'toggle not found';
+            if (!swapLabel) return 'swap-owners-label-not-found';
+
+            // Walk up to find the row container (max 8 ancestors) and look
+            // for any toggle-like element inside.
+            let container = swapLabel;
+            for (let depth = 0; depth < 8 && container.parentElement; depth++) {{
+                container = container.parentElement;
+                const cands = container.querySelectorAll(
+                    '[role="switch"], input[type="checkbox"], '
+                    + '[class*="oggle"], [class*="witch"]'
+                );
+                for (const c of cands) {{
+                    if (c.classList && c.classList.contains('react-toggle-screenreader-only')) continue;
+                    // Determine current state
+                    let isOn = false;
+                    if (c.tagName === 'INPUT' && c.type === 'checkbox') {{
+                        isOn = c.checked;
+                    }} else if (c.getAttribute('role') === 'switch') {{
+                        isOn = c.getAttribute('aria-checked') === 'true';
+                    }} else {{
+                        const cls = (c.className || '').toString().toLowerCase();
+                        isOn = cls.includes('checked')
+                            || cls.includes('--on')
+                            || cls.includes('active')
+                            || cls.includes('-on ');
+                    }}
+                    if (TARGET_ON === isOn) {{
+                        return TARGET_ON ? 'already ON' : 'already OFF';
+                    }}
+                    c.click();
+                    return TARGET_ON
+                        ? `clicked to turn ON (${{c.tagName}}.${{c.className?.toString().slice(0,40)}})`
+                        : `clicked to turn OFF`;
+                }}
+            }}
+            return 'no toggle found near Swap Owners label';
         }})()"""
         )
         logger.info("Step 2 Swap Owners: %s", toggle_result)
@@ -874,6 +904,18 @@ async def upload_csv(
         "Date of Death",
         "Probate Case Number",
         "Judge of Probate",
+        # Phone + Phone Tags columns (added 2026-06-25 — operator
+        # confirmed 517 SUN VALLEY RD probate upload landed phones in
+        # the CSV but they didn't appear on the DataSift record).
+        # Phone 1 is the primary dial-first slot; mapping it
+        # explicitly ensures the CSV's phone data survives Step 4's
+        # flaky auto-map.
+        "Phone 1",
+        "Phone Tags 1",
+        "Phone 2",
+        "Phone Tags 2",
+        "Phone 3",
+        "Phone Tags 3",
     ]
     for col_name in COLUMNS_TO_MAP:
         try:
