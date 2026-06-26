@@ -2327,13 +2327,54 @@ async def upload_to_datasift_per_distressor(
                     "list_name": list_name,
                 }
 
-            r = await upload_csv(
-                page,
-                csv_path,
-                list_name=list_name,
-                existing_list=True,
-                swap_owners=swap_owners,
-            )
+            # Wizard mode dispatch (added 2026-06-25 — Path A integration):
+            # For notice_types where swap_owners=True (probate, pre_probate
+            # per should_swap_owners), use the dedicated
+            # "Add Contact Data → Swap owner of an existing property"
+            # wizard mode via upload_csv_swap_owner(). For everything else
+            # (foreclosure, code_violation, tax sale, etc.) keep the
+            # existing "Add Data → Adding properties to an existing list"
+            # path via upload_csv().
+            #
+            # Why: the Add-Data path with the Step-2 Swap Owners toggle was
+            # the WRONG tool for owner replacement. Operator-reported on
+            # 2026-06-25 (517 SUN VALLEY RD probate + 5 pre-probate rows
+            # incl. 2916 BROWNING / 3317 PARK LANE / 6366 RED HOLLOW /
+            # 1506 GREEN OAK CIR / 430 15TH CT NW) — notes + tags landed
+            # but ownership wasn't swapped, phones didn't attach. The
+            # dedicated swap-owner mode matches by Property Address,
+            # silently skips non-matches (no duplicates created), and
+            # auto-applies owner+phone+tags+notes blob in one pass.
+            # Headed-mode probe + operator manual verification on 2026-
+            # 06-25 confirmed the swap path works end-to-end.
+            #
+            # CAVEAT — pure-swap mode silently skips properties that
+            # DON'T yet exist in DataSift. For pre-probate this means any
+            # brand-new obit-discovered property (not previously hit by a
+            # distressor scan) gets dropped. Acceptable as a stop-gap;
+            # the proper fix is the hybrid orchestrator (swap-pass +
+            # Add-Data-pass for unmatched rows), which requires the Day-2
+            # drag-drop fix to be useful.
+            if swap_owners:
+                logger.info(
+                    "Routing to swap-owner wizard mode (notice_type=%s, "
+                    "list=%s) — Add-Data path bypassed for owner-replacement "
+                    "use case",
+                    notice_type, list_name,
+                )
+                r = await upload_csv_swap_owner(
+                    page,
+                    csv_path,
+                    tag="Courthouse Data",
+                )
+            else:
+                r = await upload_csv(
+                    page,
+                    csv_path,
+                    list_name=list_name,
+                    existing_list=True,
+                    swap_owners=swap_owners,
+                )
             r["notice_type"] = notice_type
             r["list_name"] = list_name
             uploads.append(r)
