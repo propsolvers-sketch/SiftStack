@@ -748,6 +748,72 @@ _FORBIDDEN_SINGLE_WORD_NAMES = frozenset({
 })
 
 
+# Legal qualifiers commonly appended to mortgagor names in AL foreclosure
+# notices: "John Doe, AN UNMARRIED MAN AND Jane Roe, A SINGLE WOMAN, AS
+# JOINT TENANTS WITH RIGHT OF SURVIVORSHIP". These cause the owner string
+# to balloon past _is_valid_name's 80-char limit → silently rejected →
+# CSV ships with empty owner → no skip-trace match → no phones.
+#
+# Operator-reported 2026-06-25 — 107 ELLEDGE FARM DR (Hazel Green, Madison
+# County) shipped with empty owner. LLM had correctly extracted
+# "CHRISSY MARONEY, AN UNMARRIED WOMAN AND LOGAN LEE MCELYEA, AN UNMARRIED
+# MAN, JOINT TENANCY WITH RIGHT OF SURVIVORSHIP" (96 chars) → rejected.
+_OWNER_QUALIFIER_RE = re.compile(
+    r",\s*(?:"
+    # "(a/an) unmarried man/woman" — "a/an" optional because some LLM
+    # outputs strip it ("CHRISTEN GRACE, SINGLE WOMAN" — observed 2026-
+    # 06-25 from 440 4TH ST NW).
+    r"(?:an?\s+)?unmarried\s+(?:wo)?man"
+    r"|(?:an?\s+)?(?:un)?married\s+(?:wo)?man"
+    r"|(?:an?\s+)?single\s+(?:wo)?man"
+    r"|(?:an?\s+)?married\s+couple"
+    r"|husband\s+and\s+wife"
+    r"|as\s+joint\s+tenants?(?:\s+with\s+(?:rights?|right)\s+of\s+survivorship)?"
+    r"|joint\s+tenan(?:cy|ts)(?:\s+with\s+(?:rights?|right)\s+of\s+survivorship)?"
+    r"|with\s+(?:rights?|right)\s+of\s+survivorship"
+    r"|tenan(?:cy|ts)\s+in\s+common"
+    r"|trustee\s+of[\s\S]*"
+    r")\b[\s\S]*?(?=,|$| AND )",
+    re.IGNORECASE,
+)
+
+
+def _clean_owner_name(raw: str) -> str:
+    """Strip AL legal qualifiers + collapse multi-owner joint-tenancy strings.
+
+    Returns the PRIMARY mortgagor name (first one if multiple are
+    AND-conjoined). Co-owners get dropped from the owner field; consumers
+    needing the full membership can preserve `raw` separately. Without
+    this cleanup, multi-owner joint-tenancy strings exceed the 80-char
+    validity limit and the entire owner field gets silently dropped.
+
+    Examples:
+        "CHRISSY MARONEY, AN UNMARRIED WOMAN AND LOGAN LEE MCELYEA, AN
+         UNMARRIED MAN, JOINT TENANCY WITH RIGHT OF SURVIVORSHIP"
+            → "CHRISSY MARONEY"
+        "JOHN DOE, A SINGLE MAN"
+            → "JOHN DOE"
+        "JOHN DOE AND JANE DOE, HUSBAND AND WIFE"
+            → "JOHN DOE"
+    """
+    if not raw:
+        return raw
+    cleaned = _OWNER_QUALIFIER_RE.sub("", raw)
+    # Split on " AND " to pick the primary mortgagor (first listed). Use
+    # uppercase AND to avoid mis-splitting on lowercase "and" inside a
+    # surname (rare, but possible). The qualifier regex above already
+    # stripped trailing context after the first " AND " segment when a
+    # qualifier preceded it, so this is a backstop for the
+    # "JOHN DOE AND JANE DOE" no-qualifier case.
+    for sep in (" AND ", " and "):
+        if sep in cleaned:
+            cleaned = cleaned.split(sep, 1)[0]
+            break
+    # Trim trailing punctuation + collapse repeated whitespace
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().rstrip(",.;:")
+    return cleaned
+
+
 def _is_valid_name(name: str) -> bool:
     """Reject names that are obviously not real person/entity names."""
     lower = name.strip().lower()
@@ -776,13 +842,37 @@ PUBLISH_DATE_RE = re.compile(
 # The date may be "Month DD, YYYY", "MM/DD/YYYY", or with a day-of-week prefix.
 
 # Reusable date fragment: matches "March 18, 2026", "MARCH 27, 2026",
-# "04/17/2025", optional day-of-week prefix like "Wednesday, " or "FRIDAY, "
+# "04/17/2025", "the 12th day of August, 2026" (AL ordinal format used by
+# Marshall + Madison County notices), optional day-of-week prefix like
+# "Wednesday, " or "FRIDAY, ".
+#
+# Operator-reported 2026-06-25 (3 Marshall/Madison foreclosure rows landed
+# in DataSift with PAST dates 2022-2025 + wrong/empty owners): the AL
+# ordinal format wasn't in this fragment. Every auction-anchored regex in
+# AUCTION_DATE_PATTERNS uses `\bon\s+` + _DATE_FRAGMENT to locate the
+# auction date AFTER "will sell at public outcry...on". Without ordinal
+# support, all anchored patterns failed for Marshall/Madison notices →
+# parser fell through to the bare unanchored ordinal pattern → bare
+# pattern matched the FIRST ordinal date in the text, which is always
+# the MORTGAGE EXECUTION date from the "WHEREAS, executed a Mortgage on
+# the Nth day of..." preamble. Result: 107 ELLEDGE FARM showed 2/24/2023
+# (the original mortgage date), 440 4TH ST NW showed 3/19/2025, and
+# 2017 WEDGEWOOD DR NE showed 4/22/2022 — all 2-4 years stale, even
+# though the file numbers (PHL-26-XXXX, PNY-26-XXXX) confirm these are
+# 2026 foreclosure filings with future August 2026 auction dates.
 _DATE_FRAGMENT = (
     r"(?:(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s*,?\s*)?"
     r"("
     r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
     r"\s+\d{1,2}\s*,?\s*\d{4}"
     r"|\d{1,2}/\d{1,2}/\d{4}"
+    # AL ordinal format: "the 12th day of August, 2026" — used by
+    # Marshall + Madison County notices. The optional "the\s+" prefix is
+    # captured outside the group so the matched date string can still be
+    # normalized to ISO via _normalize_date.
+    r"|(?:the\s+)?\d{1,2}(?:st|nd|rd|th)\s+day\s+of\s+"
+    r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"\s*,?\s*\d{4}"
     r")"
 )
 
@@ -837,13 +927,16 @@ AUCTION_DATE_PATTERNS = [
         r"proceed\s+to\s+sell\b.{0,80}?\bon\s+" + _DATE_FRAGMENT,
         re.IGNORECASE | re.DOTALL,
     ),
-    # "the 12th day of February, 2026" — ordinal date format
-    re.compile(
-        r"the\s+(\d{1,2}(?:st|nd|rd|th)\s+day\s+of\s+"
-        r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
-        r"\s*,?\s*\d{4})",
-        re.IGNORECASE,
-    ),
+    # NOTE: A bare unanchored ordinal pattern lived here previously. It
+    # was matching the FIRST "the Nth day of Month, Year" phrase in the
+    # text — which in AL foreclosure notices is the MORTGAGE EXECUTION
+    # date from the "WHEREAS, executed a Mortgage on..." preamble, NOT
+    # the auction sale date. Removed 2026-06-25 after operator reported
+    # 3 Marshall/Madison rows landed in DataSift with PAST dates (2022,
+    # 2023, 2025) for properties whose actual auction dates are
+    # July/August 2026. The ordinal format is now supported INSIDE the
+    # auction-anchored patterns above via _DATE_FRAGMENT's new ordinal
+    # alternative, so the correct date is captured directly.
     # "sell the property described on: Friday, February 20, 2026"
     re.compile(
         r"(?:sell|advertise)\s+the\s+property\s+described\s+on\s*:\s*" + _DATE_FRAGMENT,
@@ -1343,12 +1436,29 @@ async def parse_notice_page(
                 notice.zip = llm_result.get("zip") or notice.zip
                 logger.info("LLM filled address: %s", notice.address)
             if not notice.owner_name and llm_result.get("owner_name"):
-                cand = llm_result["owner_name"].strip()
+                raw_cand = llm_result["owner_name"].strip()
+                # Strip AL legal qualifiers + collapse joint-tenancy
+                # multi-owner strings BEFORE validation. Without this,
+                # multi-owner strings ("CHRISSY MARONEY, AN UNMARRIED
+                # WOMAN AND LOGAN LEE MCELYEA, AN UNMARRIED MAN, JOINT
+                # TENANCY...") exceed the 80-char validity limit and the
+                # whole owner field gets dropped → empty owner in CSV →
+                # no skip-trace match → no phones.
+                cand = _clean_owner_name(raw_cand)
                 if _is_valid_name(cand):
                     notice.owner_name = cand
-                    logger.info("LLM filled owner: %s", notice.owner_name)
+                    if cand != raw_cand:
+                        logger.info(
+                            "LLM filled owner: %s (cleaned from %r)",
+                            notice.owner_name, raw_cand,
+                        )
+                    else:
+                        logger.info("LLM filled owner: %s", notice.owner_name)
                 else:
-                    logger.debug("LLM owner rejected as junk: %r", cand)
+                    logger.debug(
+                        "LLM owner rejected as junk: %r (cleaned to %r)",
+                        raw_cand, cand,
+                    )
             if not notice.auction_date and llm_result.get("auction_date"):
                 notice.auction_date = llm_result["auction_date"]
                 logger.info("LLM filled auction_date: %s", notice.auction_date)
@@ -1440,6 +1550,14 @@ def _extract_publish_date(full_text: str) -> str:
 def _normalize_date(raw: str) -> str:
     """Convert various date formats to YYYY-MM-DD."""
     raw = raw.strip().rstrip(".")
+
+    # Strip a leading "the " — the AL ordinal format is "the 12th day of
+    # August, 2026" and the auction-anchored regex captures the optional
+    # "the" inside its capture group when it's present in the source text.
+    # Without this strip, the ordinal_m match below would fail because
+    # re.match anchors to start-of-string.
+    if raw.lower().startswith("the "):
+        raw = raw[4:].lstrip()
 
     # Handle ordinal format: "12th day of February, 2026" → "February 12, 2026"
     ordinal_m = re.match(
