@@ -53,14 +53,55 @@ def _get_contacts_for_trace(
             and notice.decision_maker_name
             and notice.decision_maker_name.strip()):
 
-        # Always include DM #1 (primary contact)
+        # Always include DM #1 (primary contact) — but with two gates that
+        # the broader pipeline only enforces post-Tracerfy:
+        #
+        # GATE 1 (self-DM) — when the obit/probate extractor falsely set
+        # the DM name to the decedent's own name (happens for solo-living
+        # decedents where the obit names no separate survivors), there's
+        # no real person to skip-trace. Sending "Beau Williams @ <Beau's
+        # property>" to Tracerfy returns 0 matches AND poisons the entire
+        # batch with a 400 "No valid rows after data cleaning" response,
+        # taking down skip-trace for the OTHER 2 valid rows. Skip self-DM
+        # contacts here so the rest of the batch survives. Operator-
+        # reported 2026-06-26: 2213 STERLING RIDGE CIR pre-probate row
+        # had Decedent=Owner=Beau Williams and Tracerfy 400'd the whole
+        # 3-row batch including 2 valid rows behind it.
+        #
+        # GATE 2 (no real DM mailing) — previously this line fell back to
+        # the PROPERTY address when decision_maker_street was empty (i.e.
+        # asked Tracerfy "does this DM live at the dead person's house?").
+        # Tracerfy's data cleaning detects this as suspicious and rejects.
+        # Aligns with datasift_formatter._get_contact_info's explicit
+        # comment ("DM mailing — do NOT fall back to property address").
+        # Empty address contacts are skipped here too — Tracerfy can't
+        # trace a name without a mailing addr.
         dm_name = notice.decision_maker_name.strip()
-        address = notice.decision_maker_street or notice.address or ""
-        city_val = notice.decision_maker_city or notice.city or ""
-        zip_code = notice.decision_maker_zip or notice.zip or ""
-        first, last = _split_name(dm_name)
-        if first and last:
-            contacts.append((first, last, address, city_val, zip_code, dm_name))
+        dec_name = (notice.decedent_name or "").strip()
+        if dm_name.lower() == dec_name.lower():
+            logger.debug(
+                "Tracerfy: skipping self-DM contact (DM == decedent: %r) "
+                "for notice %r",
+                dm_name, notice.address or notice.source_url or "?",
+            )
+        else:
+            address = (notice.decision_maker_street or "").strip()
+            city_val = (notice.decision_maker_city or "").strip()
+            zip_code = (notice.decision_maker_zip or "").strip()
+            first, last = _split_name(dm_name)
+            if not first or not last:
+                pass  # unparseable name
+            elif not address:
+                logger.debug(
+                    "Tracerfy: skipping no-mailing contact (DM=%r at "
+                    "notice %r) — empty decision_maker_street, won't "
+                    "fall back to property addr (Tracerfy rejects)",
+                    dm_name, notice.address or notice.source_url or "?",
+                )
+            else:
+                contacts.append(
+                    (first, last, address, city_val, zip_code, dm_name)
+                )
 
         # Add other signing-authority heirs from heir_map_json
         if notice.heir_map_json:
