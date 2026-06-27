@@ -626,6 +626,26 @@ def _build_tags(notice: NoticeData, phone_tiers: dict | None = None) -> str:
     if getattr(notice, "dm_mailing_source", "") == "property_fallback":
         tags.append("mailing_unverified")
 
+    # Tracerfy-skip surface (added 2026-06-27 — UX layer on Bug B fix
+    # 843edbc). When tracerfy_skip_tracer skipped the contact before
+    # batch submission (self-DM or no real DM mailing), tag the row so
+    # the operator can spot it in DataSift's filter UI without trawling
+    # log files. The specific-reason tag lets them route differently:
+    #   `needs_dm_research`    — generic "manual research required"
+    #   `dm_self_dm`           — decedent named themselves as DM in the
+    #                            source notice; no separate executor was
+    #                            in the obit. Operator may want to look
+    #                            up the probate court filing directly.
+    #   `dm_no_mailing`        — DM identified but their real mailing
+    #                            address wasn't recoverable from any
+    #                            people-search source. May resolve once
+    #                            the property goes through formal probate
+    #                            (the court will publish the PR's mailing).
+    skip_reason = getattr(notice, "tracerfy_skip_reason", "")
+    if skip_reason:
+        tags.append("needs_dm_research")
+        tags.append(f"dm_{skip_reason}")
+
     # Signing chain tags
     if notice.signing_chain_count:
         try:

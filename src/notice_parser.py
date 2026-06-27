@@ -154,6 +154,17 @@ class NoticeData:
     # The formatter emits a `mailing_unverified` tag for property_fallback
     # so direct-mail filter presets can de-prioritize placeholder rows.
     dm_mailing_source: str = ""
+    # Recorded by tracerfy_skip_tracer._get_contacts_for_trace when the
+    # contact gets skipped from the Tracerfy batch before submission.
+    # Values:
+    #   ""           — not skipped (normal); contact submitted to Tracerfy
+    #   "self_dm"    — DM name == decedent name (no real person to trace)
+    #   "no_mailing" — DM has no real mailing address (won't fall back to
+    #                  property addr — Tracerfy rejects that)
+    # The formatter reads this and emits a `needs_dm_research` tag so the
+    # operator can filter for these rows in DataSift without trawling logs.
+    # Added 2026-06-27 as the UX surface for the Bug B fix (843edbc).
+    tracerfy_skip_reason: str = ""
     # Mailability flag
     mailable: str = ""                 # "yes" or "" (unmailable)
     # Entity research fields

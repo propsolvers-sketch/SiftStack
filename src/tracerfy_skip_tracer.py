@@ -79,6 +79,7 @@ def _get_contacts_for_trace(
         dm_name = notice.decision_maker_name.strip()
         dec_name = (notice.decedent_name or "").strip()
         if dm_name.lower() == dec_name.lower():
+            notice.tracerfy_skip_reason = "self_dm"
             logger.debug(
                 "Tracerfy: skipping self-DM contact (DM == decedent: %r) "
                 "for notice %r",
@@ -90,8 +91,9 @@ def _get_contacts_for_trace(
             zip_code = (notice.decision_maker_zip or "").strip()
             first, last = _split_name(dm_name)
             if not first or not last:
-                pass  # unparseable name
+                pass  # unparseable name — formatter has its own flagging
             elif not address:
+                notice.tracerfy_skip_reason = "no_mailing"
                 logger.debug(
                     "Tracerfy: skipping no-mailing contact (DM=%r at "
                     "notice %r) — empty decision_maker_street, won't "
