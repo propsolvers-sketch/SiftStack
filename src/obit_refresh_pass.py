@@ -257,60 +257,66 @@ def write_delta_csv(improvements: list[tuple[dict, dict]]) -> Path:
     # up the refresh delta automatically when this runs in CI.
     out_path = out_dir / f"datasift_upload_pre_probate_refresh_{timestamp}.csv"
 
-    # Notice Type is read by daily_finalize._notice_type_from_csv() to
-    # route the file to the right DataSift list (Pre-Probate). Without
-    # it the per-distressor uploader bails with "No NOTICE_TYPE_TO_LIST
-    # mapping" and the file gets skipped.
+    # MINIMAL SCHEMA — operator-reported 2026-06-28: Sunday's refresh run
+    # blanked Mailing addresses + replaced rich Notes blobs on 57+ existing
+    # DataSift records because:
+    #
+    #   1. This refresh CSV used to ship Mailing/First/Last/Notes columns
+    #      populated from the archived original. When the original was old
+    #      enough that downstream skip-trace hadn't yet completed, those
+    #      fields were empty or stale — and the swap-mode integration we
+    #      shipped 2026-06-25 (commit 9c641f3) routes any pre_probate CSV
+    #      through the "Swap owner of existing property" wizard, which
+    #      applies every CSV column to the matched record. Empty cells
+    #      overwrite existing data.
+    #
+    #   2. Rich Notes (executor / signing chain / phone tiers, etc.) got
+    #      stomped by the bare obit-refresh blob via the same mechanism.
+    #
+    # The fix is to ONLY ship columns the refresh pass legitimately wants
+    # to update. The refresh signal goes entirely into Tags — operators
+    # can filter DataSift for `obit_refreshed` to see refreshed records,
+    # then click through to the existing Obituary URL on the record (which
+    # is preserved because we no longer touch Notes) to see what changed.
+    #
+    # Canonical column names match the regular pre-probate CSV so the
+    # daily_finalize consolidator's header union works cleanly when the
+    # refresh CSV is consolidated with the regular CSV.
     cols = [
         "Notice Type",
-        "Property address", "Property city", "Property state", "Property zip",
-        "First Name", "Last Name",
-        "Mailing address", "Mailing city", "Mailing state", "Mailing zip",
-        "Tags", "Messages", "Notes",
+        "Property Street Address",
+        "Property City",
+        "Property State",
+        "Property ZIP Code",
+        "Tags",
     ]
 
+    today_iso = datetime.now().strftime("%Y-%m-%d")
     rows = []
     for original, refresh in improvements:
-        survivors = refresh["all_survivors"]
-        survivor_summary = "; ".join(
-            f"{s.get('name','?')} ({s.get('relationship','?')})"
-            for s in survivors[:15]
-        )
-        if len(survivors) > 15:
-            survivor_summary += f" ... +{len(survivors)-15} more"
-
-        note = (
-            f"=== OBIT REFRESH ({datetime.now().strftime('%Y-%m-%d')}) ===\n"
-            f"Originally extracted {refresh['old_survivor_count']} survivors; "
-            f"refreshed count is {refresh['new_survivor_count']}. "
-            f"Family appears to have added detail to the obituary after "
-            f"the initial publication on {original['first_seen_date']}.\n\n"
-            f"Decedent: {refresh['decedent_full_name']}\n"
-            f"Date of death: {refresh['date_of_death']}\n"
-            f"Spouse: {refresh.get('spouse_name') or '(not stated)'}\n"
-            f"Executor named: {refresh.get('executor_named') or '(not stated)'}\n"
-            f"All survivors: {survivor_summary}\n"
-            f"Source: {refresh['url']}"
-        )
+        old_count = refresh["old_survivor_count"]
+        new_count = refresh["new_survivor_count"]
+        # Encode the refresh detail entirely in tags so the operator can
+        # filter for it WITHOUT having to inspect the Notes blob (which
+        # we deliberately no longer touch).
+        tag_parts = [
+            "Courthouse Data",
+            "obit_refreshed",
+            f"obit_refreshed_{today_iso}",
+            f"obit_refresh_survivors_to_{new_count}",
+        ]
+        if old_count == 0 and new_count > 0:
+            # New-info case — most actionable (family added survivors after
+            # initial publication, which often means the obit was a stub
+            # at first and is now a real family graph).
+            tag_parts.append("obit_refresh_new_info")
         rows.append({
             "Notice Type": "pre_probate",
-            "Property address": original["property_addr"],
-            "Property city": original["property_city"],
-            "Property state": original["property_state"],
-            "Property zip": original["property_zip"],
-            "First Name": original["owner_first"],
-            "Last Name": original["owner_last"],
-            "Mailing address": original["mailing_addr"],
-            "Mailing city": original["mailing_city"],
-            "Mailing state": original["mailing_state"],
-            "Mailing zip": original["mailing_zip"],
-            "Tags": "Courthouse Data, obit_refreshed",
-            "Messages": (
-                f"Obit refresh on {datetime.now().strftime('%Y-%m-%d')}: "
-                f"survivors {refresh['old_survivor_count']}→"
-                f"{refresh['new_survivor_count']}"
-            ),
-            "Notes": note,
+            "Property Street Address": original["property_addr"],
+            "Property City": original["property_city"],
+            "Property State": original["property_state"],
+            "Property ZIP Code": original["property_zip"],
+            "Tags": ", ".join(tag_parts),
         })
 
     with open(out_path, "w", newline="", encoding="utf-8") as f:

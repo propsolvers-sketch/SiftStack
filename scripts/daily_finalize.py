@@ -335,24 +335,58 @@ def _consolidate_csvs(group: list[Path], notice_type: str) -> Path | None:
     out_dir = group[0].parent
     out_path = out_dir / f"datasift_upload_{nt_slug}_consolidated_{timestamp}.csv"
 
-    header: list[str] | None = None
+    # Two-pass: collect the UNION of all input fieldnames first, then write
+    # rows with that union as the output header.
+    #
+    # Single-pass with "header = group[0]'s fieldnames" silently dropped
+    # all columns from later files that weren't in the first file. Caused
+    # the 2026-06-28 regression where pre_probate's Sunday obit-refresh
+    # CSV (14 columns) got picked as group[0], stripping 66 columns off
+    # every row from the regular pre_probate CSV that followed it in the
+    # group. Net effect: rich-data rows became degraded "address + obit-
+    # refresh notes" rows that wiped Mailing + Notes via swap-mode upload.
+    #
+    # The union approach preserves rich data while letting minimal-schema
+    # CSVs like the refresh delta coexist — missing columns ship as empty
+    # for those rows, which under swap mode means "no change" for those
+    # fields (CSV writer omits absent keys, swap-mode preserves untouched
+    # columns).
+    union: list[str] = []
+    seen_cols: set[str] = set()
+    valid_sources: list[Path] = []
+    for src in group:
+        try:
+            with open(src, newline="", encoding="utf-8") as in_f:
+                reader = csv.DictReader(in_f)
+                for col in (reader.fieldnames or []):
+                    if col not in seen_cols:
+                        seen_cols.add(col)
+                        union.append(col)
+                valid_sources.append(src)
+        except Exception as e:
+            logger = __import__("logging").getLogger(__name__)
+            logger.warning("Skipping %s during consolidation: %s", src, e)
+            continue
+
+    if not union or not valid_sources:
+        return None
+
     rows_written = 0
     with open(out_path, "w", newline="", encoding="utf-8") as out_f:
-        writer = None
-        for src in group:
+        writer = csv.DictWriter(
+            out_f, fieldnames=union, extrasaction="ignore",
+        )
+        writer.writeheader()
+        for src in valid_sources:
             try:
                 with open(src, newline="", encoding="utf-8") as in_f:
                     reader = csv.DictReader(in_f)
-                    if header is None:
-                        header = list(reader.fieldnames or [])
-                        writer = csv.DictWriter(out_f, fieldnames=header)
-                        writer.writeheader()
                     for row in reader:
                         writer.writerow(row)
                         rows_written += 1
             except Exception as e:
                 logger = __import__("logging").getLogger(__name__)
-                logger.warning("Skipping %s during consolidation: %s", src, e)
+                logger.warning("Skipping %s during consolidation pass 2: %s", src, e)
                 continue
 
     if rows_written == 0:
