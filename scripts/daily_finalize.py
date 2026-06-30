@@ -440,17 +440,47 @@ def _newest_log(pattern: str) -> Path | None:
 
 # ── Upload + Slack ──────────────────────────────────────────────────────
 
-async def _upload_one(p: Path, label: str) -> dict:
-    print(f"\n=== Uploading {p.name} ({label}) ===", flush=True)
+async def _upload_one(
+    p: Path,
+    label: str,
+    *,
+    mode: str = "auto",
+    enrich: bool = True,
+    skip_trace: bool = True,
+) -> dict:
+    """Upload one CSV through one wizard pass.
+
+    Two-pass architecture (operator-clarified 2026-06-29):
+      Pass 1 (mode="add", enrich=True, skip_trace=True):
+        - Called for ALL CSVs. Creates new records + updates existing by
+          address. Runs DataSift's Enrich Data + Skip Trace once after.
+      Pass 2 (mode="swap", enrich=False, skip_trace=False):
+        - Called for swap-eligible CSVs (probate, pre_probate) AFTER
+          Pass 1 completes for everyone. Updates owner/contact only;
+          enrich/skip-trace skipped since Pass 1 already ran them.
+    """
+    print(
+        f"\n=== Uploading {p.name} ({label}, mode={mode}) ===",
+        flush=True,
+    )
     try:
         r = await upload_to_datasift_per_distressor(
-            p, headless=True, enrich=True, skip_trace=True,
+            p,
+            headless=True,
+            enrich=enrich,
+            skip_trace=skip_trace,
+            mode=mode,
         )
     except Exception as e:
         r = {"success": False, "message": f"exception: {e}", "uploads": []}
     r["csv"] = p.name
     r["label"] = label
-    print(f"{p.name}: success={r.get('success')} {r.get('message','')}", flush=True)
+    r.setdefault("mode", mode)
+    print(
+        f"{p.name}: mode={r.get('mode')} success={r.get('success')} "
+        f"{r.get('message','')}",
+        flush=True,
+    )
     return r
 
 
@@ -657,13 +687,63 @@ async def main() -> int:
     for p in csvs:
         print(f"  {_categorize(p)}: {p.name}", flush=True)
 
+    # ── Two-pass upload (operator-clarified workflow 2026-06-29) ──
+    # Pass 1: Add-Data for ALL distressors — creates new records and
+    #         updates existing ones by Property Address. Auto-maps the
+    #         core fields (Property Address, Owner Name, Mailing,
+    #         Tags). Runs DataSift's Enrich Data + Skip Trace once
+    #         after each upload.
+    # Pass 2: Swap-Owner for swap-eligible only (probate, pre_probate
+    #         per should_swap_owners). Updates owner+phone+notes+tags
+    #         on existing records via the dedicated "Swap owner of
+    #         existing property" wizard mode. enrich + skip_trace
+    #         skipped (Pass 1 already ran them).
+    #
+    # Sequencing rationale (operator's "completely last" requirement):
+    # All Pass-1 Add-Data runs must complete BEFORE any Pass-2 swap
+    # runs start, so a probate property's swap-mode owner update is
+    # not re-overwritten by a later code-violation Add-Data upload on
+    # the same address.
+    #
+    # History: pre-2026-06-29 was single-pass (mode="auto" → swap for
+    # swap-eligible, add for others). That correctly handled owner
+    # replacement on EXISTING records but silently dropped every new
+    # property — operator-reported 2026-06-29 on 3 today-fresh pre-
+    # probate addresses missing in DataSift (1287 BRIERFIELD, 1145
+    # ALFORD, 820 AUGUST). The two-pass architecture closes that gap.
+    from datasift_formatter import should_swap_owners as _should_swap
+
     results: list[dict] = []
+    print("\n========== PASS 1: Add-Data (all distressors) ==========",
+          flush=True)
     for p in csvs:
         label = _categorize(p)
         if label == "unknown":
             print(f"  SKIP {p.name} (could not categorize)", flush=True)
             continue
-        results.append(await _upload_one(p, label))
+        results.append(await _upload_one(
+            p, label, mode="add", enrich=True, skip_trace=True,
+        ))
+
+    # Pass 2: only swap-eligible CSVs, after ALL Pass-1 runs complete.
+    swap_eligible = [
+        p for p in csvs
+        if _should_swap(_notice_type_from_csv(p))
+        and _categorize(p) != "unknown"
+    ]
+    if swap_eligible:
+        print(
+            f"\n========== PASS 2: Swap-Owner (swap-eligible only — "
+            f"{len(swap_eligible)} file(s)) ==========",
+            flush=True,
+        )
+        for p in swap_eligible:
+            label = _categorize(p)
+            r = await _upload_one(
+                p, label, mode="swap", enrich=False, skip_trace=False,
+            )
+            r["pass"] = 2
+            results.append(r)
 
     # ── Dropbox archive sync ────────────────────────────────────────
     # Operator request 2026-06-12: upload the archive + per-distressor

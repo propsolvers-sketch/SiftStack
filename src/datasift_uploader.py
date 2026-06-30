@@ -2187,6 +2187,8 @@ async def upload_to_datasift_per_distressor(
     enrich: bool = True,
     skip_trace: bool = True,
     tmp_dir: Path | None = None,  # kept for back-compat; ignored
+    *,
+    mode: str = "auto",
 ) -> dict:
     """Upload a SINGLE-distressor CSV to its corresponding DataSift list.
 
@@ -2197,6 +2199,14 @@ async def upload_to_datasift_per_distressor(
     Swap Owners flag, uploads via existing-list mode, then runs enrich +
     skip-trace with the per-distressor Swap Owners setting.
 
+    Two-pass architecture (operator-clarified 2026-06-29): the daily
+    finalizer calls this twice — once with mode="add" for ALL CSVs to
+    create records, then once with mode="swap" for swap-eligible CSVs
+    (pre_probate, probate) to update owner/contact. Pass 2 runs AFTER
+    Pass 1 completes for ALL distressors so pre/probate's swap-owner
+    update doesn't get re-overwritten by a later distressor's Add-Data
+    on the same property. See dispatch comment in body for details.
+
     Args:
         csv_path: Path to a DataSift-formatted CSV. ALL rows must share the
             same ``Notice Type`` value (validated by reading row 1 + spot-
@@ -2204,15 +2214,27 @@ async def upload_to_datasift_per_distressor(
             and will fail validation.
         email / password: DataSift creds. Default to env vars.
         headless: Playwright launch flag.
-        enrich: Run enrichment after upload.
-        skip_trace: Run skip-trace after upload.
+        enrich: Run enrichment after upload. Recommended True only on Pass
+            1 — Pass 2 should pass False to avoid double-enriching.
+        skip_trace: Run skip-trace after upload. Same recommendation as
+            enrich — Pass 1 only.
         tmp_dir: Unused. Retained so existing callers don't break.
+        mode: Wizard mode to use:
+            "add"  — Add-Data path via upload_csv. Creates records +
+                     updates existing by address. Pass-1 mode.
+            "swap" — Swap-Owner path via upload_csv_swap_owner. Updates
+                     owner+phone+notes+tags on existing records only;
+                     silently skips records not in DataSift. Pass-2 mode.
+            "auto" — Backward-compat: swap-eligible (probate, pre_probate)
+                     → swap, else → add. Equivalent to pre-2026-06-29
+                     single-pass behavior.
 
     Returns:
         Dict with ``success``, ``message``, ``uploads`` (single-entry list
         for back-compat with old caller expecting a list shape),
         ``enrich_result``, ``skip_trace_result``, ``notice_type``,
-        ``list_name``, ``swap_owners``.
+        ``list_name``, ``swap_owners``, ``mode`` (effective mode actually
+        used: "add" or "swap", resolved from the input ``mode`` arg).
     """
     from datasift_formatter import NOTICE_TYPE_TO_LIST, should_swap_owners
 
@@ -2327,39 +2349,45 @@ async def upload_to_datasift_per_distressor(
                     "list_name": list_name,
                 }
 
-            # Wizard mode dispatch (added 2026-06-25 — Path A integration):
-            # For notice_types where swap_owners=True (probate, pre_probate
-            # per should_swap_owners), use the dedicated
-            # "Add Contact Data → Swap owner of an existing property"
-            # wizard mode via upload_csv_swap_owner(). For everything else
-            # (foreclosure, code_violation, tax sale, etc.) keep the
-            # existing "Add Data → Adding properties to an existing list"
-            # path via upload_csv().
+            # Wizard mode dispatch — two-pass architecture (2026-06-29).
+            # Operator-clarified intended workflow:
+            #   Pass 1 (mode="add")  — Add-Data for ALL distressors. Creates
+            #     new records; updates existing by address. Uses upload_csv
+            #     with swap_owners=False (we never want the Step-2 Swap
+            #     Owners toggle on the Add path — Pass 2 handles the swap
+            #     via the dedicated wizard mode).
+            #   Pass 2 (mode="swap") — Swap-Owner for swap-eligible only
+            #     (probate, pre_probate per should_swap_owners). Updates
+            #     owner+phone+tags+notes via the dedicated "Swap owner of
+            #     existing property" wizard mode. Silently skips properties
+            #     not yet in DataSift — that's WHY Pass 1 must run first.
             #
-            # Why: the Add-Data path with the Step-2 Swap Owners toggle was
-            # the WRONG tool for owner replacement. Operator-reported on
-            # 2026-06-25 (517 SUN VALLEY RD probate + 5 pre-probate rows
-            # incl. 2916 BROWNING / 3317 PARK LANE / 6366 RED HOLLOW /
-            # 1506 GREEN OAK CIR / 430 15TH CT NW) — notes + tags landed
-            # but ownership wasn't swapped, phones didn't attach. The
-            # dedicated swap-owner mode matches by Property Address,
-            # silently skips non-matches (no duplicates created), and
-            # auto-applies owner+phone+tags+notes blob in one pass.
-            # Headed-mode probe + operator manual verification on 2026-
-            # 06-25 confirmed the swap path works end-to-end.
+            # Caller-controlled. daily_finalize.py runs Pass 1 across ALL
+            # CSVs to completion BEFORE starting Pass 2 (operator's
+            # "completely last" requirement so nothing pre/probate-swap-
+            # updates gets re-overwritten by code-violation Add-Data).
             #
-            # CAVEAT — pure-swap mode silently skips properties that
-            # DON'T yet exist in DataSift. For pre-probate this means any
-            # brand-new obit-discovered property (not previously hit by a
-            # distressor scan) gets dropped. Acceptable as a stop-gap;
-            # the proper fix is the hybrid orchestrator (swap-pass +
-            # Add-Data-pass for unmatched rows), which requires the Day-2
-            # drag-drop fix to be useful.
-            if swap_owners:
+            # mode="auto" (default) preserves the pre-2026-06-29 single-
+            # pass behavior — swap for swap-eligible, add for others — so
+            # any caller that hasn't been updated keeps working.
+            #
+            # History:
+            #   2026-06-25 (commit 9c641f3) — first introduced swap mode
+            #     routing for swap-eligible. Closed the owner-not-swapping
+            #     bug but introduced the silent-skip-new-records bug.
+            #   2026-06-29 — operator reported 3 today-fresh pre-probate
+            #     addresses missing in DataSift (1287 BRIERFIELD, 1145
+            #     ALFORD, 820 AUGUST). Pass-1 Add-Data on the same CSV
+            #     created all 3 immediately. Architecture revised here.
+            if mode == "auto":
+                effective_mode = "swap" if swap_owners else "add"
+            else:
+                effective_mode = mode
+
+            if effective_mode == "swap":
                 logger.info(
-                    "Routing to swap-owner wizard mode (notice_type=%s, "
-                    "list=%s) — Add-Data path bypassed for owner-replacement "
-                    "use case",
+                    "Pass-2 swap-owner mode (notice_type=%s, list=%s) — "
+                    "updating owner/contact on existing records",
                     notice_type, list_name,
                 )
                 r = await upload_csv_swap_owner(
@@ -2367,16 +2395,26 @@ async def upload_to_datasift_per_distressor(
                     csv_path,
                     tag="Courthouse Data",
                 )
-            else:
+            else:  # "add"
+                logger.info(
+                    "Pass-1 Add-Data mode (notice_type=%s, list=%s) — "
+                    "creating records + auto-mapping core fields",
+                    notice_type, list_name,
+                )
                 r = await upload_csv(
                     page,
                     csv_path,
                     list_name=list_name,
                     existing_list=True,
-                    swap_owners=swap_owners,
+                    # NEVER fire Step-2 Swap Owners toggle on Pass 1.
+                    # Pass 2 handles owner replacement via the dedicated
+                    # swap-owner wizard mode. Mixing Step-2 toggle here
+                    # would re-create the 2026-06-25 silent-no-op bug.
+                    swap_owners=False,
                 )
             r["notice_type"] = notice_type
             r["list_name"] = list_name
+            r["mode"] = effective_mode
             uploads.append(r)
 
             if enrich:
