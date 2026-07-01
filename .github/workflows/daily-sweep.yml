@@ -35,14 +35,27 @@ permissions:
 jobs:
   daily-sweep:
     runs-on: ubuntu-latest
-    # 240 min budget. Bumped from 180 after the 2026-06-11 run hit the
-    # 3h cap on a high-volume day (112 notices + obit-fetch waterfalls
-    # for surnames like BENNETT). The src-side mitigations landed in
-    # the same commit (obit per-notice cap of 5, per-URL fetch timeout
-    # of 8s, pdfminer/urllib3 DEBUG silencing) should keep typical
-    # wall-clock well under 2h, but the extra 60 min of headroom
-    # absorbs spikes without killing the entire run.
-    timeout-minutes: 240
+    # 360 min budget. Bumped 2026-07-01 from 240 after Wednesday's
+    # high-volume foreclosure run cancelled at 4-hour cap TWICE (runs
+    # 28501151268 + 28523846145). The first cancellation was really a
+    # CAPTCHA solver failure (0/132 solves due to networkidle wait bug —
+    # fixed in commit 92dfe97) so the wall-clock estimate was distorted
+    # by all the failed retries. The second run confirmed the CAPTCHA
+    # fix (212/215 solves = 98.6%) but STILL didn't finish — 337 notices
+    # processed and enrichment was still running when the 240-min cap
+    # hit. Wednesday foreclosure volume genuinely exceeds the 4h budget
+    # on our current serial scrape+enrich pipeline. 360 min gives ~50%
+    # more headroom, absorbing normal Wednesday spikes plus emergency
+    # backlog days without cancelling.
+    #
+    # History:
+    #   180 min → 240 min (2026-06-11): 112 notices + BENNETT obit waterfalls
+    #   240 min → 360 min (2026-07-01): CAPTCHA fix revealed Wednesday's
+    #     genuine 4h+ scrape+enrich wall-clock. seen_ids incremental commits
+    #     (bot commit 0afa2c3) mean a re-triggered follow-up run picks up
+    #     where the cancelled one left off, so runaway cancellations are
+    #     recoverable but disruptive — the extra headroom prevents them.
+    timeout-minutes: 360
 
     # bash with -e (exit on error) and pipefail so that `cmd | tee` doesn't
     # mask non-zero exits from the python pipeline. With continue-on-error
