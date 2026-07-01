@@ -148,7 +148,29 @@ async def solve_captcha_and_view(
                 continue
 
             await view_btn.click()
-            await page.wait_for_load_state("networkidle")
+
+            # 2026-07-01 fix: prior code did `wait_for_load_state("networkidle")`
+            # with the default 60s timeout. Started failing 100% of the time on
+            # today's cron (0/132 successes over 4 hours = workflow cancelled).
+            # Site now does background network activity (tracking / long-poll)
+            # that keeps the network active indefinitely, so networkidle NEVER
+            # fires. Each failed attempt burned 60s × 3 retries = 3 min per
+            # notice; entire workflow died before scraping ANYTHING.
+            #
+            # New approach: wait DIRECTLY for the outcome selector (either
+            # success = "Notice Content" appears, or failure = CAPTCHA gate
+            # message still present). 10s cap. If neither appears in 10s,
+            # fall through to the existing polling checks — most of the time
+            # a small hard wait is enough for the DOM to update post-click.
+            try:
+                await page.wait_for_selector(
+                    "text='Notice Content'", timeout=10000,
+                )
+            except Exception:
+                # Success signal didn't appear in 10s — either CAPTCHA failed
+                # or page is still loading. Give it a small nudge and let
+                # the downstream checks decide.
+                await page.wait_for_timeout(1000)
 
             # Verify the notice content is now visible
             content_el = await page.query_selector("text='Notice Content'")
