@@ -1,14 +1,38 @@
-"""2Captcha integration for solving reCAPTCHA v2 on alabamapublicnotices.com.
+"""Cloudflare Turnstile integration for solving CAPTCHAs on
+alabamapublicnotices.com.
 
-Every notice detail page (Details.aspx) on alabamapublicnotices.com (Jefferson,
-Madison, Marshall — the active AL pipelines) requires solving a reCAPTCHA v2
-checkbox before the full notice text is revealed. Flow:
+MIGRATION (2026-07-02, v3): alabamapublicnotices.com switched from Google
+reCAPTCHA v2 to Cloudflare Turnstile sometime between 2026-06-30 (last
+successful cron run) and 2026-07-01 (broke). Evidence from headed-mode
+probe on 2026-07-02:
+  - Response field: cf-turnstile-response (was g-recaptcha-response)
+  - Widget: <div class="cf-turnstile" data-sitekey="0x4AAAAAAD..." id="recaptcha">
+    (the id="recaptcha" is a legacy label; the actual widget is Turnstile)
+  - Turnstile API script loaded: challenges.cloudflare.com/turnstile/v0/api.js
+  - New gate message: "You must complete the CAPTCHA in order to continue."
+    (was "You must complete the reCAPTCHA")
+  - Button label: "I Agree, View Notice" (was just "View Notice") — button
+    ID unchanged, so SEL_VIEW_NOTICE_BUTTON still valid.
+
+The v1 fix (07-01, commit 92dfe97) and v2 fix (07-01, commit c1cbe83) both
+targeted the wrong CAPTCHA provider — 2Captcha was returning reCAPTCHA
+tokens that the site (validating Turnstile tokens) silently rejected. The
+"gate cleared" success signal in v1 was fooled by the new gate message
+text not matching the old string; v2 correctly refused to claim success
+but never got a real one because the token itself was wrong-provider.
+
+Flow (v3):
   1. Verify we're on the detail page (View Notice button exists)
-  2. Send websiteURL + sitekey to 2Captcha API
-  3. 2Captcha returns a g-recaptcha-response token (~10-30s)
-  4. Inject token into the page's hidden textarea
-  5. Click "View Notice" button to submit
-  6. Verify the notice content is now visible
+  2. Extract Turnstile sitekey from the page's data-sitekey attribute
+     (fall back to config.TURNSTILE_SITEKEY_FALLBACK if the attribute is
+     missing — happens if the widget hasn't hydrated yet)
+  3. Send URL + sitekey to 2Captcha's turnstile solver
+  4. Inject the token into cf-turnstile-response
+  5. Click "I Agree, View Notice" button to submit
+  6. Wait up to 45s for the notice content to render
+  7. Confirm via either "Notice Content" text (legacy marker, may or may
+     not still exist post-migration) OR substantial body content length
+     (>1500 chars, matches historical average notice size)
 """
 
 import asyncio
@@ -19,12 +43,46 @@ from playwright.async_api import Page, TimeoutError as PwTimeout
 from twocaptcha import TwoCaptcha
 
 import config
-from config import MAX_RETRIES, RECAPTCHA_SITEKEY, SEL_VIEW_NOTICE_BUTTON
+from config import (
+    MAX_RETRIES,
+    SEL_VIEW_NOTICE_BUTTON,
+    TURNSTILE_SITEKEY_FALLBACK,
+)
 
 if TYPE_CHECKING:
     from observability import ServiceRateTracker
 
 logger = logging.getLogger(__name__)
+
+# Minimum body text length to consider the notice content "rendered".
+# Empirical: pre-CAPTCHA pages are ~450 chars (Terms of Use + gate
+# message); post-CAPTCHA pages with real notice content are typically
+# 2000-20000 chars. 1500 is a safe threshold that catches even the
+# shortest legitimate notices while cleanly rejecting the gate-only page.
+MIN_CONTENT_CHARS = 1500
+
+
+async def _extract_turnstile_sitekey(page: Page) -> str:
+    """Read the Turnstile sitekey from the widget's data-sitekey attribute.
+
+    Falls back to the hardcoded default when the attribute is missing —
+    happens rarely if the widget hasn't fully hydrated by the time we
+    check, or if the site changes markup again.
+    """
+    try:
+        widget = await page.query_selector(".cf-turnstile[data-sitekey]")
+        if widget:
+            sitekey = await widget.get_attribute("data-sitekey")
+            if sitekey and sitekey.startswith("0x"):
+                return sitekey
+    except Exception as e:
+        logger.debug("Sitekey extraction via selector failed: %s", e)
+
+    logger.debug(
+        "Turnstile widget data-sitekey not found — using fallback %s",
+        TURNSTILE_SITEKEY_FALLBACK,
+    )
+    return TURNSTILE_SITEKEY_FALLBACK
 
 
 async def solve_captcha_and_view(
@@ -32,18 +90,20 @@ async def solve_captcha_and_view(
     *,
     rate_tracker: "ServiceRateTracker | None" = None,
 ) -> bool:
-    """Solve reCAPTCHA v2 and click View Notice to reveal the full text.
+    """Solve Cloudflare Turnstile and click View Notice to reveal the full
+    notice text.
 
-    Retries up to MAX_RETRIES times on failure.
-    Returns True if the notice text is now visible, False otherwise.
+    Retries up to MAX_RETRIES times on failure. Returns True if the notice
+    text is now visible, False otherwise.
 
     Per CONTEXT.md D-04 (2Captcha success semantics):
-      - success = solved on any of the 3 attempts (View Notice button cleared
-        the gate)
+      - success = solved on any of the 3 attempts (View Notice button
+        cleared the gate AND notice content rendered)
       - failure = exhausted MAX_RETRIES without clearing the gate
       - IP-block bailout is NOT a 2Captcha failure (no record() call)
-      - "Content already visible — no CAPTCHA needed" path is NOT a 2Captcha
-        call either (no record() call) — the service was never invoked
+      - "Content already visible — no CAPTCHA needed" path is NOT a
+        2Captcha call either (no record() call) — the service was never
+        invoked
     """
     if not config.CAPTCHA_API_KEY:
         logger.error("CAPTCHA_API_KEY not set — cannot solve CAPTCHA")
@@ -64,168 +124,188 @@ async def solve_captcha_and_view(
                 )
                 return False  # Bail immediately, don't retry
 
-            # Check if the notice content is already visible (no CAPTCHA needed)
-            content_el = await page.query_selector("text='Notice Content'")
-            if content_el:
-                logger.info("Notice content already visible — no CAPTCHA needed")
+            # Check if the notice content is already visible (no CAPTCHA
+            # needed). Two-signal check because post-Turnstile the "Notice
+            # Content" text marker may or may not still be present — trust
+            # body length as the definitive indicator.
+            body_text = await page.inner_text("body")
+            if (await page.query_selector("text='Notice Content'")
+                    or len(body_text) >= MIN_CONTENT_CHARS):
+                logger.info(
+                    "Notice content already visible (%d chars) — no CAPTCHA needed",
+                    len(body_text),
+                )
                 return True
 
-            # Wait for the View Notice button to confirm we're on the detail page.
-            # This prevents wasting CAPTCHA solves if the page didn't load properly.
+            # Wait for the View Notice button to confirm we're on the
+            # detail page. This prevents wasting CAPTCHA solves if the
+            # page didn't load properly.
             try:
-                view_btn = await page.wait_for_selector(
-                    SEL_VIEW_NOTICE_BUTTON, timeout=15000
+                await page.wait_for_selector(
+                    SEL_VIEW_NOTICE_BUTTON, timeout=15000,
                 )
             except PwTimeout:
                 logger.warning(
-                    "View Notice button not found within 15s on %s (attempt %d/%d)",
+                    "View Notice button not found within 15s on %s "
+                    "(attempt %d/%d)",
                     page_url, attempt, MAX_RETRIES,
                 )
                 continue
 
-            # Solve reCAPTCHA v2 via 2Captcha API (~10-30s)
+            # Extract Turnstile sitekey from the widget (fresh per attempt
+            # in case the widget re-renders between retries).
+            sitekey = await _extract_turnstile_sitekey(page)
+
+            # Solve Turnstile via 2Captcha API (~10-30s)
             logger.warning(
-                "Solving reCAPTCHA for %s (attempt %d/%d)", page_url, attempt, MAX_RETRIES
+                "Solving Turnstile for %s (attempt %d/%d, sitekey=%s)",
+                page_url, attempt, MAX_RETRIES, sitekey[:12] + "...",
             )
             solver = TwoCaptcha(config.CAPTCHA_API_KEY)
-            result = solver.recaptcha(
-                sitekey=RECAPTCHA_SITEKEY,
-                url=page_url,
+            result = solver.turnstile(sitekey=sitekey, url=page_url)
+            token = (
+                result.get("code") if isinstance(result, dict)
+                else str(result)
             )
-            token = result.get("code") if isinstance(result, dict) else str(result)
-
             if not token:
-                logger.warning("2Captcha returned empty token (attempt %d)", attempt)
+                logger.warning(
+                    "2Captcha returned empty token (attempt %d)", attempt,
+                )
                 continue
 
-            # Inject the token into the page's hidden reCAPTCHA response field
+            # Inject the token into the page's Turnstile response field.
+            # The field is created by Turnstile's widget hydration and is
+            # named cf-turnstile-response (previously g-recaptcha-response
+            # for the old Google reCAPTCHA setup).
+            #
+            # Turnstile's widget also has a JS callback pattern via
+            # `turnstile.execute()` but we skip that in favor of directly
+            # setting the input value + relying on the ASP.NET form's
+            # submit-on-click flow. The site's server-side handler reads
+            # cf-turnstile-response from the POST body regardless of how
+            # the value got there.
             await page.evaluate(
                 """(token) => {
-                    const el = document.getElementById('g-recaptcha-response');
-                    if (el) { el.value = token; el.style.display = 'block'; }
-                    const ta = document.querySelector('textarea[name="g-recaptcha-response"]');
-                    if (ta) { ta.value = token; ta.style.display = 'block'; }
-                    // Trigger the reCAPTCHA callback if it exists
-                    if (typeof ___grecaptcha_cfg !== 'undefined') {
-                        const clients = ___grecaptcha_cfg.clients;
-                        if (clients) {
-                            Object.keys(clients).forEach(key => {
-                                const client = clients[key];
-                                const findCallback = (obj) => {
-                                    if (!obj || typeof obj !== 'object') return;
-                                    Object.values(obj).forEach(v => {
-                                        if (typeof v === 'object' && v !== null) {
-                                            if (typeof v.callback === 'function') {
-                                                v.callback(token);
-                                            }
-                                            findCallback(v);
-                                        }
-                                    });
-                                };
-                                findCallback(client);
-                            });
-                        }
+                    // Primary: the hidden input the widget populates
+                    const input = document.querySelector(
+                        'input[name="cf-turnstile-response"]'
+                    );
+                    if (input) {
+                        input.value = token;
                     }
+                    // Belt-and-suspenders: any other Turnstile-related
+                    // input/textarea (some Turnstile modes create both).
+                    document.querySelectorAll(
+                        '[name="cf-turnstile-response"], '
+                        + '[id^="cf-chl-widget"]'
+                    ).forEach(el => {
+                        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                            el.value = token;
+                        }
+                    });
                 }""",
                 token,
             )
 
-            # Brief pause for any callback-triggered actions
+            # Brief pause for any JS handlers to run
             await asyncio.sleep(1)
 
-            # Click the "View Notice" button to submit with the solved CAPTCHA.
-            # Re-find the button in case the callback caused a DOM update.
+            # Click "I Agree, View Notice" to submit the form. Button ID
+            # unchanged from the pre-migration site so SEL_VIEW_NOTICE_BUTTON
+            # still targets the right element (label text changed from
+            # "View Notice" to "I Agree, View Notice" — ID stayed the same).
             view_btn = await page.query_selector(SEL_VIEW_NOTICE_BUTTON)
             if not view_btn:
-                # Callback may have auto-submitted — check if content is visible
-                content_el = await page.query_selector("text='Notice Content'")
-                if content_el:
-                    logger.warning("CAPTCHA solved — callback auto-submitted form")
+                # In rare cases the callback auto-submits the form; check
+                # if content is already visible before giving up on this
+                # attempt.
+                body_text_check = await page.inner_text("body")
+                if len(body_text_check) >= MIN_CONTENT_CHARS:
+                    logger.warning(
+                        "CAPTCHA solved — form auto-submitted (%d chars)",
+                        len(body_text_check),
+                    )
                     if rate_tracker is not None:
                         rate_tracker.record("2captcha", True)
                     return True
-                logger.warning("View Notice button gone after token inject (attempt %d)", attempt)
+                logger.warning(
+                    "View Notice button gone after token inject (attempt %d)",
+                    attempt,
+                )
                 continue
 
             await view_btn.click()
 
-            # 2026-07-01 fix v2: prior code did `wait_for_load_state(
-            # "networkidle")` with the default 60s timeout. Started failing
-            # 100% of the time on today's cron (0/132 successes over 4 hours
-            # = workflow cancelled). Site now does background network
-            # activity (tracking / long-poll) that keeps the network active
-            # indefinitely, so networkidle NEVER fires.
+            # Wait up to 45s for the notice content to render. Use a
+            # content-length signal: pre-solve pages are ~450 chars (Terms
+            # + gate message), post-solve pages are 2000-20000 chars. If
+            # body length exceeds MIN_CONTENT_CHARS we've solved it.
             #
-            # v1 fix (bug — introduced later on 2026-07-01) replaced the
-            # networkidle wait with a 10s wait_for_selector on "Notice
-            # Content", then fell through to a "gate cleared" fallback that
-            # returned SUCCESS if the CAPTCHA message was gone. This
-            # SILENTLY MASKED text-not-rendered failures: 237/237 solves
-            # fired "gate cleared" (not "notice text visible") → every
-            # notice's raw_text was empty → LLM extracted address='' → tier
-            # filter dropped ALL 213 as no-ZIP.
-            #
-            # v2 fix (this):
-            #   1. Bump wait_for_selector timeout to 45s — the site takes
-            #      >10s to render "Notice Content" post-CAPTCHA in the
-            #      current version (empirically observed 2026-07-01).
-            #   2. Do NOT report "gate cleared" as success. If we can't
-            #      see "Notice Content", the notice text isn't rendered,
-            #      and downstream parsing WILL fail. Better to retry (or
-            #      let the caller drop the notice) than pretend it worked.
-            try:
-                await page.wait_for_selector(
-                    "text='Notice Content'", timeout=45000,
-                )
-            except Exception:
-                pass  # will re-check with query_selector below
+            # We also fall through to check for the legacy "Notice Content"
+            # text marker — some notices may still render it, and it's a
+            # cleaner signal when present. But we don't REQUIRE it because
+            # the migration may have removed it.
+            SUCCESS_POLL_INTERVAL_MS = 2000
+            DEADLINE_MS = 45000
+            elapsed_ms = 0
+            content_rendered = False
+            while elapsed_ms < DEADLINE_MS:
+                # Check both signals: length + legacy marker
+                body_text = await page.inner_text("body")
+                if len(body_text) >= MIN_CONTENT_CHARS:
+                    content_rendered = True
+                    break
+                if await page.query_selector("text='Notice Content'"):
+                    body_text = await page.inner_text("body")
+                    content_rendered = True
+                    break
+                await page.wait_for_timeout(SUCCESS_POLL_INTERVAL_MS)
+                elapsed_ms += SUCCESS_POLL_INTERVAL_MS
 
-            # Verify the notice content is now visible — HARD REQUIREMENT.
-            # If this fails, the CAPTCHA gate may be gone but the notice
-            # text hasn't loaded, so we can't parse anything downstream.
-            content_el = await page.query_selector("text='Notice Content'")
-            if content_el:
-                logger.warning("CAPTCHA solved — notice text visible")
-                if rate_tracker is not None:
-                    rate_tracker.record("2captcha", True)
-                return True
-
-            # Give it one last nudge — sometimes the DOM is 500ms behind
-            # the network signal.
-            await page.wait_for_timeout(2000)
-            content_el = await page.query_selector("text='Notice Content'")
-            if content_el:
+            if content_rendered:
                 logger.warning(
-                    "CAPTCHA solved — notice text visible (after 2s nudge)"
+                    "Turnstile solved — notice content rendered "
+                    "(%d chars body text)",
+                    len(body_text),
                 )
                 if rate_tracker is not None:
                     rate_tracker.record("2captcha", True)
                 return True
 
-            # Content still not visible. Check what state we're in for the
-            # log — either the CAPTCHA gate is still up (retry needed) or
-            # cleared-but-content-missing (site error, retry likely same).
-            captcha_msg = await page.query_selector(
+            # Content still not rendered after 45s. Distinguish gate-still-
+            # up (retry needed — new token might work) from gate-cleared-
+            # but-content-missing (site error, retry unlikely to help but
+            # try anyway per MAX_RETRIES).
+            new_gate_msg = await page.query_selector(
+                "text='You must complete the CAPTCHA'"
+            )
+            # Legacy check kept for defense-in-depth — if the site rolls
+            # back to reCAPTCHA the old message would reappear.
+            legacy_gate_msg = await page.query_selector(
                 "text='You must complete the reCAPTCHA'"
             )
-            if captcha_msg:
+            if new_gate_msg or legacy_gate_msg:
+                gate_type = "Turnstile" if new_gate_msg else "reCAPTCHA"
                 logger.warning(
-                    "CAPTCHA still present after attempt %d", attempt,
+                    "%s gate still present after attempt %d — token may "
+                    "have been rejected",
+                    gate_type, attempt,
                 )
             else:
-                # Gate cleared but no notice text — used to be treated as
-                # success (v1 bug). Now we log and retry so we don't feed
-                # the parser an empty page.
                 logger.warning(
-                    "CAPTCHA gate cleared but 'Notice Content' not visible "
-                    "after 45s+nudge (attempt %d) — treating as failure",
-                    attempt,
+                    "Gate cleared but body text still short (%d < %d "
+                    "chars) after 45s (attempt %d) — treating as failure",
+                    len(body_text), MIN_CONTENT_CHARS, attempt,
                 )
 
         except Exception:
-            logger.exception("CAPTCHA solve error (attempt %d/%d)", attempt, MAX_RETRIES)
+            logger.exception(
+                "CAPTCHA solve error (attempt %d/%d)", attempt, MAX_RETRIES,
+            )
 
-    logger.error("All %d CAPTCHA attempts failed for %s", MAX_RETRIES, page_url)
+    logger.error(
+        "All %d CAPTCHA attempts failed for %s", MAX_RETRIES, page_url,
+    )
     if rate_tracker is not None:
         rate_tracker.record("2captcha", False)
     return False

@@ -108,9 +108,18 @@ SEL_VIEW_BUTTON_PATTERN = "input.viewButton"
 SEL_NEXT_PAGE_BUTTON = "input[title='Next page']"
 SEL_PAGE_INFO = "span[id$='lblTotalPages']"
 
-# Notice detail page (DetailsPrint.aspx — reCAPTCHA + Terms gated)
+# Notice detail page (DetailsPrint.aspx — CAPTCHA + Terms gated)
 SEL_VIEW_NOTICE_BUTTON = "#ctl00_ContentPlaceHolder1_PublicNoticeDetailsBody1_btnViewNotice"
+# Legacy Google reCAPTCHA v2 sitekey — RETAINED FOR BACKWARD COMPAT ONLY.
+# Site migrated to Cloudflare Turnstile sometime between 2026-06-30 (last
+# successful cron run) and 2026-07-01 (broke). Actual sitekey is now
+# extracted dynamically from the page's `data-sitekey` attribute in
+# captcha_solver.solve_captcha_and_view — this hardcoded value is unused
+# but kept in case the site rolls back or we need a fallback default.
 RECAPTCHA_SITEKEY = "6LccnQ8sAAAAAMNFrb4ZLDtPAqk50k_r-CCwimHJ"
+# Fallback Turnstile sitekey (used only if dynamic extraction fails).
+# Observed live 2026-07-02 via headed-mode probe on notice ID 1475686.
+TURNSTILE_SITEKEY_FALLBACK = "0x4AAAAAADs-xpiU_yrMy8ZY"
 
 # ── Rate Limiting ──────────────────────────────────────────────────────
 REQUEST_DELAY_MIN = 2.0  # seconds between requests
