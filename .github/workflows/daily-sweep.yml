@@ -55,7 +55,16 @@ jobs:
     #     (bot commit 0afa2c3) mean a re-triggered follow-up run picks up
     #     where the cancelled one left off, so runaway cancellations are
     #     recoverable but disruptive — the extra headroom prevents them.
-    timeout-minutes: 360
+    #   360 min → 480 min (2026-07-02): Site migrated Google reCAPTCHA to
+    #     Cloudflare Turnstile between 06-30 and 07-01. Turnstile solves are
+    #     roughly 3-6x slower than the historical baseline (~180s per notice
+    #     vs ~30s pre-migration; probe on 2026-07-02 showed attempts 1+2
+    #     often fail and only attempt 3 succeeds, so per-notice cost is
+    #     inflated even when the solve eventually works). At Wednesday's
+    #     ~200-notice volume, 200 × 180s = 10 hours — well over the 6h cap.
+    #     8h buys headroom while the CAPTCHA integration stabilizes; may
+    #     revisit downward once we understand the attempt-1 failure mode.
+    timeout-minutes: 480
 
     # bash with -e (exit on error) and pipefail so that `cmd | tee` doesn't
     # mask non-zero exits from the python pipeline. With continue-on-error
