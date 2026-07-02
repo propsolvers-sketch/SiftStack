@@ -149,30 +149,40 @@ async def solve_captcha_and_view(
 
             await view_btn.click()
 
-            # 2026-07-01 fix: prior code did `wait_for_load_state("networkidle")`
-            # with the default 60s timeout. Started failing 100% of the time on
-            # today's cron (0/132 successes over 4 hours = workflow cancelled).
-            # Site now does background network activity (tracking / long-poll)
-            # that keeps the network active indefinitely, so networkidle NEVER
-            # fires. Each failed attempt burned 60s × 3 retries = 3 min per
-            # notice; entire workflow died before scraping ANYTHING.
+            # 2026-07-01 fix v2: prior code did `wait_for_load_state(
+            # "networkidle")` with the default 60s timeout. Started failing
+            # 100% of the time on today's cron (0/132 successes over 4 hours
+            # = workflow cancelled). Site now does background network
+            # activity (tracking / long-poll) that keeps the network active
+            # indefinitely, so networkidle NEVER fires.
             #
-            # New approach: wait DIRECTLY for the outcome selector (either
-            # success = "Notice Content" appears, or failure = CAPTCHA gate
-            # message still present). 10s cap. If neither appears in 10s,
-            # fall through to the existing polling checks — most of the time
-            # a small hard wait is enough for the DOM to update post-click.
+            # v1 fix (bug — introduced later on 2026-07-01) replaced the
+            # networkidle wait with a 10s wait_for_selector on "Notice
+            # Content", then fell through to a "gate cleared" fallback that
+            # returned SUCCESS if the CAPTCHA message was gone. This
+            # SILENTLY MASKED text-not-rendered failures: 237/237 solves
+            # fired "gate cleared" (not "notice text visible") → every
+            # notice's raw_text was empty → LLM extracted address='' → tier
+            # filter dropped ALL 213 as no-ZIP.
+            #
+            # v2 fix (this):
+            #   1. Bump wait_for_selector timeout to 45s — the site takes
+            #      >10s to render "Notice Content" post-CAPTCHA in the
+            #      current version (empirically observed 2026-07-01).
+            #   2. Do NOT report "gate cleared" as success. If we can't
+            #      see "Notice Content", the notice text isn't rendered,
+            #      and downstream parsing WILL fail. Better to retry (or
+            #      let the caller drop the notice) than pretend it worked.
             try:
                 await page.wait_for_selector(
-                    "text='Notice Content'", timeout=10000,
+                    "text='Notice Content'", timeout=45000,
                 )
             except Exception:
-                # Success signal didn't appear in 10s — either CAPTCHA failed
-                # or page is still loading. Give it a small nudge and let
-                # the downstream checks decide.
-                await page.wait_for_timeout(1000)
+                pass  # will re-check with query_selector below
 
-            # Verify the notice content is now visible
+            # Verify the notice content is now visible — HARD REQUIREMENT.
+            # If this fails, the CAPTCHA gate may be gone but the notice
+            # text hasn't loaded, so we can't parse anything downstream.
             content_el = await page.query_selector("text='Notice Content'")
             if content_el:
                 logger.warning("CAPTCHA solved — notice text visible")
@@ -180,17 +190,37 @@ async def solve_captcha_and_view(
                     rate_tracker.record("2captcha", True)
                 return True
 
-            # Fallback: check if CAPTCHA message is gone
-            captcha_msg = await page.query_selector(
-                "text='You must complete the reCAPTCHA'"
-            )
-            if not captcha_msg:
-                logger.warning("CAPTCHA solved — gate cleared")
+            # Give it one last nudge — sometimes the DOM is 500ms behind
+            # the network signal.
+            await page.wait_for_timeout(2000)
+            content_el = await page.query_selector("text='Notice Content'")
+            if content_el:
+                logger.warning(
+                    "CAPTCHA solved — notice text visible (after 2s nudge)"
+                )
                 if rate_tracker is not None:
                     rate_tracker.record("2captcha", True)
                 return True
 
-            logger.warning("CAPTCHA still present after attempt %d", attempt)
+            # Content still not visible. Check what state we're in for the
+            # log — either the CAPTCHA gate is still up (retry needed) or
+            # cleared-but-content-missing (site error, retry likely same).
+            captcha_msg = await page.query_selector(
+                "text='You must complete the reCAPTCHA'"
+            )
+            if captcha_msg:
+                logger.warning(
+                    "CAPTCHA still present after attempt %d", attempt,
+                )
+            else:
+                # Gate cleared but no notice text — used to be treated as
+                # success (v1 bug). Now we log and retry so we don't feed
+                # the parser an empty page.
+                logger.warning(
+                    "CAPTCHA gate cleared but 'Notice Content' not visible "
+                    "after 45s+nudge (attempt %d) — treating as failure",
+                    attempt,
+                )
 
         except Exception:
             logger.exception("CAPTCHA solve error (attempt %d/%d)", attempt, MAX_RETRIES)
