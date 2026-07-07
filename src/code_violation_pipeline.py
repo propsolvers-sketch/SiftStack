@@ -103,10 +103,16 @@ CODE_VIOLATION_GATES: tuple[str, ...] = (
     "bulk_fetched",
     "owner_enriched",
     "tier_gated",
+    "tracerfy_matched",
+    "datasift_uploaded",
 )
-"""Canonical 3-gate D-01 sequence for the code-violation pipeline. Pinned
+"""Canonical D-01 gate sequence for the code-violation pipeline. Pinned
 as a module constant so any rollup (e.g. Phase 3 unified scheduler) can
-reuse the ordered list without re-deriving it."""
+reuse the ordered list without re-deriving it.
+
+The final two gates (`tracerfy_matched`, `datasift_uploaded`) mirror the
+pre-probate + apn-probate pipelines so downstream Slack renderers can
+show a consistent per-pipeline funnel across every distressor."""
 
 
 # ── Per-county fetch wrappers ────────────────────────────────────────
@@ -642,6 +648,13 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Post run summary + funnel + service-rates blocks to Slack "
              "(D-02 — one message per run via SLACK_WEBHOOK_URL).",
     )
+    p.add_argument(
+        "--skip-trace", action="store_true",
+        help="Run Tracerfy batch skip-trace on tier-gated records with an "
+             "owner_name (fills Phone 1-9 / Email 1-5 for direct outreach). "
+             "Off by default to keep bulk pulls free; enable for daily-ops "
+             "runs. ~$0.02/contact.",
+    )
     return p
 
 
@@ -703,6 +716,38 @@ def _main(argv: list[str]) -> int:
     )
 
     _summarize(notices)
+
+    # Tracerfy skip-trace for code-violation records. Only fires when
+    # --skip-trace is on AND at least one tier-gated notice has an
+    # owner_name (address-only records — no owner enrichment run, or
+    # ~20% of Huntsville records that miss address-search — can't be
+    # skip-traced, so we don't waste the batch call on them).
+    if args.skip_trace and notices:
+        traceable = [n for n in notices if (n.owner_name or "").strip()]
+        if traceable:
+            try:
+                import tracerfy_skip_tracer
+                stats = tracerfy_skip_tracer.batch_skip_trace(
+                    traceable, rate_tracker=rate_tracker,
+                )
+                logger.info(
+                    "Skip-trace stats: submitted=%d matched=%d phones=%d "
+                    "emails=%d cost=$%.2f",
+                    stats.get("submitted", 0), stats.get("matched", 0),
+                    stats.get("phones_found", 0),
+                    stats.get("emails_found", 0),
+                    stats.get("cost", 0.0),
+                )
+                funnel.set("tracerfy_matched", stats.get("matched", 0))
+            except Exception as e:
+                logger.warning(
+                    "Skip-trace failed (continuing without phones): %s", e,
+                )
+        else:
+            logger.info(
+                "Skip-trace requested but no notices have owner_name — "
+                "consider running with --enrich-owner first.",
+            )
 
     # D-04: terminal mirrors Slack regardless of whether --notify-slack is set.
     logger.info(

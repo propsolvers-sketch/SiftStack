@@ -603,6 +603,13 @@ def _build_slack_message(
                 continue
             emoji = "✅" if ok else "❌"
             is_heir_csv = "_Heirs_" in r["csv"]
+            # Two-pass architecture (see PASS 1 / PASS 2 in main()): the
+            # same CSV can appear twice — once in mode=add (creates new
+            # rows + updates by address) and once in mode=swap (replaces
+            # owner/contact on existing rows). Show the mode tag so the
+            # duplicate line doesn't read as an accidental double-upload.
+            raw_mode = (r.get("mode") or "").lower()
+            mode_tag = f" ({raw_mode})" if raw_mode in ("add", "swap") else ""
             sub = r.get("uploads", [])
             if sub:
                 for u in sub:
@@ -613,11 +620,13 @@ def _build_slack_message(
                         if is_heir_csv else base_label
                     )
                     lines.append(
-                        f"  {emoji} {r['csv']} → {label}: "
+                        f"  {emoji} {r['csv']}{mode_tag} → {label}: "
                         f"{u.get('records_uploaded','?')} records"
                     )
             else:
-                lines.append(f"  {emoji} {r['csv']}: {r.get('message','')}")
+                lines.append(
+                    f"  {emoji} {r['csv']}{mode_tag}: {r.get('message','')}"
+                )
         lines.append("")
 
     # Always include a working link to the source-of-truth artifact for this
