@@ -207,6 +207,36 @@ SAVED_SEARCHES: list[SearchConfig] = [
         exclude_terms="CONDEMNATION",
         days_back=7,
     ),
+    # Statewide catch-all foreclosure searches. The per-county searches above
+    # require the county name as a keyword — attorneys who publish trustee
+    # sale notices WITHOUT the county in the title/keywords slip through. In
+    # July 2026 recon we found Advertiser-Gleam (Marshall) carries active
+    # legal notices but zero notices publish under "MORTGAGE FORECLOSURE SALE
+    # MARSHALL", and Madison APN yield has been persistently near-zero.
+    #
+    # These broad searches let APN return every AL foreclosure; the pre-CAPTCHA
+    # snippet_passes_county_filter (in notice_parser.py) drops non-target-county
+    # notices before any CAPTCHA solve, so the cost impact is bounded by
+    # Jefferson/Madison/Marshall volume, not statewide AL volume.
+    #
+    # notice.county is reassigned from the detected county post-CAPTCHA
+    # (see scraper.py), so records land in the correct DataSift list.
+    SearchConfig(
+        county="Statewide",
+        notice_type="foreclosure",
+        search_terms="MORTGAGE FORECLOSURE SALE",
+        search_type="AND",
+        exclude_terms="CONDEMNATION",
+        days_back=7,
+    ),
+    SearchConfig(
+        county="Statewide",
+        notice_type="foreclosure",
+        search_terms="NOTICE OF MORTGAGE RESCHEDULE",
+        search_type="AND",
+        exclude_terms="CONDEMNATION",
+        days_back=7,
+    ),
     # Probate "Notice to Creditors" publications. APN search has no county
     # filter — the county-of-property check happens in is_target_county()
     # against the full notice text after CAPTCHA.

@@ -41,6 +41,7 @@ from config import (
 from foreclosure_filter import is_valid_foreclosure
 from notice_parser import (
     NoticeData,
+    assign_target_county_from_text,
     is_target_county_async,
     parse_notice_page,
     snippet_passes_county_filter,
@@ -335,6 +336,18 @@ async def _scrape_notice(
             ):
                 logger.debug("  Filtered out (wrong county): %s", notice_id)
                 return None
+
+            # Statewide catch-all searches (search.county="Statewide") pick
+            # up notices whose actual property county isn't in the search
+            # keywords. Reassign notice.county to the county the text
+            # actually references so downstream DataSift Lists/tags land
+            # in the right per-county filter presets. No-op when the
+            # scrape's nominal county already matches the detected one.
+            if assign_target_county_from_text(notice):
+                logger.debug(
+                    "  Reassigned notice.county %s → %s (from %s search)",
+                    search.county, notice.county, search.search_terms,
+                )
 
             logger.debug("  Kept notice %s", notice_id)
             return notice

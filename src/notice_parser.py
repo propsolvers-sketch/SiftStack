@@ -1074,6 +1074,28 @@ def _detect_counties_via_regex(text: str) -> set[str]:
     return mentioned
 
 
+def assign_target_county_from_text(notice) -> bool:
+    """Reassign notice.county to the detected target county in raw_text.
+
+    Used after a Statewide catch-all search (or any search whose nominal
+    `county` may not match the actual property county). When the notice
+    text unambiguously mentions ONE target county, update notice.county so
+    downstream DataSift Lists/tags/county-filter presets stay coherent.
+
+    Returns True when the county was reassigned; False when no unambiguous
+    single-target-county signal was found and the existing notice.county
+    was left untouched.
+    """
+    detected = _detect_counties_via_regex(notice.raw_text or "") & _TARGET_COUNTIES
+    if len(detected) != 1:
+        return False
+    actual = next(iter(detected)).title()
+    if notice.county != actual:
+        notice.county = actual
+        return True
+    return False
+
+
 def snippet_passes_county_filter(snippet: str) -> bool:
     """Cheap pre-CAPTCHA county pre-filter for APN search-result snippets.
 

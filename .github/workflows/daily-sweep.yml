@@ -157,7 +157,7 @@ jobs:
           echo "Using --since ${SINCE_DATE}"
           python src/main.py daily \
             --since "${SINCE_DATE}" \
-            --counties Jefferson,Madison,Marshall \
+            --counties Jefferson,Madison,Marshall,Statewide \
             --types foreclosure,probate \
             --tiers 1,2 \
             --no-raw-csv \
