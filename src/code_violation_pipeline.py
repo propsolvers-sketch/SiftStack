@@ -755,13 +755,30 @@ def _main(argv: list[str]) -> int:
         funnel.pipeline_name, dict(funnel.as_ordered_dict()),
     )
 
+    # Trestle phone scoring — same gap fix as apn_probate (2026-06-13)
+    # and pre_probate. Skip-trace fills phones; Trestle tiers them so the
+    # DataSift `Phone Tags N` columns populate for dial-priority routing.
+    # No-op when skip_trace wasn't run or no phones were found.
+    phone_tiers: dict | None = None
+    if args.skip_trace and notices:
+        try:
+            from phone_validator import score_phones_for_pipeline
+            phone_tiers = score_phones_for_pipeline(notices)
+        except Exception as e:
+            logger.warning(
+                "Trestle scoring failed (continuing without tiers): %s", e,
+            )
+
     if args.output_csv:
         from data_formatter import write_csv
         path = write_csv(notices, str(args.output_csv))
         print(f"\nWrote Sift CSV: {path}")
     if args.output_datasift_csv:
         from datasift_formatter import write_datasift_csv
-        path = write_datasift_csv(notices, str(args.output_datasift_csv))
+        path = write_datasift_csv(
+            notices, str(args.output_datasift_csv),
+            phone_tiers=phone_tiers,
+        )
         print(f"Wrote DataSift CSV: {path}")
 
     if args.notify_slack:
