@@ -252,6 +252,27 @@ jobs:
             --output-datasift-csv output/leads/datasift_upload_foreclosure_tb_${{ steps.run_start.outputs.ts }}.csv \
             2>&1 | tee logs/daily_tb_${{ steps.run_start.outputs.ts }}.log
 
+      # ── Halliday, Watkins & Mann AL foreclosure schedule ────────────────
+      # Third trustee-portal foreclosure source alongside Rubin Lublin +
+      # Tiffany & Bosco. Portal at halliday-watkins.com/live/AL/bids.htm —
+      # pure static HTML, no JS despite earlier research suggesting it was
+      # gated. HWM was #2 by volume behind T&B in our 4-week Jefferson
+      # capture (10% of records). Distinctive: HWM strips ZIP from most
+      # rows (~92% missing) so --enrich-owner is REQUIRED — the tier
+      # filter needs a ZIP, and enrichment recovers it from the tax roll.
+      # City-tier centroid fallback (from address_standardizer) catches
+      # the ~20% of records where enrichment misses. Live 2026-07-08:
+      # 71 total AL / 21 target-county (14 Jefferson + 6 Madison + 1 flat).
+      - name: Run Halliday Watkins Mann AL foreclosures
+        continue-on-error: true
+        run: |
+          python src/halliday_watkins_al_pipeline.py \
+            --counties Jefferson,Madison,Marshall \
+            --tiers 1,2 \
+            --enrich-owner \
+            --output-datasift-csv output/leads/datasift_upload_foreclosure_hwm_${{ steps.run_start.outputs.ts }}.csv \
+            2>&1 | tee logs/daily_hwm_${{ steps.run_start.outputs.ts }}.log
+
       # ── Sunday-only: obit refresh pass (Mark Jerome Green pattern) ──
       # Families update legacy.com obituaries after initial publication
       # (heirs added days/weeks later). Live measurement on 2026-06-19
