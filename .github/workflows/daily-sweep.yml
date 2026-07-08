@@ -214,6 +214,25 @@ jobs:
             --output-datasift-csv output/leads/datasift_upload_code_violations_${{ steps.run_start.outputs.ts }}.csv \
             2>&1 | tee logs/daily_code_${{ steps.run_start.outputs.ts }}.log
 
+      # ── Rubin Lublin AL foreclosure schedule ────────────────────────────
+      # Public HTML portal at rlselaw.com/property-listing/alabama-property-
+      # listings/ — closes the Madison + Marshall coverage gap (APN yields
+      # 0 because The Madison County Record is NOT an APN participating
+      # publication; verified 2026-07-08). Live snapshot at build time:
+      # 117 total AL / 13 tier-qualified (4 Jefferson + 6 Madison + 3 Marshall).
+      # CSV writes Notice Type = "foreclosure" so daily_finalize's
+      # _categorize() routes it to the Foreclosure DataSift list alongside
+      # the APN foreclosure output (DataSift dedupes by property address).
+      - name: Run Rubin Lublin AL foreclosures
+        continue-on-error: true
+        run: |
+          python src/rubin_lublin_al_pipeline.py \
+            --counties Jefferson,Madison,Marshall \
+            --tiers 1,2 \
+            --enrich-owner \
+            --output-datasift-csv output/leads/datasift_upload_foreclosure_rl_${{ steps.run_start.outputs.ts }}.csv \
+            2>&1 | tee logs/daily_rl_${{ steps.run_start.outputs.ts }}.log
+
       # ── Sunday-only: obit refresh pass (Mark Jerome Green pattern) ──
       # Families update legacy.com obituaries after initial publication
       # (heirs added days/weeks later). Live measurement on 2026-06-19

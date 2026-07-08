@@ -1,0 +1,435 @@
+"""Rubin Lublin, LLC — Alabama foreclosure sale schedule adapter.
+
+Rubin Lublin publishes their entire statewide AL non-judicial foreclosure
+sale schedule as a public HTML table at:
+
+    https://rlselaw.com/property-listing/alabama-property-listings/
+
+The page is server-rendered HTML with a clean 7-column layout: Sale Date,
+File #, Property (street), City, Zip, County, Bid link. No auth, no
+CAPTCHA, no JS gating. Update cadence appears daily-ish (attorneys post
+new sales as files come in).
+
+This adapter closes the Madison + Marshall County foreclosure coverage
+gap: alabamapublicnotices.com (APN) returns 0 Madison/Marshall foreclosures
+because The Madison County Record (the primary Madison publisher) is NOT
+an APN participating publication — verified 2026-07-08. Rubin Lublin's
+public portal + Tiffany & Bosco's public portal (fs.tblaw.com) are our
+two primary paths to Madison + Marshall foreclosures until an APN
+alternative surfaces.
+
+Live 2026-07-08 snapshot: 117 total AL records / 8 Madison / 3 Marshall
+(all 3 Marshall in Tier 1; 5 of 8 Madison in Tier 1+2).
+
+Per-record fields the portal exposes:
+    - Sale date + auction time window ("07/16/2026 (11am - 4pm)")
+    - RL File # (e.g. "26-01908")
+    - Property street address
+    - City + ZIP
+    - County
+    - Bid submission portal link (Auction.com, Xome, hubzu, Servicelink)
+
+Owner name is NOT on the portal listing (available only on the underlying
+Notice of Sale PDF). We enrich via county property API address-search
+(existing Jefferson E-Ring / Madison AssuranceWeb / Marshall AssuranceWeb
+adapters) — same pattern as birmingham_code_enforcement_api.enrich_with_owner.
+
+CLI:
+    python src/rubin_lublin_al_pipeline.py
+    python src/rubin_lublin_al_pipeline.py --counties Madison,Marshall
+    python src/rubin_lublin_al_pipeline.py --tiers 1,2 --enrich-owner \\
+        --output-datasift-csv output/rl_foreclosures.csv
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import re
+import sys
+from dataclasses import asdict, dataclass
+from datetime import date, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import requests
+from bs4 import BeautifulSoup
+
+if TYPE_CHECKING:
+    from notice_parser import NoticeData
+
+logger = logging.getLogger(__name__)
+
+RUBIN_LUBLIN_AL_URL = (
+    "https://rlselaw.com/property-listing/alabama-property-listings/"
+)
+
+_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+
+# Match the leading MM/DD/YYYY portion of the sale-date cell so we can
+# parse out just the date (auction time window is retained separately).
+_DATE_RE = re.compile(r"^(\d{1,2}/\d{1,2}/\d{4})")
+# Auction time window like "(11am - 4pm)"
+_TIME_WINDOW_RE = re.compile(r"\(([^)]+)\)")
+
+
+@dataclass
+class RubinLublinRecord:
+    """One row of Rubin Lublin's Alabama property listings table."""
+
+    sale_date_raw: str = ""     # "07/16/2026 (11am - 4pm)"
+    sale_date: str = ""         # "2026-07-16" (ISO)
+    auction_time_window: str = ""  # "11am - 4pm"
+    file_number: str = ""       # "26-01908"
+    address: str = ""           # "107 Elledge Farm Dr"
+    city: str = ""              # "Hazel Green"
+    zipcode: str = ""           # "35750"
+    county: str = ""            # "Madison"
+    bid_link: str = ""          # "Go to Auction.com" or "Not Available"
+
+    # Owner enrichment (populated by enrich_with_owner when --enrich-owner)
+    owner_name: str = ""
+    parcel_id: str = ""
+    assessed_value: str = ""
+    is_homestead: bool = False
+
+
+# ── Fetch + parse ──────────────────────────────────────────────────────
+
+
+def fetch_rubin_lublin_al(
+    *,
+    timeout: float = 30.0,
+    url: str = RUBIN_LUBLIN_AL_URL,
+) -> list[RubinLublinRecord]:
+    """Fetch and parse Rubin Lublin's Alabama property listings page.
+
+    Returns every row in the table (all AL counties). Filter downstream
+    via `filter_records()` for county / tier selection.
+    """
+    logger.info("Fetching Rubin Lublin AL listings: %s", url)
+    resp = requests.get(url, headers={"User-Agent": _UA}, timeout=timeout)
+    resp.raise_for_status()
+    return _parse_html(resp.text)
+
+
+def _parse_html(html: str) -> list[RubinLublinRecord]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # The main listings table has one <table> matching the 7-col header
+    # (Sale Date | File # | Property | City | Zip | County | Bid). Find
+    # by presence of a <th data-sort> — RL's page has one such table.
+    table = None
+    for t in soup.find_all("table"):
+        headers = [th.get_text(strip=True) for th in t.find_all("th")]
+        if "Sale Date" in headers and "County" in headers:
+            table = t
+            break
+    if table is None:
+        logger.warning("Rubin Lublin table not found in fetched HTML")
+        return []
+
+    records: list[RubinLublinRecord] = []
+    for tr in table.find_all("tr"):
+        cells: dict[str, str] = {}
+        for td in tr.find_all("td"):
+            cls = td.get("class") or []
+            if cls:
+                cells[cls[0]] = td.get_text(strip=True)
+        if not cells.get("property"):
+            continue  # Header row or empty row
+
+        rec = RubinLublinRecord()
+        rec.sale_date_raw = cells.get("date", "")
+        rec.sale_date = _parse_sale_date_iso(rec.sale_date_raw)
+        rec.auction_time_window = _parse_time_window(rec.sale_date_raw)
+        rec.file_number = cells.get("case", "")
+        rec.address = cells.get("property", "")
+        rec.city = cells.get("city", "")
+        rec.zipcode = cells.get("zip", "")
+        rec.county = cells.get("county", "")
+        rec.bid_link = cells.get("bid", "")
+        records.append(rec)
+    return records
+
+
+def _parse_sale_date_iso(raw: str) -> str:
+    """'07/16/2026 (11am - 4pm)' → '2026-07-16'."""
+    m = _DATE_RE.match(raw or "")
+    if not m:
+        return ""
+    try:
+        return datetime.strptime(m.group(1), "%m/%d/%Y").strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
+
+
+def _parse_time_window(raw: str) -> str:
+    m = _TIME_WINDOW_RE.search(raw or "")
+    return m.group(1).strip() if m else ""
+
+
+# ── Filters ────────────────────────────────────────────────────────────
+
+
+def filter_records(
+    records: list[RubinLublinRecord],
+    *,
+    counties: tuple[str, ...] | None = None,
+    tiers: tuple[int, ...] | None = None,
+) -> list[RubinLublinRecord]:
+    """Filter records by county and/or ZIP tier.
+
+    ``counties`` — set to ("Jefferson", "Madison", "Marshall") for the
+    default SiftStack scope. Case-insensitive match against ``record.county``.
+
+    ``tiers`` — set to (1, 2) to keep only Tier-1 + Tier-2 ZIPs per
+    ``target_zips.zip_tier_county``. Records without a ZIP or in non-tier
+    ZIPs are dropped.
+    """
+    result = list(records)
+
+    if counties:
+        wanted = {c.lower() for c in counties}
+        result = [r for r in result if (r.county or "").lower() in wanted]
+
+    if tiers is not None:
+        from target_zips import zip_tier_county
+        tier_set = set(tiers)
+        kept: list[RubinLublinRecord] = []
+        for r in result:
+            zip5 = (r.zipcode or "").strip()[:5]
+            if not zip5:
+                continue
+            t, _ = zip_tier_county(zip5)
+            if t in tier_set:
+                kept.append(r)
+        result = kept
+
+    return result
+
+
+# ── Owner enrichment (via existing property APIs) ──────────────────────
+
+
+def enrich_with_owner(rec: RubinLublinRecord) -> bool:
+    """Fill owner_name/parcel_id/assessed_value via county property API.
+
+    Routes to Jefferson E-Ring, Madison AssuranceWeb, or Marshall
+    AssuranceWeb depending on ``rec.county``. Returns True if the lookup
+    filled owner_name; False otherwise. Cheap (~0.3s per lookup).
+    """
+    county = (rec.county or "").lower()
+    if not rec.address:
+        return False
+    try:
+        if county == "jefferson":
+            from jefferson_property_api import search_by_situs_address
+            matches = search_by_situs_address(rec.address)
+        elif county == "madison":
+            from madison_property_api import search_by_situs_address
+            # Madison adapter expects (street_number, street_name)
+            house_num, street = _split_house_num(rec.address)
+            matches = search_by_situs_address(house_num, street) if house_num else []
+        elif county == "marshall":
+            from marshall_property_api import search_by_situs_address
+            house_num, street = _split_house_num(rec.address)
+            matches = search_by_situs_address(house_num, street) if house_num else []
+        else:
+            return False
+    except Exception as e:
+        logger.debug("Owner enrichment failed for %r (%s): %s",
+                     rec.address, county, e)
+        return False
+
+    if not matches:
+        return False
+    m = matches[0]
+    rec.owner_name = getattr(m, "owner_name", "") or ""
+    rec.parcel_id = getattr(m, "parcel_number", "") or getattr(m, "parcel_id", "") or ""
+    total_value = getattr(m, "total_value", "") or getattr(m, "assessed_value", "")
+    rec.assessed_value = str(total_value) if total_value else ""
+    rec.is_homestead = bool(getattr(m, "is_homestead", False)
+                            or getattr(m, "is_buildable", False))
+    return bool(rec.owner_name)
+
+
+def _split_house_num(address: str) -> tuple[str, str]:
+    """'107 Elledge Farm Dr' → ('107', 'Elledge Farm Dr')."""
+    m = re.match(r"^\s*(\d+)\s+(.+?)\s*$", address or "")
+    if not m:
+        return ("", address or "")
+    return (m.group(1), m.group(2))
+
+
+# ── NoticeData conversion ──────────────────────────────────────────────
+
+
+def to_notice_data(rec: RubinLublinRecord) -> "NoticeData":
+    """Convert a Rubin Lublin record to a NoticeData ready for the
+    standard SiftStack downstream (Tracerfy skip-trace, Trestle scoring,
+    DataSift CSV write, seen-ids dedup).
+    """
+    from notice_parser import NoticeData
+    n = NoticeData()
+    n.notice_type = "foreclosure"
+    n.county = (rec.county or "").strip().title()  # "Madison" / "Marshall" / "Jefferson"
+    n.state = "AL"
+    n.address = rec.address
+    n.city = rec.city
+    n.zip = rec.zipcode
+    n.auction_date = _mmddyyyy(rec.sale_date)
+    n.date_added = date.today().strftime("%Y-%m-%d")
+    n.received_date = n.date_added
+    n.source_url = RUBIN_LUBLIN_AL_URL
+    # File # goes into the case_number slot for cross-source correlation
+    # with T&B's file# convention.
+    n.case_number = rec.file_number
+    n.trustee = "Rubin Lublin, LLC"
+    # Notes summary — mirrors the format used by other foreclosure adapters
+    # so daily_finalize.py's Notes regex parses it consistently.
+    n.raw_text = (
+        f"Foreclosure | Auction: {n.auction_date} | Municipality: {rec.city} | "
+        f"Trustee: Rubin Lublin, LLC | File#: {rec.file_number} | "
+        f"Bid: {rec.bid_link} | Source: Rubin Lublin AL portal"
+    )
+    if rec.owner_name:
+        n.owner_name = rec.owner_name
+        n.tax_owner_name = rec.owner_name
+    if rec.parcel_id:
+        n.parcel_id = rec.parcel_id
+    if rec.assessed_value:
+        n.assessed_value = rec.assessed_value
+    if rec.is_homestead:
+        n.is_homestead = "Y"
+    return n
+
+
+def _mmddyyyy(iso: str) -> str:
+    """'2026-07-16' → '7/16/2026' for foreclosure auction_date convention."""
+    if not iso:
+        return ""
+    try:
+        return datetime.strptime(iso, "%Y-%m-%d").strftime("%-m/%-d/%Y")
+    except ValueError:
+        return iso
+
+
+# ── Orchestrator ───────────────────────────────────────────────────────
+
+
+def fetch_all(
+    *,
+    counties: tuple[str, ...] = ("Jefferson", "Madison", "Marshall"),
+    tiers: tuple[int, ...] | None = (1, 2),
+    enrich_owner: bool = False,
+) -> list["NoticeData"]:
+    """One-shot fetch + filter + enrich + convert to NoticeData."""
+    records = fetch_rubin_lublin_al()
+    logger.info("Rubin Lublin AL: %d total records fetched", len(records))
+    records = filter_records(records, counties=counties, tiers=tiers)
+    logger.info(
+        "Rubin Lublin AL: %d records after county/tier filter "
+        "(counties=%s, tiers=%s)",
+        len(records), counties, tiers,
+    )
+
+    if enrich_owner:
+        hits = 0
+        for r in records:
+            if enrich_with_owner(r):
+                hits += 1
+        logger.info("Rubin Lublin AL: owner enrichment filled %d/%d records",
+                    hits, len(records))
+
+    return [to_notice_data(r) for r in records]
+
+
+# ── CLI ────────────────────────────────────────────────────────────────
+
+
+def _build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="rubin_lublin_al_pipeline",
+        description="Rubin Lublin AL foreclosure schedule → NoticeData / CSV.",
+    )
+    p.add_argument(
+        "--counties", default="Jefferson,Madison,Marshall",
+        help="Comma-separated counties (default: Jefferson,Madison,Marshall).",
+    )
+    p.add_argument(
+        "--tiers", default="1,2",
+        help="Comma-separated ZIP tiers (default '1,2', 'all' disables).",
+    )
+    p.add_argument(
+        "--enrich-owner", action="store_true",
+        help="Enrich owner_name via county property API address-search "
+             "(~0.3s/record).",
+    )
+    p.add_argument(
+        "--output-csv", type=Path, default=None,
+        help="Write standard Sift-format CSV to this path.",
+    )
+    p.add_argument(
+        "--output-datasift-csv", type=Path, default=None,
+        help="Write DataSift-format CSV (80 cols) to this path.",
+    )
+    p.add_argument(
+        "--json", action="store_true",
+        help="Print raw records as JSON (skip NoticeData conversion).",
+    )
+    return p
+
+
+def _main(argv: list[str]) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+    args = _build_argparser().parse_args(argv)
+
+    counties = tuple(c.strip() for c in args.counties.split(",") if c.strip())
+    tiers_arg = (args.tiers or "").lower()
+    tiers: tuple[int, ...] | None
+    if tiers_arg in ("", "all"):
+        tiers = None
+    else:
+        tiers = tuple(int(t) for t in args.tiers.split(",") if t.strip().isdigit())
+
+    if args.json:
+        import json
+        records = fetch_rubin_lublin_al()
+        records = filter_records(records, counties=counties, tiers=tiers)
+        if args.enrich_owner:
+            for r in records:
+                enrich_with_owner(r)
+        print(json.dumps([asdict(r) for r in records], indent=2))
+        return 0
+
+    notices = fetch_all(
+        counties=counties,
+        tiers=tiers,
+        enrich_owner=args.enrich_owner,
+    )
+
+    print(f"\n=== Rubin Lublin AL — {len(notices)} notice(s) ===")
+    for n in notices:
+        owner = n.owner_name or "(no owner)"
+        print(
+            f"  {n.county:10s} {n.zip:5s} {n.address:35s} sale={n.auction_date}  "
+            f"file={n.case_number}  owner={owner}"
+        )
+
+    if args.output_csv:
+        from data_formatter import write_csv
+        path = write_csv(notices, str(args.output_csv))
+        print(f"\nWrote Sift CSV: {path}")
+    if args.output_datasift_csv:
+        from datasift_formatter import write_datasift_csv
+        path = write_datasift_csv(notices, str(args.output_datasift_csv))
+        print(f"Wrote DataSift CSV: {path}")
+
+    return 0 if notices else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main(sys.argv[1:]))
