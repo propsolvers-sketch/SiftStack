@@ -44,6 +44,10 @@ from dotenv import load_dotenv
 
 import datasift_formatter
 from notice_parser import NoticeData
+from address_standardizer import (
+    smarty_zip_or_city_estimate_for_madison,
+    smarty_zip_or_city_estimate_for_marshall,
+)
 from pre_probate_pipeline_al import (
     _promote_heir_contacts_to_csv_slots,
     _smarty_zip_for_madison_address,
@@ -154,7 +158,10 @@ def _fetch_madison_proxy(
         # Smarty geocode for ZIP (Madison's bulk feed has no city/zip)
         if not r.situs_address:
             continue
-        city, zip_code = _smarty_zip_for_madison_address(r.situs_address)
+        # 3-tuple variant with city-tier centroid fallback (2026-07-08).
+        city, zip_code, zip_estimated = smarty_zip_or_city_estimate_for_madison(
+            r.situs_address,
+        )
         if not zip_code:
             geocode_misses += 1
             continue
@@ -167,6 +174,12 @@ def _fetch_madison_proxy(
         n.city = city or n.city
         n.zip = zip_code
         n.notice_subtype = "tier_distress_proxy"
+        if zip_estimated:
+            existing = n.missing_data_flags or ""
+            n.missing_data_flags = (
+                f"{existing}|zip_estimated_from_city" if existing
+                else "zip_estimated_from_city"
+            )
         notices.append(n)
 
         # Be polite to Smarty — small inter-call delay to avoid rate-limit
@@ -215,7 +228,10 @@ def _fetch_marshall_proxy(
     for r in recs:
         if not r.situs_address:
             continue
-        city, zip_code = _smarty_zip_for_marshall_address(r.situs_address)
+        # 3-tuple variant with city-tier centroid fallback (2026-07-08).
+        city, zip_code, zip_estimated = smarty_zip_or_city_estimate_for_marshall(
+            r.situs_address,
+        )
         if not zip_code:
             geocode_misses += 1
             continue
@@ -228,6 +244,12 @@ def _fetch_marshall_proxy(
         n.city = city or n.city
         n.zip = zip_code
         n.notice_subtype = "tier_distress_proxy"
+        if zip_estimated:
+            existing = n.missing_data_flags or ""
+            n.missing_data_flags = (
+                f"{existing}|zip_estimated_from_city" if existing
+                else "zip_estimated_from_city"
+            )
         notices.append(n)
 
         time.sleep(0.05)

@@ -61,6 +61,8 @@ from pre_probate_pipeline_al import (
 from address_standardizer import (
     smarty_zip_for_madison_address,
     smarty_zip_for_marshall_address,
+    smarty_zip_or_city_estimate_for_madison,
+    smarty_zip_or_city_estimate_for_marshall,
 )
 from probate_property_locator import enrich_notice_with_property
 from scraper import scrape_all
@@ -265,16 +267,27 @@ async def run_pipeline(
         # never enters this branch.
         county_lc = n.county.lower()
         if not n.zip and n.address and county_lc in {"madison", "marshall"}:
+            # 3-tuple variant with city-tier centroid fallback (2026-07-08).
+            # When USPS-CASS doesn't recognize the specific house number
+            # but Smarty confirms the street is in a known Madison/Marshall
+            # city, use the city's Tier-1 centroid ZIP + flag it so
+            # downstream filter presets can exclude if precision matters.
             if county_lc == "marshall":
-                city, zip_code = smarty_zip_for_marshall_address(n.address)
+                city, zip_code, zip_estimated = smarty_zip_or_city_estimate_for_marshall(n.address)
             else:
-                city, zip_code = smarty_zip_for_madison_address(n.address)
+                city, zip_code, zip_estimated = smarty_zip_or_city_estimate_for_madison(n.address)
             if zip_code:
                 n.zip = zip_code
                 if not n.city and city:
                     n.city = city
-                logger.debug("  Smarty filled %s ZIP: %s → %s, %s",
-                             n.county, n.address, city, zip_code)
+                if zip_estimated:
+                    existing = n.missing_data_flags or ""
+                    n.missing_data_flags = (
+                        f"{existing}|zip_estimated_from_city" if existing
+                        else "zip_estimated_from_city"
+                    )
+                logger.debug("  Smarty filled %s ZIP: %s → %s, %s (estimated=%s)",
+                             n.county, n.address, city, zip_code, zip_estimated)
 
         # Stage 3.7: Same-property dedupe (P0 #3) — skip duplicate addresses
         # before the tier gate. Multiple probate notices for co-deceased

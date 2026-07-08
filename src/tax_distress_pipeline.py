@@ -295,24 +295,33 @@ def fetch_tax_distress(
     # one outcome per logical Smarty call regardless of the multi-anchor
     # retry inside smarty_zip_for_assuranceweb_address.
     from address_standardizer import (
-        smarty_zip_for_madison_address,
-        smarty_zip_for_marshall_address,
+        smarty_zip_or_city_estimate_for_madison,
+        smarty_zip_or_city_estimate_for_marshall,
     )
 
     smarty_hits = 0
     for n, anchor_county in smarty_targets:
+        # 3-tuple variant with city-tier centroid fallback (2026-07-08).
+        # Records recovered via city centroid carry zip_estimated_from_city
+        # in missing_data_flags for downstream filter-preset visibility.
         if anchor_county == "Madison":
-            city, zip_code = smarty_zip_for_madison_address(
+            city, zip_code, zip_estimated = smarty_zip_or_city_estimate_for_madison(
                 n.address, rate_tracker=rate_tracker,
             )
         else:  # Marshall
-            city, zip_code = smarty_zip_for_marshall_address(
+            city, zip_code, zip_estimated = smarty_zip_or_city_estimate_for_marshall(
                 n.address, rate_tracker=rate_tracker,
             )
         if zip_code:
             n.zip = zip_code
             if city and not n.city:
                 n.city = city
+            if zip_estimated:
+                existing = n.missing_data_flags or ""
+                n.missing_data_flags = (
+                    f"{existing}|zip_estimated_from_city" if existing
+                    else "zip_estimated_from_city"
+                )
             smarty_hits += 1
 
     # Records with a resolved ZIP after this stage: Jefferson (always) +

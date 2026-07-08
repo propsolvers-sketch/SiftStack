@@ -123,9 +123,12 @@ def fetch_tb_al(
 ) -> list[TiffanyBoscoRecord]:
     """Fetch and parse T&B's AL pending sales page.
 
-    Returns every property in the current default-window view (roughly
-    the next 4 months, per the ASP.NET form's max-date constraint).
-    Filter downstream via `filter_records()` for county / tier selection.
+    Returns every property in the default GET view. The default view is
+    NOT restricted by date — it shows all upcoming sales the firm has
+    scheduled (verified 2026-07-08 vs an ASP.NET POST-back with
+    tbSaleEnd=today+4mo which counter-intuitively returned FEWER records
+    for some counties, meaning the POST-back is a date-range FILTER not
+    a widening — the default already shows everything unbounded).
 
     The ``iagree=true`` cookie set here bypasses T&B's client-side terms
     of use redirect. It's a JS-only check — server serves data on GET
