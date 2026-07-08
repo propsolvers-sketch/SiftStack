@@ -31,9 +31,27 @@ MAX_BATCH_SIZE = 100
 
 
 def _build_client(auth_id: str, auth_token: str):
-    """Build an authenticated Smarty US Street API client."""
+    """Build an authenticated Smarty US Street API client.
+
+    Pinned to the ``us-core-cloud`` license because the account's active
+    subscription is US Address Verification / Core Edition / Cloud. The
+    smartystreets_python_sdk defaults to ``us-standard-cloud``, which
+    yields HTTP 402 ``Active subscription required (1588026162)`` against
+    a Core-only account — verified 2026-07-08 via direct HTTP probe:
+      - No license or ``us-core-cloud`` → HTTP 200
+      - ``us-standard-cloud`` (SDK default) → HTTP 402
+      - ``us-rooftop-geocoding-cloud`` → HTTP 402
+    Without this pin the pre-probate pipeline silently drops every
+    Madison/Marshall obituary match (~14/week) because Smarty is the
+    only path we have to recover ZIP from the AssuranceWeb street-only
+    property response.
+    """
     credentials = BasicAuthCredentials(auth_id, auth_token)
-    return ClientBuilder(credentials).build_us_street_api_client()
+    return (
+        ClientBuilder(credentials)
+        .with_licenses(["us-core-cloud"])
+        .build_us_street_api_client()
+    )
 
 
 def _build_lastline(notice: NoticeData) -> str:
