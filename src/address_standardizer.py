@@ -470,6 +470,29 @@ _MARSHALL_ANCHORS: tuple[str, ...] = (
     "AL",
 )
 
+# City → primary Tier-1 ZIP for city-only fallback (see
+# smarty_zip_or_city_estimate below). Used when USPS-CASS doesn't
+# recognize the specific house number but Smarty confirms the street
+# is in a known Madison/Marshall city. Verified 2026-07-08 via direct
+# us-zipcode.api.smarty.com lookups:
+#   Huntsville → 24 ZIPs (most Tier 1: 35801/35803/35805/35810/35811)
+#   Albertville → 2 ZIPs (both Tier 1: 35950, 35951)
+#   Arab → 1 ZIP (Tier 1: 35016)
+#   Guntersville → 1 ZIP (Tier 1: 35976)
+#   Boaz → 2 ZIPs (Tier 1: 35957; non-tier: 35956)
+# These are TIER CENTROIDS, not USPS-standardized ZIPs — records
+# stamped with these MUST carry the ``zip_estimated_from_city`` data
+# flag so downstream filter presets can exclude if precision matters.
+_CITY_TIER_ZIP_FALLBACK: dict[str, str] = {
+    # Madison County
+    "HUNTSVILLE": "35801",     # Tier 1 (Downtown / South Huntsville)
+    # Marshall County (all 4 primary cities have a Tier-1 anchor ZIP)
+    "ALBERTVILLE": "35950",    # Tier 1
+    "ARAB": "35016",           # Tier 1 (single ZIP city)
+    "GUNTERSVILLE": "35976",   # Tier 1 (single ZIP city)
+    "BOAZ": "35957",           # Tier 1 (city has 2 ZIPs; this is the tier one)
+}
+
 
 def _smarty_lookup_once(situs: str, lastline_hint: str) -> tuple[str, str]:
     """Single Smarty lookup attempt. Returns ('','') on any failure."""
@@ -557,6 +580,101 @@ def smarty_zip_for_assuranceweb_address(
     if rate_tracker is not None:
         rate_tracker.record("smarty", False)
     return ("", "")
+
+
+def smarty_zip_or_city_estimate(
+    situs: str,
+    lastline_hint: str,
+    anchor_fallbacks: tuple[str, ...] | None = None,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
+) -> tuple[str, str, bool]:
+    """Enhanced ZIP recovery with a city-tier-centroid fallback.
+
+    Same multi-anchor Smarty lookup as ``smarty_zip_for_assuranceweb_address``,
+    plus one additional stage: when USPS-CASS doesn't recognize the specific
+    house number but Smarty confirms the street is in a known Madison/Marshall
+    city, return the city's Tier-1 centroid ZIP with an ``is_estimated=True``
+    flag. Recovers records that would otherwise drop entirely (new
+    construction, private drives, rural addresses USPS doesn't deliver to,
+    county-tax-roll addresses that differ from postal delivery addresses).
+
+    Verified 2026-07-08: 11 Madison + 3 Marshall pre-probate matches per
+    day were being dropped as ``tier=None`` because Smarty returned city
+    but no ZIP for county-tax-roll addresses; this fallback recovers
+    ~8-11 leads/week that pass the tier gate on city centroid alone.
+
+    Returns (city, zip, is_estimated_from_city). ``is_estimated=True``
+    means the ZIP is a tier centroid, not a USPS-standardized value —
+    callers should stamp ``zip_estimated_from_city`` on the record so
+    downstream filter presets can filter these separately if needed.
+    """
+    if not situs or not situs.strip():
+        return ("", "", False)
+
+    best_city_only = ""
+
+    # Primary anchor
+    city, zip_ = _smarty_lookup_once(situs, lastline_hint)
+    if zip_:
+        if rate_tracker is not None:
+            rate_tracker.record("smarty", True)
+        return (city, zip_, False)
+    if city and not best_city_only:
+        best_city_only = city
+
+    # Fallback anchors
+    for anchor in (anchor_fallbacks or ()):
+        if anchor == lastline_hint:
+            continue
+        city, zip_ = _smarty_lookup_once(situs, anchor)
+        if zip_:
+            logger.debug("Smarty fallback hit on %r (anchor=%r): %s, %s",
+                         situs, anchor, city, zip_)
+            if rate_tracker is not None:
+                rate_tracker.record("smarty", True)
+            return (city, zip_, False)
+        if city and not best_city_only:
+            best_city_only = city
+
+    # All full-precision lookups exhausted. Last-resort: city-centroid.
+    if best_city_only:
+        fallback_zip = _CITY_TIER_ZIP_FALLBACK.get(best_city_only.upper())
+        if fallback_zip:
+            logger.info(
+                "Smarty city-only fallback: %r → %s + tier centroid ZIP %s "
+                "(is_estimated=True)",
+                situs, best_city_only, fallback_zip,
+            )
+            if rate_tracker is not None:
+                rate_tracker.record("smarty", True)
+            return (best_city_only, fallback_zip, True)
+
+    if rate_tracker is not None:
+        rate_tracker.record("smarty", False)
+    return ("", "", False)
+
+
+def smarty_zip_or_city_estimate_for_madison(
+    situs: str,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
+) -> tuple[str, str, bool]:
+    """Madison-anchored 3-tuple variant with city-centroid fallback."""
+    return smarty_zip_or_city_estimate(
+        situs, "Huntsville AL", _MADISON_ANCHORS, rate_tracker=rate_tracker,
+    )
+
+
+def smarty_zip_or_city_estimate_for_marshall(
+    situs: str,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
+) -> tuple[str, str, bool]:
+    """Marshall-anchored 3-tuple variant with city-centroid fallback."""
+    return smarty_zip_or_city_estimate(
+        situs, "Albertville AL", _MARSHALL_ANCHORS, rate_tracker=rate_tracker,
+    )
 
 
 def smarty_zip_for_madison_address(

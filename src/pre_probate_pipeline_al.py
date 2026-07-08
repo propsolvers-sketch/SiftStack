@@ -794,6 +794,12 @@ class PreProbateResult:
     situs_address: str = ""
     situs_city: str = ""
     situs_zip: str = ""
+    # True when situs_zip is a city-tier centroid (Smarty confirmed the
+    # street is in a known Madison/Marshall city but USPS-CASS didn't
+    # recognize the specific house number). Propagates to notice
+    # missing_data_flags so downstream filter presets can filter these
+    # separately. See address_standardizer._CITY_TIER_ZIP_FALLBACK.
+    zip_estimated_from_city: bool = False
     is_homestead: bool = False
     total_value: float = 0.0
     is_delinquent: bool = False
@@ -867,6 +873,8 @@ from address_standardizer import (
     smarty_zip_for_assuranceweb_address,
     smarty_zip_for_madison_address,
     smarty_zip_for_marshall_address,
+    smarty_zip_or_city_estimate_for_madison,
+    smarty_zip_or_city_estimate_for_marshall,
 )
 _smarty_zip_for_assuranceweb_address = smarty_zip_for_assuranceweb_address
 _smarty_zip_for_madison_address = smarty_zip_for_madison_address
@@ -1226,18 +1234,27 @@ def run_pipeline(
             result.municipality = primary.municipality
 
         # Stage 3.5: Madison + Marshall records have no ZIP from the property
-        # API. One-shot Smarty geocode to recover (city, zip) before the tier
-        # gate. Anchor city differs by county (Huntsville for Madison,
-        # Albertville for Marshall) so Smarty's USPS-CASS lookup resolves
-        # rural addresses to the correct delivery city.
+        # API. Smarty geocode recovers (city, zip) before the tier gate.
+        # Anchor city differs by county (Huntsville for Madison, Albertville
+        # for Marshall) so Smarty's USPS-CASS lookup resolves rural addresses
+        # to the correct delivery city.
+        #
+        # Since 2026-07-08 uses the 3-tuple variant with a city-tier-centroid
+        # fallback: when USPS-CASS doesn't recognize the specific house number
+        # but Smarty confirms the street is in a known Madison/Marshall city,
+        # the tier centroid ZIP (35801 Huntsville / 35950 Albertville / etc.)
+        # is returned with is_estimated=True. Recovers ~8-11 leads/week that
+        # used to drop as tier=None — new construction, private drives, rural
+        # tax-roll addresses that differ from postal delivery.
         if not result.situs_zip and result.situs_address:
+            zip_estimated = False
             if matched_county == "Marshall":
-                city, zip_code = _smarty_zip_for_marshall_address(
+                city, zip_code, zip_estimated = smarty_zip_or_city_estimate_for_marshall(
                     result.situs_address, rate_tracker=rate_tracker,
                 )
                 anchor = "Marshall"
             elif matched_county == "Madison":
-                city, zip_code = _smarty_zip_for_madison_address(
+                city, zip_code, zip_estimated = smarty_zip_or_city_estimate_for_madison(
                     result.situs_address, rate_tracker=rate_tracker,
                 )
                 anchor = "Madison"
@@ -1248,8 +1265,12 @@ def run_pipeline(
                 result.situs_zip = zip_code
                 if not result.situs_city and city:
                     result.situs_city = city
-                logger.debug("  Smarty geocode filled %s ZIP: %s → %s, %s",
-                             anchor, result.situs_address, city, zip_code)
+                if zip_estimated:
+                    result.zip_estimated_from_city = True
+                logger.debug(
+                    "  Smarty geocode filled %s ZIP: %s → %s, %s (estimated=%s)",
+                    anchor, result.situs_address, city, zip_code, zip_estimated,
+                )
 
         # Stage 3.7: Same-property dedupe (P0 #3).
         # When two decedent obits resolve to the same situs address (e.g.
@@ -1418,6 +1439,17 @@ def _to_notice_data(r: PreProbateResult) -> NoticeData:
         notice.dm_confidence = "low"
         notice.dm_confidence_reason = "no_survivors_named_in_obituary"
         notice.missing_data_flags = "no_decision_maker"
+
+    # City-tier centroid marker: when Smarty resolved city but not the
+    # specific ZIP, propagate the estimated flag so downstream filter
+    # presets can target `zip_estimated_from_city` if wanted (or exclude
+    # it if precision matters).
+    if r.zip_estimated_from_city:
+        existing = notice.missing_data_flags or ""
+        notice.missing_data_flags = (
+            f"{existing}|zip_estimated_from_city" if existing
+            else "zip_estimated_from_city"
+        )
 
     return notice
 
