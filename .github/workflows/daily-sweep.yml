@@ -233,6 +233,25 @@ jobs:
             --output-datasift-csv output/leads/datasift_upload_foreclosure_rl_${{ steps.run_start.outputs.ts }}.csv \
             2>&1 | tee logs/daily_rl_${{ steps.run_start.outputs.ts }}.log
 
+      # ── Tiffany & Bosco AL foreclosure schedule ─────────────────────────
+      # Public ASP.NET portal at fs.tblaw.com/Sales/PendingSalesAl.aspx.
+      # T&B is the dominant AL non-judicial foreclosure firm (successor to
+      # Sirote & Permutt's mortgage practice — Homewood, AL). Cross-source
+      # coverage alongside Rubin Lublin: T&B tends to have stronger Madison
+      # inventory when RL is thin, and vice-versa. Same downstream pattern
+      # as RL — writes datasift_upload_foreclosure_tb_<ts>.csv, DataSift
+      # dedupes by property address across all three foreclosure sources
+      # (APN + RL + T&B).
+      - name: Run Tiffany & Bosco AL foreclosures
+        continue-on-error: true
+        run: |
+          python src/tiffany_bosco_al_pipeline.py \
+            --counties Jefferson,Madison,Marshall \
+            --tiers 1,2 \
+            --enrich-owner \
+            --output-datasift-csv output/leads/datasift_upload_foreclosure_tb_${{ steps.run_start.outputs.ts }}.csv \
+            2>&1 | tee logs/daily_tb_${{ steps.run_start.outputs.ts }}.log
+
       # ── Sunday-only: obit refresh pass (Mark Jerome Green pattern) ──
       # Families update legacy.com obituaries after initial publication
       # (heirs added days/weeks later). Live measurement on 2026-06-19
