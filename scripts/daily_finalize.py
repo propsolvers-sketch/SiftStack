@@ -109,6 +109,27 @@ class PreProbateFunnel:
     trace_cost: float = 0.0
 
 
+@dataclass
+class CodeViolationFunnel:
+    """Funnel state for the code_violation pipeline (Huntsville +
+    Birmingham + Hoover). Distinct from the others because CV's
+    cross-run dedup (seen_code_violations.json, 180-day prune window)
+    is a first-class filter — the operator needs to see both fresh and
+    skipped counts to understand why "daily new" volume is small."""
+    bulk_fetched: int = 0
+    owner_enriched: int = 0
+    tier_gated: int = 0
+    dedup_fresh: int = 0        # Passed cross-run dedup — actually emitted
+    dedup_skipped: int = 0      # Seen within 180-day prune window — skipped
+    dedup_no_case: int = 0      # No case# — passed through (can't dedup)
+    tracerfy_submitted: int = 0
+    tracerfy_matched: int = 0
+    tracerfy_phones: int = 0
+    tracerfy_emails: int = 0
+    tracerfy_cost: float = 0.0
+    csv_written: int = 0        # Final row count in the datasift CSV
+
+
 def _first_int(pattern: str, text: str) -> int:
     m = re.search(pattern, text)
     return int(m.group(1)) if m else 0
@@ -204,6 +225,64 @@ def parse_apn_probate(path: Path) -> ApnProbateFunnel:
     f.dropped_off_tier = _first_int(r"dropped \(off-target ZIP\):\s*(\d+)", text)
     f.dropped_no_property = _first_int(r"dropped \(no property\):\s*(\d+)", text)
     f.dedupes = len(re.findall(r"SKIP.*dup decedent", text))
+    return f
+
+
+def parse_code_violation(path: Path) -> CodeViolationFunnel:
+    """Parse the code_violation pipeline's log (logs/daily_code_*.log).
+
+    Log line formats we extract from:
+      - "owner_enriched gate: 419 notices have an owner_name" — owner count
+      - "Cross-run dedup: 217 → 8 (skipped 209 already-seen, 0 had no case# ...)" — dedup
+      - "Funnel (code_violation): {'bulk_fetched': 469, ...}" — full funnel dict
+      - "Skip-trace stats: submitted=X matched=Y phones=Z emails=W cost=$..."
+      - "Wrote 8 records to DataSift CSV: ..." — final CSV size
+    """
+    if not path.exists():
+        return CodeViolationFunnel()
+    text = path.read_text(encoding="utf-8", errors="replace")
+    f = CodeViolationFunnel()
+
+    # Funnel dict — pulls bulk_fetched + owner_enriched + tier_gated in one shot
+    m = re.search(
+        r"Funnel \(code_violation\):\s*\{[^}]*"
+        r"'bulk_fetched':\s*(\d+)[^}]*"
+        r"'owner_enriched':\s*(\d+)[^}]*"
+        r"'tier_gated':\s*(\d+)",
+        text,
+    )
+    if m:
+        f.bulk_fetched = int(m.group(1))
+        f.owner_enriched = int(m.group(2))
+        f.tier_gated = int(m.group(3))
+
+    # Cross-run dedup line
+    m = re.search(
+        r"Cross-run dedup:\s*(\d+)\s*→\s*(\d+)\s*"
+        r"\(skipped\s+(\d+)\s+already-seen,\s*(\d+)\s+had no case",
+        text,
+    )
+    if m:
+        # group(1) = tier_gated pre-dedup, group(2) = fresh, group(3) = skipped, group(4) = no-case
+        f.dedup_fresh = int(m.group(2))
+        f.dedup_skipped = int(m.group(3))
+        f.dedup_no_case = int(m.group(4))
+
+    # Skip-trace stats
+    m = re.search(
+        r"Skip-trace stats:\s*submitted=(\d+)\s+matched=(\d+)\s+"
+        r"phones=(\d+)\s+emails=(\d+)\s+cost=\$([\d.]+)",
+        text,
+    )
+    if m:
+        f.tracerfy_submitted = int(m.group(1))
+        f.tracerfy_matched = int(m.group(2))
+        f.tracerfy_phones = int(m.group(3))
+        f.tracerfy_emails = int(m.group(4))
+        f.tracerfy_cost = float(m.group(5))
+
+    # CSV row count from the "Wrote N records to DataSift CSV" line
+    f.csv_written = _first_int(r"Wrote (\d+) records? to DataSift CSV", text)
     return f
 
 
@@ -538,6 +617,40 @@ def _format_apn_funnel(f: ApnProbateFunnel) -> list[str]:
     ]
 
 
+def _format_code_violation_funnel(f: CodeViolationFunnel) -> list[str]:
+    """Render the Code Violation section for the Slack summary.
+
+    Makes the 180-day cross-run dedup visible — the operator needs to
+    see BOTH the fresh count and the skipped count to understand why
+    daily new-volume is small (~0-15/day) despite the source portals
+    listing hundreds of active cases at any time.
+    """
+    if not (f.bulk_fetched or f.dedup_fresh or f.csv_written):
+        return ["  (no code_violation output)"]
+
+    lines = [
+        f"  bulk-fetched: {f.bulk_fetched}  ·  "
+        f"owner-enriched: {f.owner_enriched}  ·  "
+        f"tier-gated: {f.tier_gated}",
+    ]
+    if f.dedup_skipped or f.dedup_fresh:
+        no_case_note = (
+            f"  ·  {f.dedup_no_case} passed through (no case#)"
+            if f.dedup_no_case else ""
+        )
+        lines.append(
+            f"  cross-run dedup: {f.dedup_fresh} fresh  ·  "
+            f"{f.dedup_skipped} skipped (seen ≤ 180d){no_case_note}"
+        )
+    if f.tracerfy_submitted:
+        lines.append(
+            f"  Tracerfy: {f.tracerfy_matched}/{f.tracerfy_submitted} matched  ·  "
+            f"{f.tracerfy_phones} phones  ·  {f.tracerfy_emails} emails  ·  "
+            f"${f.tracerfy_cost:.2f}"
+        )
+    return lines
+
+
 def _format_pre_funnel(f: PreProbateFunnel) -> list[str]:
     if not f.harvested:
         return ["  (no pre_probate output — Firecrawl listing returned empty)"]
@@ -715,6 +828,7 @@ def _build_slack_message(
     csv_count: int,
     dropbox_results: list[dict] | None = None,
     csvs: list[Path] | None = None,
+    code_violation_f: CodeViolationFunnel | None = None,
 ) -> str:
     today = datetime.now().strftime("%Y-%m-%d")
     out = str(OUT)
@@ -751,6 +865,19 @@ def _build_slack_message(
         *_format_pre_funnel(pre_f),
         "",
     ])
+    # Code Violation section — only render when the log had a funnel to
+    # parse. Makes the 180-day cross-run dedup visible so "0-8 new/day"
+    # doesn't read as a broken pipeline (it's the seen_code_violations
+    # filter working as designed).
+    if code_violation_f is not None and (
+        code_violation_f.bulk_fetched or code_violation_f.dedup_fresh
+        or code_violation_f.csv_written
+    ):
+        lines.extend([
+            "*Code Violation (Huntsville · Birmingham · Hoover)*",
+            *_format_code_violation_funnel(code_violation_f),
+            "",
+        ])
 
     if csv_count == 0:
         lines.append(
@@ -853,13 +980,16 @@ async def main() -> int:
     main_log = _newest_log("daily_main_*.log")
     apn_log = _newest_log("daily_apn_*.log")
     pre_log = _newest_log("daily_pre_*.log")
+    code_log = _newest_log("daily_code_*.log")
     print(f"main log:        {main_log}", flush=True)
     print(f"apn log:         {apn_log}", flush=True)
     print(f"pre log:         {pre_log}", flush=True)
+    print(f"code log:        {code_log}", flush=True)
 
     main_funnel = parse_main_daily(main_log) if main_log else MainDailyFunnel()
     apn_funnel = parse_apn_probate(apn_log) if apn_log else ApnProbateFunnel()
     pre_funnel = parse_pre_probate(pre_log) if pre_log else PreProbateFunnel()
+    code_funnel = parse_code_violation(code_log) if code_log else CodeViolationFunnel()
 
     csvs = _csvs_from_this_run(start_ts)
     print(f"\nFound {len(csvs)} CSV(s) produced this run:", flush=True)
@@ -962,6 +1092,7 @@ async def main() -> int:
         main_funnel, apn_funnel, pre_funnel, results, len(csvs),
         dropbox_results=dropbox_results,
         csvs=csvs,
+        code_violation_f=code_funnel,
     )
     print("\n--- SLACK ---", flush=True)
     print(msg, flush=True)
