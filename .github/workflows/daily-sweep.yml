@@ -254,6 +254,35 @@ jobs:
             --output-datasift-csv output/leads/datasift_upload_foreclosure_tb_${{ steps.run_start.outputs.ts }}.csv \
             2>&1 | tee logs/daily_tb_${{ steps.run_start.outputs.ts }}.log
 
+      # ── T&B Sales Results (historical, 180 days) ────────────────────────
+      # Companion to the pending-sales adapter above. Pulls the past 180
+      # days of completed T&B AL sales from fs.tblaw.com/Sales/SalesResultsAl.aspx
+      # (ASP.NET POST-back with pagination) and emits ONLY records with
+      # status "Cancelled" or "Postponed" — high-signal distress leads
+      # where the owner retained the property but is under active
+      # financial stress. Sold/3rd-Party/Reverted records are dropped
+      # (no direct-outreach opportunity — bank REO or already sold).
+      # Cross-run dedup via .tb_results_seen_ids.json so daily reruns
+      # emit only NEW cancellations/postponements. Two separate CSVs
+      # output: cancelled + postponed, each carrying notice_subtype
+      # (foreclosure_cancelled / foreclosure_postponed) for DataSift
+      # filter-preset targeting. Live 2026-07-09: 5 Madison/Marshall/
+      # Jefferson tier-qualified cancelled records visible in the
+      # 180-day window (0 postponed — cancellations are the dominant
+      # outcome).
+      - name: Run T&B Sales Results (Cancelled + Postponed)
+        continue-on-error: true
+        run: |
+          python src/tiffany_bosco_al_results_pipeline.py \
+            --counties Jefferson,Madison,Marshall \
+            --tiers 1,2 \
+            --days-back 180 \
+            --enrich-owner \
+            --skip-trace \
+            --output-datasift-cancelled output/leads/datasift_upload_foreclosure_tb_cancelled_${{ steps.run_start.outputs.ts }}.csv \
+            --output-datasift-postponed output/leads/datasift_upload_foreclosure_tb_postponed_${{ steps.run_start.outputs.ts }}.csv \
+            2>&1 | tee logs/daily_tb_results_${{ steps.run_start.outputs.ts }}.log
+
       # ── Halliday, Watkins & Mann AL foreclosure schedule ────────────────
       # Third trustee-portal foreclosure source alongside Rubin Lublin +
       # Tiffany & Bosco. Portal at halliday-watkins.com/live/AL/bids.htm —
@@ -396,6 +425,7 @@ jobs:
             seen_ids.json \
             last_run.json \
             seen_code_violations.json \
+            .tb_results_seen_ids.json \
             output/observability/service_rates.json \
             2>/dev/null || true
           if ! git diff --cached --quiet; then

@@ -563,20 +563,28 @@ def _foreclosure_source_label(csv_name: str) -> str | None:
     """Map a foreclosure CSV filename to a human-readable source label.
 
     Returns None for non-foreclosure CSVs. Filename patterns:
-      datasift_upload_foreclosure_<ts>.csv                → APN (main.py daily)
-      datasift_upload_foreclosure_rl_<ts>.csv             → Rubin Lublin
-      datasift_upload_foreclosure_tb_<ts>.csv             → Tiffany & Bosco
-      datasift_upload_foreclosure_hwm_<ts>.csv            → Halliday Watkins Mann
-      datasift_upload_foreclosure_consolidated_<ts>.csv   → SKIP (aggregate)
+      datasift_upload_foreclosure_<ts>.csv                       → APN (main.py daily)
+      datasift_upload_foreclosure_rl_<ts>.csv                    → Rubin Lublin
+      datasift_upload_foreclosure_tb_<ts>.csv                    → Tiffany & Bosco (pending)
+      datasift_upload_foreclosure_tb_cancelled_<ts>.csv          → T&B Sales Results (Cancelled)
+      datasift_upload_foreclosure_tb_postponed_<ts>.csv          → T&B Sales Results (Postponed)
+      datasift_upload_foreclosure_hwm_<ts>.csv                   → Halliday Watkins Mann
+      datasift_upload_foreclosure_consolidated_<ts>.csv          → SKIP (aggregate)
     """
     if "foreclosure" not in csv_name:
         return None
     if "consolidated" in csv_name:
         return None  # aggregate — its total is the sum of per-source lines
+    # Check specific-suffix patterns before the generic _tb_ so cancelled/
+    # postponed are distinguished from the pending T&B adapter.
+    if "_tb_cancelled_" in csv_name:
+        return "T&B Sales Results (Cancelled)"
+    if "_tb_postponed_" in csv_name:
+        return "T&B Sales Results (Postponed)"
     if "_rl_" in csv_name:
         return "Rubin Lublin"
     if "_tb_" in csv_name:
-        return "Tiffany & Bosco"
+        return "Tiffany & Bosco (pending)"
     if "_hwm_" in csv_name:
         return "Halliday Watkins Mann"
     return "APN (main.py daily)"
@@ -630,12 +638,15 @@ def _analyze_foreclosure_csvs(csvs: list[Path]) -> tuple[list[str], list[str]]:
     breakdown: list[str] = []
     if by_source:
         breakdown.append("*Foreclosure Sources Breakdown*")
-        # Preferred source order — APN first, then trustee portals
+        # Preferred source order — APN first, then trustee portals,
+        # historical T&B Results at the end (backfill, not fresh volume)
         source_order = [
             "APN (main.py daily)",
             "Rubin Lublin",
-            "Tiffany & Bosco",
+            "Tiffany & Bosco (pending)",
             "Halliday Watkins Mann",
+            "T&B Sales Results (Cancelled)",
+            "T&B Sales Results (Postponed)",
         ]
         ordered = [s for s in source_order if s in by_source]
         ordered += [s for s in by_source if s not in ordered]
