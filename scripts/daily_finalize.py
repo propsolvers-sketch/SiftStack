@@ -26,7 +26,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -557,6 +557,145 @@ def _format_pre_funnel(f: PreProbateFunnel) -> list[str]:
     return lines
 
 
+# ── Foreclosure source + county breakdown + upcoming auction callouts ──
+
+def _foreclosure_source_label(csv_name: str) -> str | None:
+    """Map a foreclosure CSV filename to a human-readable source label.
+
+    Returns None for non-foreclosure CSVs. Filename patterns:
+      datasift_upload_foreclosure_<ts>.csv                → APN (main.py daily)
+      datasift_upload_foreclosure_rl_<ts>.csv             → Rubin Lublin
+      datasift_upload_foreclosure_tb_<ts>.csv             → Tiffany & Bosco
+      datasift_upload_foreclosure_hwm_<ts>.csv            → Halliday Watkins Mann
+      datasift_upload_foreclosure_consolidated_<ts>.csv   → SKIP (aggregate)
+    """
+    if "foreclosure" not in csv_name:
+        return None
+    if "consolidated" in csv_name:
+        return None  # aggregate — its total is the sum of per-source lines
+    if "_rl_" in csv_name:
+        return "Rubin Lublin"
+    if "_tb_" in csv_name:
+        return "Tiffany & Bosco"
+    if "_hwm_" in csv_name:
+        return "Halliday Watkins Mann"
+    return "APN (main.py daily)"
+
+
+def _analyze_foreclosure_csvs(csvs: list[Path]) -> tuple[list[str], list[str]]:
+    """Build the foreclosure source breakdown + upcoming auctions block.
+
+    Returns (breakdown_lines, upcoming_lines). Both are Slack-formatted
+    string lists. Breakdown groups records by source + county; upcoming
+    lists auctions by 7/14/21-day windows.
+    """
+    # Per-source county tallies + auction accumulator
+    by_source: dict[str, dict[str, int]] = {}
+    grand_total: dict[str, int] = {}
+    auctions: list[tuple[date, str, str, str]] = []  # (auction_date, address, city, county)
+    today = date.today()
+
+    for p in csvs:
+        source = _foreclosure_source_label(p.name)
+        if source is None:
+            continue
+        try:
+            with open(p, newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    county = (row.get("County") or "").strip() or "(unknown)"
+                    # Split into 2 steps because Python evaluates the RHS
+                    # before the LHS assignment — a single-line chained
+                    # setdefault would KeyError on the first row.
+                    sub = by_source.setdefault(source, {})
+                    sub[county] = sub.get(county, 0) + 1
+                    grand_total[county] = grand_total.get(county, 0) + 1
+
+                    # Parse the auction date for the upcoming-auctions block.
+                    raw = (row.get("Foreclosure Date") or "").strip()
+                    if not raw:
+                        continue
+                    try:
+                        auction_dt = datetime.strptime(raw, "%m/%d/%Y").date()
+                    except ValueError:
+                        continue
+                    if auction_dt < today:
+                        continue
+                    address = (row.get("Property Street Address") or "").strip()
+                    city = (row.get("Property City") or "").strip()
+                    auctions.append((auction_dt, address, city, county))
+        except Exception:
+            continue
+
+    # Breakdown section
+    breakdown: list[str] = []
+    if by_source:
+        breakdown.append("*Foreclosure Sources Breakdown*")
+        # Preferred source order — APN first, then trustee portals
+        source_order = [
+            "APN (main.py daily)",
+            "Rubin Lublin",
+            "Tiffany & Bosco",
+            "Halliday Watkins Mann",
+        ]
+        ordered = [s for s in source_order if s in by_source]
+        ordered += [s for s in by_source if s not in ordered]
+        for src in ordered:
+            counties = by_source[src]
+            total = sum(counties.values())
+            county_str = " | ".join(
+                f"{c[:3]} {n}" for c, n in sorted(counties.items())
+            )
+            breakdown.append(f"  {src}: {total}  ·  {county_str}")
+        # Consolidated total (post-dedup)
+        grand = sum(grand_total.values())
+        grand_str = " | ".join(
+            f"{c[:3]} {n}" for c, n in sorted(grand_total.items())
+        )
+        breakdown.append(f"  *Total (pre-dedup): {grand}*  ·  {grand_str}")
+
+    # Upcoming auctions section — 3 windows, capped rows per window
+    upcoming: list[str] = []
+    if auctions:
+        auctions.sort(key=lambda t: t[0])
+        _MAX_ROWS = 8  # cap per window to keep Slack readable
+        for label, days in [
+            (":rotating_light: *Upcoming Auctions — next 7 days*", 7),
+            (":warning: *Upcoming Auctions — 8-14 days*", 14),
+            (":clock3: *Upcoming Auctions — 15-21 days*", 21),
+        ]:
+            # Window boundaries: lower = previous window end + 1, upper = days
+            lower = 0 if days == 7 else (7 if days == 14 else 14)
+            in_window = [
+                a for a in auctions
+                if lower < (a[0] - today).days <= days
+                or (days == 7 and (a[0] - today).days <= 7 and (a[0] - today).days >= 0)
+            ]
+            # Deduplicate: same address twice from different sources → one line
+            seen_addr: set[str] = set()
+            dedup: list[tuple[date, str, str, str]] = []
+            for a in in_window:
+                key = (a[1] or "").upper()
+                if key and key in seen_addr:
+                    continue
+                if key:
+                    seen_addr.add(key)
+                dedup.append(a)
+            if not dedup:
+                continue
+            upcoming.append(label + f"  ({len(dedup)})")
+            for auction_dt, address, city, county in dedup[:_MAX_ROWS]:
+                dleft = (auction_dt - today).days
+                city_str = f", {city}" if city else ""
+                upcoming.append(
+                    f"  • {address}{city_str} ({county}) — "
+                    f"{auction_dt.strftime('%Y-%m-%d')} ({dleft}d)"
+                )
+            if len(dedup) > _MAX_ROWS:
+                upcoming.append(f"  _...and {len(dedup) - _MAX_ROWS} more_")
+
+    return breakdown, upcoming
+
+
 def _build_slack_message(
     main_f: MainDailyFunnel,
     apn_f: ApnProbateFunnel,
@@ -564,13 +703,33 @@ def _build_slack_message(
     results: list[dict],
     csv_count: int,
     dropbox_results: list[dict] | None = None,
+    csvs: list[Path] | None = None,
 ) -> str:
     today = datetime.now().strftime("%Y-%m-%d")
     out = str(OUT)
+
+    # Foreclosure source breakdown + upcoming auction callouts.
+    # Runs off the local CSVs so it's the ONE authoritative view of
+    # foreclosure records across all sources (APN + RL + T&B + HWM),
+    # reconciling the split between main.py's --notify-slack post
+    # (APN-only) and this consolidated daily-sweep post.
+    forec_breakdown: list[str] = []
+    upcoming_auctions: list[str] = []
+    if csvs:
+        forec_breakdown, upcoming_auctions = _analyze_foreclosure_csvs(csvs)
+
     lines = [
         f"*SiftStack Daily Sweep — {today}*",
         "_Jefferson · Madison · Marshall · Tier 1+2_",
         "",
+    ]
+    if upcoming_auctions:
+        lines.extend(upcoming_auctions)
+        lines.append("")
+    if forec_breakdown:
+        lines.extend(forec_breakdown)
+        lines.append("")
+    lines.extend([
         "*Foreclosure + Probate (main.py daily)*",
         *_format_main_funnel(main_f),
         "",
@@ -580,7 +739,7 @@ def _build_slack_message(
         "*Pre-Probate (Birmingham · Huntsville · Marshall)*",
         *_format_pre_funnel(pre_f),
         "",
-    ]
+    ])
 
     if csv_count == 0:
         lines.append(
@@ -791,6 +950,7 @@ async def main() -> int:
     msg = _build_slack_message(
         main_funnel, apn_funnel, pre_funnel, results, len(csvs),
         dropbox_results=dropbox_results,
+        csvs=csvs,
     )
     print("\n--- SLACK ---", flush=True)
     print(msg, flush=True)
