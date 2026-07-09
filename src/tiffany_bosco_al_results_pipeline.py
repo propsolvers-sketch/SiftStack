@@ -749,6 +749,36 @@ def _main(argv: list[str]) -> int:
             f"sale={n.auction_date}  file={n.case_number}  owner={owner}"
         )
 
+    # Smarty USPS standardization — normalizes address per USPS CASS,
+    # fills lat/lng + plus4_code + dpv_match_code, validates deliverability.
+    # Same call the main.py daily pipeline uses via enrichment_pipeline.
+    # Both cancelled and postponed lists are standardized together to
+    # amortize the batch overhead.
+    all_notices = cancelled + postponed
+    if all_notices:
+        try:
+            import config
+            if config.SMARTY_AUTH_ID and config.SMARTY_AUTH_TOKEN:
+                from address_standardizer import standardize_addresses
+                standardize_addresses(
+                    all_notices,
+                    config.SMARTY_AUTH_ID,
+                    config.SMARTY_AUTH_TOKEN,
+                )
+                confirmed = sum(
+                    1 for n in all_notices if getattr(n, "dpv_match_code", "") == "Y"
+                )
+                logger.info(
+                    "Smarty standardization: %d/%d DPV-confirmed",
+                    confirmed, len(all_notices),
+                )
+            else:
+                logger.info("Smarty standardization skipped — no SMARTY_AUTH_ID/TOKEN.")
+        except Exception as e:
+            logger.warning(
+                "Smarty standardization failed (continuing without): %s", e,
+            )
+
     # Tracerfy skip-trace + Trestle — same shape as pending adapter
     phone_tiers_cancelled: dict | None = None
     phone_tiers_postponed: dict | None = None
