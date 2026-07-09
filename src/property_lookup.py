@@ -423,25 +423,41 @@ async def lookup_decedent_properties(notices: list) -> None:
                     # only the street — city/zip aren't in the bulk payload. Without
                     # this, downstream tier filtering drops the notice. Same fix the
                     # apn_probate_pipeline_al + pre_probate_pipeline_al pipelines use.
+                    #
+                    # 2026-07-09: upgraded to the 3-tuple variant with city-tier
+                    # centroid fallback (address_standardizer.smarty_zip_or_city_estimate_*).
+                    # When USPS-CASS doesn't recognize the specific house number
+                    # but Smarty confirms the street is in a known Madison/Marshall
+                    # city, use the city's Tier-1 centroid ZIP + stamp
+                    # missing_data_flags with "zip_estimated_from_city" so
+                    # downstream filter presets can exclude these if precision
+                    # matters. Recovers ~2-4 probate records/week that would
+                    # otherwise drop as tier=None.
                     county_lc = notice.county.lower()
                     if county_lc in ("madison", "marshall") and notice.address and not notice.zip:
                         from address_standardizer import (
-                            smarty_zip_for_madison_address,
-                            smarty_zip_for_marshall_address,
+                            smarty_zip_or_city_estimate_for_madison,
+                            smarty_zip_or_city_estimate_for_marshall,
                         )
                         helper = (
-                            smarty_zip_for_marshall_address
+                            smarty_zip_or_city_estimate_for_marshall
                             if county_lc == "marshall"
-                            else smarty_zip_for_madison_address
+                            else smarty_zip_or_city_estimate_for_madison
                         )
-                        city, zip_code = helper(notice.address)
+                        city, zip_code, zip_estimated = helper(notice.address)
                         if zip_code:
                             notice.zip = zip_code
                             if not notice.city and city:
                                 notice.city = city
+                            if zip_estimated:
+                                existing = notice.missing_data_flags or ""
+                                notice.missing_data_flags = (
+                                    f"{existing}|zip_estimated_from_city" if existing
+                                    else "zip_estimated_from_city"
+                                )
                             logger.info(
-                                "  Smarty filled %s ZIP: %s -> %s, %s",
-                                notice.county, notice.address, city, zip_code,
+                                "  Smarty filled %s ZIP: %s -> %s, %s (estimated=%s)",
+                                notice.county, notice.address, city, zip_code, zip_estimated,
                             )
                         else:
                             logger.info(

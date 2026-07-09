@@ -426,6 +426,33 @@ def _main(argv: list[str]) -> int:
             f"file={n.case_number}  owner={owner}"
         )
 
+    # Smarty USPS standardization — normalizes address per USPS CASS,
+    # fills lat/lng + plus4_code + dpv_match_code, validates deliverability.
+    # Same call the main.py daily pipeline uses via enrichment_pipeline.
+    if notices:
+        try:
+            import config
+            if config.SMARTY_AUTH_ID and config.SMARTY_AUTH_TOKEN:
+                from address_standardizer import standardize_addresses
+                standardize_addresses(
+                    notices,
+                    config.SMARTY_AUTH_ID,
+                    config.SMARTY_AUTH_TOKEN,
+                )
+                confirmed = sum(
+                    1 for n in notices if getattr(n, "dpv_match_code", "") == "Y"
+                )
+                logger.info(
+                    "Smarty standardization: %d/%d DPV-confirmed",
+                    confirmed, len(notices),
+                )
+            else:
+                logger.info("Smarty standardization skipped — no SMARTY_AUTH_ID/TOKEN.")
+        except Exception as e:
+            logger.warning(
+                "Smarty standardization failed (continuing without): %s", e,
+            )
+
     # Tracerfy skip-trace + Trestle phone scoring — same gap fix as
     # code_violation_pipeline (f100e83) and apn_probate. Without this,
     # the DataSift Phone 1-9 / Email 1-5 columns stay empty and the
