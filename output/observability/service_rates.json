@@ -32,8 +32,8 @@
     },
     {
       "date": "2026-07-09",
-      "success": 350,
-      "total": 350
+      "success": 59,
+      "total": 59
     }
   ],
   "smarty": [
@@ -69,8 +69,8 @@
     },
     {
       "date": "2026-07-09",
-      "success": 0,
-      "total": 29
+      "success": 1,
+      "total": 1
     }
   ],
   "tracerfy": [
@@ -106,8 +106,8 @@
     },
     {
       "date": "2026-07-09",
-      "success": 24,
-      "total": 29
+      "success": 0,
+      "total": 1
     }
   ],
   "llm": [
@@ -143,8 +143,8 @@
     },
     {
       "date": "2026-07-09",
-      "success": 316,
-      "total": 316
+      "success": 58,
+      "total": 58
     }
   ]
 }
