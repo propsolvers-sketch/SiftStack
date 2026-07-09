@@ -398,12 +398,21 @@ def _is_valid_address(addr: str) -> bool:
     return True
 
 
-# ── TN zip code ──────────────────────────────────────────────────────
-# TN zips range from 37010 to 38589 — require 37xxx or 38xxx prefix
-ZIP_RE = re.compile(r"\b(3[78]\d{3})(?:-\d{4})?\b")
+# ── AL + TN zip codes ─────────────────────────────────────────────────
+# 2026-07-09: extended from TN-only (37xxx / 38xxx) to also accept
+# AL (35xxx / 36xxx). Previously the fallback ZIP extractor silently
+# rejected every Alabama ZIP because the range didn't match, dropping
+# city/zip on ~5-10% of AL notices that fell through the primary regex.
+# TN zips: 37010–38589; AL zips: 35004–36925. Combined pattern accepts
+# any 35xxx-38xxx.
+ZIP_RE = re.compile(r"\b(3[5-8]\d{3})(?:-\d{4})?\b")
 
 # Zips to reject when found via fallback (no address context):
-# Courthouse / auction / law-office zips that commonly appear in notice text
+# Courthouse / auction / law-office zips that commonly appear in notice text.
+# AL courthouse ZIPs (35203 Birmingham/Jefferson, 35801 Huntsville/Madison,
+# 35976 Guntersville/Marshall) are DELIBERATELY NOT INCLUDED here — those
+# ZIPs contain plenty of legitimate property addresses (all three are
+# Tier 1/2 target ZIPs) and blanket rejection would drop real leads.
 _COURTHOUSE_ZIPS = {
     "37902",  # Downtown Knoxville (courthouse, City-County Building)
     "37901",  # Knoxville PO Box area
@@ -412,10 +421,23 @@ _COURTHOUSE_ZIPS = {
     "37219",  # Nashville (state offices)
 }
 
-# Expected zip prefixes by county (for fallback validation)
+# Expected zip prefixes by county (for fallback validation).
+# AL counties added 2026-07-09. Prefixes chosen wide-enough to accept
+# every ZIP within each county (per USPS ZCTA boundaries):
+#   Jefferson  — 35004..35298  →  350, 351, 352
+#   Madison    — 35744..35899  →  357, 358
+#   Marshall   — 35016..35980  →  350, 351, 357, 359
+# Overlap between counties is fine — the check rejects only when ZERO
+# prefixes match the county's expected range.
 _COUNTY_ZIP_PREFIXES: dict[str, list[str]] = {
-    "Knox":   ["377", "378", "379"],
-    "Blount": ["377", "378"],
+    # TN legacy — Knox/Blount pipelines retired but kept for any
+    # historical import runs against archived data.
+    "Knox":      ["377", "378", "379"],
+    "Blount":    ["377", "378"],
+    # AL — active pipelines as of 2026-05.
+    "Jefferson": ["350", "351", "352"],
+    "Madison":   ["357", "358"],
+    "Marshall":  ["350", "351", "357", "359"],
 }
 
 
@@ -1769,14 +1791,16 @@ def _extract_city_zip_near(notice: NoticeData, text: str, addr_end: int) -> None
             notice.zip = m.group(2)
         return
 
-    # Fallback: find a known TN city in the window
+    # Fallback: find any known TN or AL city in the window. 2026-07-09
+    # extended from TN-only — AL notices reaching this fallback path
+    # were silently losing city because AL_CITIES wasn't consulted.
     window_upper = window.upper()
-    for city in TN_CITIES:
+    for city in TN_CITIES + AL_CITIES:
         if city.upper() in window_upper:
             notice.city = city
             break
 
-    # Find a TN zip near the address
+    # Find any AL or TN zip near the address (35xxx-38xxx range).
     zip_match = ZIP_RE.search(window)
     if zip_match:
         notice.zip = zip_match.group(1)
@@ -1795,12 +1819,17 @@ def _is_valid_fallback_zip(zip_code: str, county: str) -> bool:
 def _extract_city_zip_fallback(notice: NoticeData, text: str) -> None:
     """Last resort: find city/zip anywhere in the notice text.
 
-    Only used when no address was found. Finds the first known TN city
-    and first TN zip code, but rejects courthouse/out-of-county zips.
+    Only used when no address was found. Finds the first known AL or TN
+    city and first AL or TN zip (35xxx-38xxx), but rejects courthouse /
+    out-of-county zips per _is_valid_fallback_zip.
+
+    2026-07-09: extended from TN-only. Previously the AL side of the
+    pipeline silently no-op'd here because neither TN_CITIES nor the
+    TN-only ZIP_RE matched anything on an AL notice.
     """
     if not notice.city:
         text_upper = text.upper()
-        for city in TN_CITIES:
+        for city in TN_CITIES + AL_CITIES:
             if city.upper() in text_upper:
                 notice.city = city
                 break
