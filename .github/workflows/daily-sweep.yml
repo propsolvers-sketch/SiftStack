@@ -305,6 +305,37 @@ jobs:
             --output-datasift-csv output/leads/datasift_upload_foreclosure_hwm_${{ steps.run_start.outputs.ts }}.csv \
             2>&1 | tee logs/daily_hwm_${{ steps.run_start.outputs.ts }}.log
 
+      # ── TN Valley Media AdHunter probate (Madison + Marshall) ───────────
+      # Closes the Madison probate publication gap. The Madison Record is
+      # NOT an APN participating publication (verified 2026-07-09) —
+      # instead it publishes legal notices to the TN Valley Media AdHunter
+      # classifieds platform at classads.tnvalleymedia.com. Same platform
+      # also carries Advertiser-Gleam (Marshall County) probate notices.
+      #
+      # Live 2026-07-09 sample: 22 total notices / 6 Advertiser-Gleam
+      # Marshall probate / 0 Madison Record probate this week (dry week —
+      # Madison volume is bursty). Cross-check confirmed the 6 Marshall
+      # decedents are NOT in our existing APN probate CSVs → net new.
+      #
+      # Handles 3 subtypes:
+      #   * probate_creditors   — standard Letters Testamentary/Admin
+      #   * probate_sale        — Petition to Sell Real Property (HIGH-signal)
+      #   * probate_final_settlement — hearing notices
+      #
+      # Cross-run dedup via .adhunter_probate_seen_ids.json (30-day prune).
+      # Full enrichment chain: probate_property_locator → Smarty USPS →
+      # Tracerfy skip-trace → Trestle phone scoring. daily_finalize routes
+      # the output CSV via notice_type="probate".
+      - name: Run AdHunter probate (Madison + Marshall)
+        continue-on-error: true
+        run: |
+          python src/adhunter_probate_pipeline.py \
+            --counties Madison,Marshall \
+            --tiers 1,2 \
+            --skip-trace \
+            --output-datasift-csv output/leads/datasift_upload_probate_adhunter_${{ steps.run_start.outputs.ts }}.csv \
+            2>&1 | tee logs/daily_adhunter_probate_${{ steps.run_start.outputs.ts }}.log
+
       # ── Sunday-only: obit refresh pass (Mark Jerome Green pattern) ──
       # Families update legacy.com obituaries after initial publication
       # (heirs added days/weeks later). Live measurement on 2026-06-19
@@ -426,6 +457,7 @@ jobs:
             last_run.json \
             seen_code_violations.json \
             .tb_results_seen_ids.json \
+            .adhunter_probate_seen_ids.json \
             output/observability/service_rates.json \
             2>/dev/null || true
           if ! git diff --cached --quiet; then

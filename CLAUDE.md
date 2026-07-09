@@ -519,6 +519,65 @@ So Madison post-probate must use APN newspaper publications. The flow is structu
 - **Daily scheduler / cron** — same as the other pipelines, manual invocation only
 - **Cost monitoring** — APN scraping costs CAPTCHA solves (~$0.003/notice). With `seen_ids.json` deduplicating across runs, daily cadence settles to ~5-15 new notices/day = ~$0.05/day. First-run on a fresh `seen_ids.json` will burn ~$3-5 because it processes the full backlog.
 
+## Alabama AdHunter Probate Pipeline (Madison + Marshall, added 2026-07-09)
+
+**Companion to the APN Post-Probate pipeline.** Where APN routes through the alabamapublicnotices.com aggregator, this adapter scrapes the TN Valley Media **AdHunter** classifieds platform at `classads.tnvalleymedia.com/AdHunter/Default/Home/Search?majorClass=10` — a static-HTML classifieds database with no CAPTCHA, no login, no JavaScript. **Closes the Madison probate publication gap** discovered during the 2026-07-09 investigation: population math said Madison probate volume should run ~4× Marshall, but our APN data showed the inverse (~2-4 Madison vs ~6 Marshall per weekly CSV). Root cause: **The Madison Record is NOT an APN participating publication** — verified 2026-07-09 by checking APN's publication dropdown. Instead, The Madison Record publishes legal notices via its own AdHunter instance. The same AdHunter platform also carries **Advertiser-Gleam** (Marshall County) which surfaces additional Marshall estates that APN misses.
+
+### Adapter — [src/adhunter_probate_pipeline.py](src/adhunter_probate_pipeline.py)
+
+Papers on the AdHunter platform (9 total; we route only 3 to our pipeline):
+
+| Publication domain | Primary county | Included? |
+|---|---|---|
+| themadisonrecord.com | Madison | ✓ closes Madison gap |
+| advertisergleam.com | Marshall | ✓ complements APN Marshall |
+| redstonerocket.com | Madison (Redstone Arsenal / south-Huntsville) | ✓ edge-case coverage |
+| Decatur Daily / Times Daily / Courier Journal / Moulton Advertiser / Franklin County Times / Hartselle Enquirer | non-target counties (Morgan, Lauderdale, Lawrence, Franklin, Colbert) | ✗ filtered out |
+
+### Pipeline flow
+
+1. **Listing sweep** — paginate all `?majorClass=10&perpage=100&page=N` until an empty page (typically 1-2 pages, ~20-30 notices total).
+2. **Title pre-filter** — `IN THE PROBATE COURT`, `IN THE MATTER OF THE ESTATE`, `NOTICE TO CREDITORS`, or `LETTERS TESTAMENTARY|OF ADMINISTRATION`. Avoids fetching detail pages for non-probate ads.
+3. **Publication routing** — keep only the 3 target publications above (skips Lawrence County / Moulton Advertiser dominance).
+4. **Cross-run dedup** — `.adhunter_probate_seen_ids.json`, 30-day prune window. AdHunter ads are visible 15-21 days (3-week AL statutory publication), so a 30-day file catches republished ads without unbounded growth.
+5. **Detail fetch** — one HTTP per surviving candidate. Body lives in `<div class="item panel-body">` (verified 2026-07-09). Extracts decedent, PR name, case #, granted date, and **notice subtype**:
+   - `probate_creditors` — standard Letters granting Notice-to-Creditors
+   - `probate_sale` — Petition for Authority to Sell Real Property (**highest-signal distress** — estate is actively selling)
+   - `probate_final_settlement` — hearing on final settlement / distribution
+6. **County filter (body-authoritative)** — regex `Judge of Probate Court of (Madison|Marshall) County` on the notice body. Publication mapping only steered us to the detail page; the body's county reference decides.
+7. **Enrichment chain** (mirrors `apn_probate_pipeline_al`):
+   - `probate_property_locator.enrich_notice_with_property` — decedent-name lookup against county tax roll (Madison + Marshall AssuranceWeb)
+   - Smarty ZIP recovery + city-tier centroid fallback for AssuranceWeb counties (same `smarty_zip_or_city_estimate_for_madison/marshall` helpers used by the other pipelines)
+   - Same-decedent + same-address dedup (P0 #2, #3 patterns from `apn_probate`)
+   - ZIP tier gate (Tier 1 + Tier 2)
+   - Tracerfy skip-trace + Trestle phone scoring (--skip-trace, unconditional in workflow YAML)
+8. **DataSift CSV write** — `datasift_upload_probate_adhunter_<ts>.csv`. `daily_finalize._categorize()` routes it via `notice_type="probate"` alongside APN + Benchmark outputs. Cross-source dedup with APN happens at DataSift upload time (address-based).
+
+### Live 2026-07-09 verification
+
+- 22 total public notices on the platform
+- 13 pass the title probate filter
+- 6 pass the target-publication filter (all Advertiser-Gleam / Marshall this dry week; 0 Madison Record notices)
+- **Cross-check confirmed:** the 6 Marshall decedents (Bowron, Teal, Graves, Verrill, Pierce, Ennis) do NOT appear in our existing APN probate CSVs — **net-new records**
+- 3 subtypes represented in the sample: 4 creditors + 1 sale (Petition for Authority to Sell Real Property, Patricia Harbin Pierce) + 1 final settlement (Anita L Verrill)
+- End-to-end enrichment test: 2 of 3 hit Tier-1 target-county records (Ronald Teal → 358 Watts Road / Boaz / 35957; Barbara Ann Graves → 854 Jeremy Place / Arab / 35016)
+
+### CLI
+
+```bash
+python src/adhunter_probate_pipeline.py --counties Madison,Marshall --tiers 1,2 --skip-trace \
+    --output-datasift-csv output/leads/datasift_upload_probate_adhunter.csv
+
+# Diagnostics
+python src/adhunter_probate_pipeline.py --no-seen-dedup --tiers all -v      # ignore dedup, all tiers, verbose
+python src/adhunter_probate_pipeline.py --max-pages 3                        # cap sweep depth
+```
+
+### What's NOT done
+
+- **Judicial nuance on `probate_sale` subtype** — these carry a hearing_date (Petition heard on X) but no granted_date. The extractor recognizes them but downstream Slack summary doesn't yet callout upcoming sale hearings the way `daily_finalize` does for foreclosure auctions. Low priority — the DataSift filter preset can key on `notice_subtype=probate_sale` to prioritize these leads.
+- **AdHunter has no publication URL-parameter filter** — we filter by teaser's domain suffix. If TN Valley Media consolidates its platform or renames publications, the `_PUB_TARGET` map needs an update. Not fragile at present.
+
 ## Alabama Pre-Probate Pipeline (Jefferson + Madison, obituary-driven)
 
 **Companion to the Post-Probate pipeline.** Where post-probate reads court records (case-driven, 30-90 days after death), pre-probate works backwards from fresh obituaries (death-driven, days fresh). Same downstream: ZIP gate → enrichment → DataSift CSV → Slack. Together both pipelines replicate the full RealSupermarket vendor product the user was buying.
