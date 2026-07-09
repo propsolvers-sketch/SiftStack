@@ -1159,7 +1159,11 @@ def is_target_county(text: str, search_county: str) -> bool:
 
 
 async def is_target_county_async(
-    text: str, search_county: str, api_key: str | None = None,
+    text: str,
+    search_county: str,
+    api_key: str | None = None,
+    *,
+    rate_tracker: "ServiceRateTracker | None" = None,
 ) -> bool:
     """County check with LLM tiebreaker for ambiguous regex results.
 

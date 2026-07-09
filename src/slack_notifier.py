@@ -197,7 +197,11 @@ def build_summary(
     upcoming = _upcoming_auctions(notices)
 
     lines = [
-        f"*SiftStack - Daily Report ({datetime.now().strftime('%Y-%m-%d')})*",
+        f"*APN Scrape — early progress ({datetime.now().strftime('%Y-%m-%d')})*",
+        "_Preliminary — from main.py daily's APN scrape only. Full "
+        "consolidated summary (with Rubin Lublin + Tiffany & Bosco + "
+        "Halliday Watkins Mann sources + upcoming auctions) posts ~90 min "
+        "later as 'SiftStack Daily Sweep'._",
         "",
         f"*New notices scraped:* {total}",
     ]

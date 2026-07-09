@@ -333,6 +333,7 @@ async def _scrape_notice(
                 return None
             if not await is_target_county_async(
                 notice.raw_text, search.county, api_key=llm_api_key,
+                rate_tracker=rate_tracker,
             ):
                 logger.debug("  Filtered out (wrong county): %s", notice_id)
                 return None
