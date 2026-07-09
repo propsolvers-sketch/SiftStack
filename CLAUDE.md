@@ -135,6 +135,86 @@ Three regex patterns detect the property's actual county to filter false positiv
 
 `_TARGET_COUNTIES = {"jefferson", "madison"}`. Notices whose property is in any other county are dropped.
 
+## Alabama Foreclosure — Multi-Source Trustee Portal Coverage (added 2026-07-08 → 07-09)
+
+Alabama's non-judicial foreclosure statute (§ 35-10-13) requires 3 weeks of newspaper publication. APN captures **only** publishers who participate in the alabamapublicnotices.com network — **The Madison County Record is NOT an APN participant** (verified via APN publication-dropdown check 2026-07-08), so Madison + Marshall foreclosures returned 0 from APN alone. Four independent trustee-portal adapters close this gap; combined they give **5 concurrent foreclosure sources** running in the daily GHA cron.
+
+| Source | Adapter | Portal | Volume (weekly, target counties) | Notes |
+|---|---|---|---|---|
+| APN scrape | `main.py daily` | alabamapublicnotices.com | 20-30 | Turnstile CAPTCHA → 2Captcha. Strong Jefferson, weak Madison/Marshall |
+| Rubin Lublin | `src/rubin_lublin_al_pipeline.py` (350d668) | rlselaw.com | 10-15 | Static HTML table, no auth |
+| Tiffany & Bosco pending | `src/tiffany_bosco_al_pipeline.py` (c46bd72) | fs.tblaw.com/Sales/PendingSalesAl.aspx | 5-10 | ASP.NET ListView, iagree cookie bypass |
+| Halliday Watkins Mann | `src/halliday_watkins_al_pipeline.py` (b4e6a42) | halliday-watkins.com/live/AL/bids.htm | 5-10 | Static HTML; **no ZIP in address column** → tier filter runs POST-enrichment |
+| T&B Sales Results | `src/tiffany_bosco_al_results_pipeline.py` (c427ad3) | fs.tblaw.com/Sales/SalesResultsAl.aspx | 3-5 | 180-day POST-back; **Cancelled + Postponed only** (drops Sold/Reverted/3rd-Party) |
+
+**Deferred** (2026-07 evaluation):
+- **McMichael Taylor Gray** — Playwright + PowerBI iframe; fragile, low incremental volume
+- **LOGS Legal** — Playwright + PowerBI iframe; same fragility profile
+
+### Uniform enrichment chain (as of b63fa6e, 2026-07-09)
+
+All 5 sources run the same 4-stage chain. Consistency is enforced at commit time — new adapters MUST include all 4 stages before the DataSift CSV write:
+
+1. **County property API** — owner name recovery: Jefferson E-Ring (`src/jefferson_property_api.py`), Madison + Marshall AssuranceWeb (`src/madison_property_api.py`, `src/marshall_property_api.py`). Also recovers ZIP for HWM (address column has no ZIP).
+2. **Smarty US Street standardization** — populates `dpv_match_code`, `latitude`, `longitude`, `plus4_code` (ZIP+4). License MUST be `us-core-cloud` (not the SDK default `us-standard-cloud`, which lacks USPS-CASS). See `src/address_standardizer._build_client()` (3265316).
+3. **Tracerfy skip-trace** — phones + emails. `--skip-trace` flag on each adapter; workflow YAML passes it unconditionally. Cost ~$0.02/contact, ~$0.30-0.60/day across the 3 trustee adapters.
+4. **Trestle phone tier scoring** — populates `Phone Tags N` columns for DataSift filter presets (Tier 1 mobile / Tier 2 landline / Tier 3 VOIP).
+
+**City-tier centroid ZIP fallback** (97654c2 + d05f79f, extended to trustee adapters in b63fa6e): when Smarty USPS-CASS doesn't recognize the specific house number but confirms the street is in a known Madison/Marshall city, uses the Tier-1 centroid ZIP from `address_standardizer._CITY_TIER_ZIP_FALLBACK` (Huntsville→35801, Albertville→35950, Arab→35016, Guntersville→35976, Boaz→35957) and stamps `zip_estimated_from_city` in `NoticeData.missing_data_flags` for downstream visibility. HWM adapter also uses this map directly as a hard fallback when both property API and Smarty miss.
+
+### Cross-source deduplication
+
+Three layers:
+1. **Within-fetch:** each adapter dedups its own paginated results (T&B Results uses `(file#, sale_date, outcome)` triple; others use address).
+2. **Cross-run persistence:** `.tb_results_seen_ids.json` for T&B Results (180-day dedup window). Other adapters re-fetch fully each day and rely on layer 3.
+3. **Cross-source at upload time:** DataSift's address-dedup handles overlap between adapters (a property appearing in both RL and T&B pending lands once with the union of enrichment fields).
+
+The state files committed by the bot's `chore(bot)` step: `seen_ids.json`, `last_run.json`, `seen_code_violations.json`, `.tb_results_seen_ids.json`, `output/observability/service_rates.json`.
+
+### CSV output naming (glob pattern for daily_finalize)
+
+Each adapter writes to `output/leads/` with a distinct prefix so `daily_finalize._categorize()` can route them:
+
+- `datasift_upload_foreclosure_<ts>.csv` — APN (main.py daily)
+- `datasift_upload_foreclosure_rl_<ts>.csv` — Rubin Lublin
+- `datasift_upload_foreclosure_tb_<ts>.csv` — T&B pending
+- `datasift_upload_foreclosure_hwm_<ts>.csv` — Halliday Watkins Mann
+- `datasift_upload_foreclosure_tb_results_cancelled_<ts>.csv` — T&B Cancelled (subtype `foreclosure_cancelled`)
+- `datasift_upload_foreclosure_tb_results_postponed_<ts>.csv` — T&B Postponed (subtype `foreclosure_postponed`)
+
+The `notice_subtype` field on the Results CSVs enables DataSift filter-preset targeting (Cancelled = highest-signal distress).
+
+### Daily Slack summary structure (`scripts/daily_finalize.py`)
+
+Rendered in this order (a1ae8e0 + d63d531 + 3999bec):
+
+1. **Upcoming Auctions** — pinned at top; three time windows:
+   - 🚨 next 7 days (highest priority — call immediately)
+   - ⚠️ 8-14 days
+   - 🕐 15-21 days
+   - Each entry: address, city, county, ISO date, days-remaining. Cap 8 rows per window; overflow shown as "...and N more". Cross-source dedup by property address.
+2. **Foreclosure Sources Breakdown** — per-source + per-county counts. Reconciles the discrepancy between the APN-only `main.py --notify-slack` post (posted ~90 min earlier as "APN Scrape — early progress") and the consolidated total.
+3. **APN funnel** (main.py sub-summary), **Pre-Probate funnel**, **Code Violation funnel** (a1ae8e0) — each with dedup transparency (bulk-fetched → tier-gated → cross-run-dedup → uploaded).
+4. **DataSift Uploads** — one line per CSV that landed.
+
+The consolidated post is titled "SiftStack Daily Sweep". The earlier APN-only post is titled "APN Scrape — early progress" with a subtitle pointing to the consolidated post.
+
+### Workflow wiring — `.github/workflows/daily-sweep.yml`
+
+Each source is a separate step. Order matters only for the state-file `git add` at the end. All 3 trustee-portal steps (RL, T&B pending, HWM) MUST include `--skip-trace` (5c34efa fix — earlier versions omitted this and phones stayed empty).
+
+### Recovery procedures
+
+| Symptom | Cause / Fix |
+|---|---|
+| Every notice detail page fails CAPTCHA | Check 2Captcha balance at 2captcha.com. Turnstile sitekey lives in `src/config.py`. See `SESSION_2026-07-02.md` for the reCAPTCHA→Turnstile migration playbook. |
+| Smarty returns "subscription error" or 401 | Verify `us-core-cloud` license active at smartystreets.com. Test locally: `python -c "from src.address_standardizer import _build_client; c=_build_client(); print(c)"`. If local .env works but GHA fails, GHA secrets are stale — rotate via `gh secret set SMARTY_AUTH_ID` + `gh secret set SMARTY_AUTH_TOKEN` (stdin, no history). |
+| One trustee source suddenly returns 0 target-county records | HTML structure likely changed (esp. T&B — ASP.NET IDs are auto-generated). Curl the portal manually, compare against adapter's parser selectors. RL/HWM use static HTML → most likely a class rename. |
+| Slack posts show numbers but DataSift shows 0 uploads | Check `output/leads/` for the CSV files — they exist locally in the GHA workspace even if the DataSift upload step failed. Look at the "DataSift Uploads" section: missing rows = the upload step logged an error. Check the workflow log for `datasift_uploader.py` output. |
+| `notice_parser` LLM tiebreaker silently no-ops | Verify `is_target_county_async()` signature accepts `rate_tracker` kwarg (3999bec fixed this — was silently NameError-ing on every call before). |
+| AL notice's ZIP shows as None in main.py daily | Regression in `ZIP_RE` — must accept `3[5-8]\d{3}` (c570b65). TN-only regex would silently reject AL. |
+| New adapter added but Slack Breakdown doesn't show it | Add source label to `_foreclosure_source_label()` in `scripts/daily_finalize.py` (d63d531). Otherwise it defaults to "Other" and rolls up incorrectly. |
+
 ## Alabama Probate Pipeline (Jefferson + Madison)
 
 Probate "Notice to Creditors" publications on alabamapublicnotices.com follow a tightly templated format mandated by Alabama Code § 43-2-61 (publication for 3 successive weeks) and § 43-2-350 (creditors have **6 months** from grant of letters to file claims). The notice body always contains a case number, the Judge of Probate's name, and the date Letters Testamentary or Letters of Administration were granted — but **never the decedent's property address**. Filling that gap is the second half of the pipeline.
