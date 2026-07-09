@@ -230,6 +230,7 @@ jobs:
             --counties Jefferson,Madison,Marshall \
             --tiers 1,2 \
             --enrich-owner \
+            --skip-trace \
             --output-datasift-csv output/leads/datasift_upload_foreclosure_rl_${{ steps.run_start.outputs.ts }}.csv \
             2>&1 | tee logs/daily_rl_${{ steps.run_start.outputs.ts }}.log
 
@@ -249,6 +250,7 @@ jobs:
             --counties Jefferson,Madison,Marshall \
             --tiers 1,2 \
             --enrich-owner \
+            --skip-trace \
             --output-datasift-csv output/leads/datasift_upload_foreclosure_tb_${{ steps.run_start.outputs.ts }}.csv \
             2>&1 | tee logs/daily_tb_${{ steps.run_start.outputs.ts }}.log
 
@@ -270,6 +272,7 @@ jobs:
             --counties Jefferson,Madison,Marshall \
             --tiers 1,2 \
             --enrich-owner \
+            --skip-trace \
             --output-datasift-csv output/leads/datasift_upload_foreclosure_hwm_${{ steps.run_start.outputs.ts }}.csv \
             2>&1 | tee logs/daily_hwm_${{ steps.run_start.outputs.ts }}.log
 

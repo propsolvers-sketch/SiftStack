@@ -369,6 +369,13 @@ def _build_argparser() -> argparse.ArgumentParser:
              "(~0.3s/record).",
     )
     p.add_argument(
+        "--skip-trace", action="store_true",
+        help="Run Tracerfy batch skip-trace on records with owner_name "
+             "(fills Phone 1-9 / Email 1-5) + Trestle phone scoring for "
+             "DataSift dial-priority tiers. Off by default to keep bulk "
+             "pulls free; enable for daily-ops runs. ~$0.02/contact.",
+    )
+    p.add_argument(
         "--output-csv", type=Path, default=None,
         help="Write standard Sift-format CSV to this path.",
     )
@@ -419,13 +426,54 @@ def _main(argv: list[str]) -> int:
             f"file={n.case_number}  owner={owner}"
         )
 
+    # Tracerfy skip-trace + Trestle phone scoring — same gap fix as
+    # code_violation_pipeline (f100e83) and apn_probate. Without this,
+    # the DataSift Phone 1-9 / Email 1-5 columns stay empty and the
+    # dial-priority filter presets can't route RL leads by tier.
+    phone_tiers: dict | None = None
+    if args.skip_trace and notices:
+        traceable = [n for n in notices if (n.owner_name or "").strip()]
+        if traceable:
+            try:
+                import tracerfy_skip_tracer
+                stats = tracerfy_skip_tracer.batch_skip_trace(traceable)
+                logger.info(
+                    "Skip-trace stats: submitted=%d matched=%d phones=%d "
+                    "emails=%d cost=$%.2f",
+                    stats.get("submitted", 0), stats.get("matched", 0),
+                    stats.get("phones_found", 0),
+                    stats.get("emails_found", 0),
+                    stats.get("cost", 0.0),
+                )
+            except Exception as e:
+                logger.warning(
+                    "Skip-trace failed (continuing without phones): %s", e,
+                )
+            # Trestle scoring runs regardless of skip-trace outcome so any
+            # existing phones on the records still tier correctly.
+            try:
+                from phone_validator import score_phones_for_pipeline
+                phone_tiers = score_phones_for_pipeline(notices)
+            except Exception as e:
+                logger.warning(
+                    "Trestle scoring failed (continuing without tiers): %s", e,
+                )
+        else:
+            logger.info(
+                "Skip-trace requested but no notices have owner_name — "
+                "consider running with --enrich-owner first.",
+            )
+
     if args.output_csv:
         from data_formatter import write_csv
         path = write_csv(notices, str(args.output_csv))
         print(f"\nWrote Sift CSV: {path}")
     if args.output_datasift_csv:
         from datasift_formatter import write_datasift_csv
-        path = write_datasift_csv(notices, str(args.output_datasift_csv))
+        path = write_datasift_csv(
+            notices, str(args.output_datasift_csv),
+            phone_tiers=phone_tiers,
+        )
         print(f"Wrote DataSift CSV: {path}")
 
     return 0 if notices else 1
