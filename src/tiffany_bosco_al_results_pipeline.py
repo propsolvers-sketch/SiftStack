@@ -618,6 +618,20 @@ def fetch_all(
         logger.info("T&B Results: owner enrichment filled %d/%d",
                     hits, len(filtered))
 
+        # Fallback: fill remaining empty owner_names from the APN owner
+        # cache (see src/owner_cache.py). T&B Results already filters to
+        # Cancelled + Postponed only — the highest-signal distress subset
+        # — so recovering owner names on the tax-roll misses here has
+        # the best per-record ROI of any adapter.
+        try:
+            import owner_cache
+            filled = owner_cache.fill_missing_owners(filtered)
+            if filled:
+                logger.info("T&B Results: APN owner cache filled +%d "
+                            "additional records", filled)
+        except Exception as e:
+            logger.debug("Owner cache fallback skipped: %s", e)
+
     # After enrichment, re-apply tier filter for records where ZIP was
     # recovered from the tax roll (was empty during initial filter).
     if tiers is not None:

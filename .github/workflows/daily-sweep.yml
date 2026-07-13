@@ -164,6 +164,32 @@ jobs:
             --notify-slack \
             -v 2>&1 | tee logs/daily_main_${{ steps.run_start.outputs.ts }}.log
 
+      # ── Refresh foreclosure owner cache (post-APN, pre-trustee) ─────────
+      # main.py daily extracts the MORTGAGOR from each APN foreclosure
+      # notice body ("executed by X") — the person actually losing the
+      # house. The 4 trustee-portal adapters (RL / T&B pending / T&B
+      # Results / HWM) that run downstream currently rely on a county
+      # property-API address lookup which returns the CURRENT TAX OWNER
+      # — sometimes the same person, but hit rate is only ~26-30% (2026-
+      # 07-13 baseline). Result: 70-74% of trustee records land in DataSift
+      # with no owner name, no Tracerfy skip-trace, no phones.
+      #
+      # This step folds today's APN mortgagor names into a rolling 90-day
+      # address→owner_name cache at output/observability/
+      # foreclosure_owner_cache.json. Each trustee adapter calls
+      # owner_cache.fill_missing_owners() after its property-API step
+      # to backfill from the cache. Coverage steadily improves as the
+      # cache accumulates (steady-state benefit ~30-50% of trustee misses
+      # over 90 days — depends on APN/trustee cross-source overlap rate).
+      #
+      # Skipping this step (or missing APN CSV) is non-fatal — trustee
+      # adapters just fall back to their current property-API-only path.
+      - name: Refresh foreclosure owner cache
+        continue-on-error: true
+        run: |
+          python scripts/refresh_owner_cache.py 2>&1 \
+            | tee logs/daily_owner_cache_${{ steps.run_start.outputs.ts }}.log
+
       # ── Pipeline 2: apn_probate (probate-dedicated post-probate path) ──
       # Runs AFTER main.py because both write seen_ids.json — main.py adds
       # today's IDs, apn_probate then skips them. Inverted order would
@@ -459,6 +485,7 @@ jobs:
             .tb_results_seen_ids.json \
             .adhunter_probate_seen_ids.json \
             output/observability/service_rates.json \
+            output/observability/foreclosure_owner_cache.json \
             2>/dev/null || true
           if ! git diff --cached --quiet; then
             git commit -m "chore(bot): update seen_ids + last_run + rolling rates + code-violation dedup after daily sweep"

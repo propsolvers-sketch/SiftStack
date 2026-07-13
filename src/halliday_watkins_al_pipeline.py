@@ -384,6 +384,20 @@ def fetch_all(
         logger.info("HWM AL: enrichment recovered ZIP+owner for %d/%d records",
                     hits, len(records))
 
+        # Fallback: fill remaining empty owner_names from the APN owner
+        # cache (see src/owner_cache.py). HWM's own enrichment recovers
+        # both ZIP and owner from the tax roll; the cache only backfills
+        # owner_name — records that ended up with a ZIP but no owner get
+        # a second-chance name from APN's mortgagor extraction.
+        try:
+            import owner_cache
+            filled = owner_cache.fill_missing_owners(records)
+            if filled:
+                logger.info("HWM AL: APN owner cache filled +%d additional "
+                            "records", filled)
+        except Exception as e:
+            logger.debug("Owner cache fallback skipped: %s", e)
+
     if tiers is not None:
         records = filter_by_tier(records, tiers)
         logger.info(

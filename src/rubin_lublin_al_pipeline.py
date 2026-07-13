@@ -344,6 +344,21 @@ def fetch_all(
         logger.info("Rubin Lublin AL: owner enrichment filled %d/%d records",
                     hits, len(records))
 
+        # Fallback: fill remaining empty owner_names from the APN owner cache
+        # (foreclosure_owner_cache.json — populated by scripts/refresh_owner_cache.py
+        # after main.py daily writes its APN foreclosure CSV). APN extracts the
+        # mortgagor from the notice body itself; this catches properties whose
+        # tax-roll owner name diverges from (or is missing on) the county API.
+        try:
+            import owner_cache
+            filled = owner_cache.fill_missing_owners(records)
+            if filled:
+                logger.info("Rubin Lublin AL: APN owner cache filled +%d "
+                            "additional records (%d/%d total)",
+                            filled, hits + filled, len(records))
+        except Exception as e:
+            logger.debug("Owner cache fallback skipped: %s", e)
+
     return [to_notice_data(r) for r in records]
 
 

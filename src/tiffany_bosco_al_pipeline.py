@@ -409,6 +409,21 @@ def fetch_all(
         logger.info("T&B AL: owner enrichment filled %d/%d records",
                     hits, len(records))
 
+        # Fallback: fill remaining empty owner_names from the APN owner
+        # cache (see src/owner_cache.py for full motivation). Catches
+        # properties whose tax-roll owner name diverges from (or is missing
+        # on) the county API but which have appeared in APN in the last
+        # 90 days with a mortgagor name extracted from the notice body.
+        try:
+            import owner_cache
+            filled = owner_cache.fill_missing_owners(records)
+            if filled:
+                logger.info("T&B AL: APN owner cache filled +%d additional "
+                            "records (%d/%d total)",
+                            filled, hits + filled, len(records))
+        except Exception as e:
+            logger.debug("Owner cache fallback skipped: %s", e)
+
     return [to_notice_data(r) for r in records]
 
 
