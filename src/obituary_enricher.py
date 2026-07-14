@@ -729,10 +729,13 @@ def _fetch_cached_text(url: str) -> str:
         ),
     }
 
-    # Try Wayback Machine
+    # Try Wayback Machine — bumped from 15s to 30s timeout on 2026-07-13
+    # after aggregator scrapes (cyberbackgroundchecks.com) started hitting
+    # the ceiling. Wayback is our final fallback for these hosts so a 15s
+    # cap was costing recoverable content on slow Wayback responses.
     try:
         wb_url = f"https://web.archive.org/web/2/{url}"
-        resp = requests.get(wb_url, headers=headers, timeout=15, allow_redirects=True)
+        resp = requests.get(wb_url, headers=headers, timeout=30, allow_redirects=True)
         if resp.status_code == 200:
             content = resp.text[:200000]
             # Try structured extraction first
@@ -1280,6 +1283,25 @@ _firecrawl_calls_used = 0
 _firecrawl_lock = threading.Lock()
 
 
+# People-search aggregator hosts that the pre_probate skip-trace fallback
+# path scrapes when Tracerfy misses. These pages are essentially static
+# HTML (no meaningful JS gating on the phone/address content), but they're
+# slow to serve behind Firecrawl's proxy and were the primary source of
+# 45s ReadTimeout / 408 failures in the 2026-07-13 pre_probate log (~15%
+# of heir lookups failed → ~4-5 rows/day lost to timeouts). Hardening:
+# longer network timeout (90s), reduced waitFor (2s — content doesn't need
+# JS render), and one retry with a 5s backoff. See "pre_probate phone
+# coverage improvement" note in commit history.
+_FIRECRAWL_AGGREGATOR_HOSTS = (
+    "cyberbackgroundchecks.com",
+    "spokeo.com",
+    "whitepages.com",
+    "truepeoplesearch.com",
+    "beenverified.com",
+    "fastpeoplesearch.com",
+)
+
+
 def _fetch_firecrawl(
     url: str, wait_ms: int = 5000, max_text: int = 0, priority: str = "high"
 ) -> str:
@@ -1291,6 +1313,9 @@ def _fetch_firecrawl(
     priority: "high" (obituary pages, always allowed), "medium" (Phase B upgrades,
               allowed if >50% budget remains), "low" (DM address lookups, allowed
               if >75% budget remains).
+
+    Aggregator hosts (cyberbackgroundchecks.com et al.) get a hardened
+    path: 90s network timeout, 2s waitFor, and one retry on 408/timeout.
     """
     global _firecrawl_credits_exhausted, _firecrawl_calls_used
     import config as cfg
@@ -1309,74 +1334,120 @@ def _fetch_firecrawl(
         _firecrawl_calls_used += 1
 
     limit = max_text or MAX_OBITUARY_TEXT
-    try:
-        resp = requests.post(
-            "https://api.firecrawl.dev/v1/scrape",
-            headers={
-                "Authorization": f"Bearer {cfg.FIRECRAWL_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"url": url, "formats": ["markdown"], "waitFor": wait_ms},
-            timeout=45,
-        )
-        if resp.status_code == 402:
-            # Firecrawl returns 402 for both real credit exhaustion AND per-minute
-            # rate limits on lower-tier plans. Parse the body to tell them apart:
-            # only flip the in-process "exhausted" flag when the account is truly
-            # out of credits. Rate-limited responses get a transient retry path.
-            body_text = ""
-            try:
-                body_text = (resp.json().get("error") or resp.text or "").lower()
-            except Exception:
-                body_text = (resp.text or "").lower()
 
-            rate_limit_hit = (
-                "rate limit" in body_text
-                or "rate-limit" in body_text
-                or "too many requests" in body_text
-            )
-            credits_out = (
-                "insufficient credit" in body_text
-                or "out of credits" in body_text
-                or "credits exhausted" in body_text
-                or "no credits" in body_text
-                or "payment required" in body_text
+    # Aggregator-specific parameters — see _FIRECRAWL_AGGREGATOR_HOSTS comment
+    is_aggregator = any(h in url for h in _FIRECRAWL_AGGREGATOR_HOSTS)
+    if is_aggregator:
+        actual_wait_ms = min(wait_ms, 2000)   # static content — no JS wait needed
+        network_timeout = 90                  # up from 45s baseline
+        max_attempts = 2                      # one retry on timeout/408
+    else:
+        actual_wait_ms = wait_ms
+        network_timeout = 45
+        max_attempts = 1
+
+    for attempt in range(max_attempts):
+        try:
+            resp = requests.post(
+                "https://api.firecrawl.dev/v1/scrape",
+                headers={
+                    "Authorization": f"Bearer {cfg.FIRECRAWL_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={"url": url, "formats": ["markdown"], "waitFor": actual_wait_ms},
+                timeout=network_timeout,
             )
 
-            if credits_out or not rate_limit_hit:
-                # Treat ambiguous 402s as credit exhaustion (safer default — stop
-                # hammering an account that's truly out). Only the rate-limit
-                # branch leaves the flag unset so the next call can retry.
-                with _firecrawl_lock:
-                    _firecrawl_credits_exhausted = True
-                logger.warning(
-                    "Firecrawl 402 (credits): %s — disabling Firecrawl for this run after %d calls",
-                    body_text[:200] or "no body",
-                    _firecrawl_calls_used,
+            if resp.status_code == 402:
+                # Firecrawl returns 402 for both real credit exhaustion AND
+                # per-minute rate limits on lower-tier plans. Parse the body
+                # to tell them apart: only flip the in-process "exhausted"
+                # flag when the account is truly out of credits. Rate-limited
+                # responses get a transient retry path.
+                body_text = ""
+                try:
+                    body_text = (resp.json().get("error") or resp.text or "").lower()
+                except Exception:
+                    body_text = (resp.text or "").lower()
+
+                rate_limit_hit = (
+                    "rate limit" in body_text
+                    or "rate-limit" in body_text
+                    or "too many requests" in body_text
                 )
-            else:
-                logger.warning(
-                    "Firecrawl 402 (rate limit): %s — skipping this call, future calls will retry",
-                    body_text[:200] or "no body",
+                credits_out = (
+                    "insufficient credit" in body_text
+                    or "out of credits" in body_text
+                    or "credits exhausted" in body_text
+                    or "no credits" in body_text
+                    or "payment required" in body_text
                 )
+
+                if credits_out or not rate_limit_hit:
+                    with _firecrawl_lock:
+                        _firecrawl_credits_exhausted = True
+                    logger.warning(
+                        "Firecrawl 402 (credits): %s — disabling Firecrawl "
+                        "for this run after %d calls",
+                        body_text[:200] or "no body", _firecrawl_calls_used,
+                    )
+                else:
+                    logger.warning(
+                        "Firecrawl 402 (rate limit): %s — skipping this call, "
+                        "future calls will retry",
+                        body_text[:200] or "no body",
+                    )
+                return ""
+
+            resp.raise_for_status()
+            data = resp.json()
+            markdown = data.get("data", {}).get("markdown", "")
+            if not markdown:
+                return ""
+            # Filter CBC pages to strip noise and fit more results
+            if "cyberbackgroundchecks.com" in url:
+                markdown = _filter_cbc_markdown(markdown)
+            if _firecrawl_calls_used % 50 == 0:
+                logger.info(
+                    "Firecrawl budget: %d/%d used (%.0f%% remaining)",
+                    _firecrawl_calls_used, _firecrawl_budget_total,
+                    budget_remaining_pct * 100,
+                )
+            return markdown[:limit]
+
+        except requests.exceptions.ReadTimeout as e:
+            if attempt + 1 < max_attempts:
+                logger.info(
+                    "Firecrawl timeout for %s (attempt %d/%d, timeout=%ds) — "
+                    "retrying in 5s",
+                    url, attempt + 1, max_attempts, network_timeout,
+                )
+                time.sleep(5)
+                continue
+            logger.debug("Firecrawl fetch failed for %s: %s", url, e)
             return ""
-        resp.raise_for_status()
-        data = resp.json()
-        markdown = data.get("data", {}).get("markdown", "")
-        if not markdown:
-            return ""
-        # Filter CBC pages to strip noise and fit more results
-        if "cyberbackgroundchecks.com" in url:
-            markdown = _filter_cbc_markdown(markdown)
-        if _firecrawl_calls_used % 50 == 0:
-            logger.info(
-                "Firecrawl budget: %d/%d used (%.0f%% remaining)",
-                _firecrawl_calls_used, _firecrawl_budget_total, budget_remaining_pct * 100,
+        except requests.exceptions.HTTPError as e:
+            # 408 Request Timeout from the Firecrawl service itself — same
+            # retry treatment as network-level ReadTimeout (aggregator hosts
+            # are slow enough that Firecrawl's own scrape times out sometimes).
+            is_408 = (
+                e.response is not None
+                and getattr(e.response, "status_code", 0) == 408
             )
-        return markdown[:limit]
-    except Exception as e:
-        logger.debug("Firecrawl fetch failed for %s: %s", url, e)
-        return ""
+            if attempt + 1 < max_attempts and is_408:
+                logger.info(
+                    "Firecrawl 408 for %s (attempt %d/%d) — retrying in 5s",
+                    url, attempt + 1, max_attempts,
+                )
+                time.sleep(5)
+                continue
+            logger.debug("Firecrawl fetch failed for %s: %s", url, e)
+            return ""
+        except Exception as e:
+            logger.debug("Firecrawl fetch failed for %s: %s", url, e)
+            return ""
+
+    return ""
 
 
 def _extract_address_from_page(
