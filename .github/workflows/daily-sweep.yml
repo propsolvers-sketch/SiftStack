@@ -483,6 +483,9 @@ jobs:
             last_run.json \
             seen_code_violations.json \
             .tb_results_seen_ids.json \
+            .tb_pending_seen_ids.json \
+            .rl_seen_ids.json \
+            .hwm_seen_ids.json \
             .adhunter_probate_seen_ids.json \
             output/observability/service_rates.json \
             output/observability/foreclosure_owner_cache.json \

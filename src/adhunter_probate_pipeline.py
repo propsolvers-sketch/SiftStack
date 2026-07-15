@@ -904,7 +904,9 @@ def _main(argv: list[str]) -> int:
         logger.info("AdHunter: 0 target-county probate notices this run.")
         if not args.no_seen_dedup:
             save_seen_ids(seen_ids)
-        return 1
+        # "0 new records after dedup / enrichment gate" is a healthy no-op,
+        # not a failure — the pipeline is designed to have quiet days.
+        return 0
 
     # Phase 2: enrichment + tier gate
     results, enrfunnel = enrich_and_gate(
@@ -918,7 +920,9 @@ def _main(argv: list[str]) -> int:
         logger.info("AdHunter: 0 records survived enrichment + tier gate.")
         if not args.no_seen_dedup:
             save_seen_ids(seen_ids)
-        return 1
+        # "0 new records after dedup / enrichment gate" is a healthy no-op,
+        # not a failure — the pipeline is designed to have quiet days.
+        return 0
 
     # Phase 3: Smarty USPS standardization (parity with the other adapters)
     try:

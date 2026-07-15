@@ -43,6 +43,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import re
 import sys
@@ -62,6 +63,17 @@ logger = logging.getLogger(__name__)
 RUBIN_LUBLIN_AL_URL = (
     "https://rlselaw.com/property-listing/alabama-property-listings/"
 )
+
+# Cross-run dedup — matches T&B Results pattern (c427ad3). The RL portal
+# lists foreclosures for the full statutory publication window (~3 weeks
+# before auction), so without persistent dedup we re-emit every property
+# ~15-21 times over its listing lifetime. DataSift's address-dedup at
+# upload prevents duplicate ROWS but adds a fresh "comment" to the lead
+# each day — the user sees weeks of redundant "Foreclosure | Auction: X"
+# notes on the same lead, obscuring which record is actually new today.
+# Key: "file_number|sale_date". Sale-date change (postponement) → new key
+# → correctly re-emitted with the updated date.
+_SEEN_IDS_PATH = Path(__file__).resolve().parent.parent / ".rl_seen_ids.json"
 
 _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -320,13 +332,47 @@ def _mmddyyyy(iso: str) -> str:
 # ── Orchestrator ───────────────────────────────────────────────────────
 
 
+def _dedup_key(rec: RubinLublinRecord) -> str:
+    """(file_number, sale_date) key for cross-run dedup. Empty file# → empty
+    key → record always emits (safer than a fuzzy address key)."""
+    if not rec.file_number:
+        return ""
+    return f"{(rec.file_number or '').strip()}|{(rec.sale_date or '').strip()}"
+
+
+def load_seen_ids(path: Path = _SEEN_IDS_PATH) -> set[str]:
+    """Load the cross-run dedup set. Missing/corrupt file → empty set."""
+    if not path.exists():
+        return set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            return set(json.load(f))
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Could not load %s (%s); starting fresh", path.name, e)
+        return set()
+
+
+def save_seen_ids(seen: set[str], path: Path = _SEEN_IDS_PATH) -> None:
+    """Persist the updated dedup set."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(sorted(seen), f, indent=1)
+    except OSError as e:
+        logger.warning("Failed to save %s: %s", path.name, e)
+
+
 def fetch_all(
     *,
     counties: tuple[str, ...] = ("Jefferson", "Madison", "Marshall"),
     tiers: tuple[int, ...] | None = (1, 2),
     enrich_owner: bool = False,
-) -> list["NoticeData"]:
-    """One-shot fetch + filter + enrich + convert to NoticeData."""
+    seen_ids: set[str] | None = None,
+) -> tuple[list["NoticeData"], list[RubinLublinRecord]]:
+    """One-shot fetch + filter + dedup + enrich + convert to NoticeData.
+
+    Returns (notices, kept_records) so the caller can update seen_ids
+    with dedup keys derived from the record's file_number + sale_date.
+    """
     records = fetch_rubin_lublin_al()
     logger.info("Rubin Lublin AL: %d total records fetched", len(records))
     records = filter_records(records, counties=counties, tiers=tiers)
@@ -335,6 +381,16 @@ def fetch_all(
         "(counties=%s, tiers=%s)",
         len(records), counties, tiers,
     )
+
+    if seen_ids is not None:
+        before = len(records)
+        records = [r for r in records if _dedup_key(r) not in seen_ids]
+        skipped = before - len(records)
+        if skipped:
+            logger.info(
+                "Rubin Lublin AL: cross-run dedup dropped %d already-seen "
+                "records (kept %d)", skipped, len(records),
+            )
 
     if enrich_owner:
         hits = 0
@@ -359,7 +415,7 @@ def fetch_all(
         except Exception as e:
             logger.debug("Owner cache fallback skipped: %s", e)
 
-    return [to_notice_data(r) for r in records]
+    return [to_notice_data(r) for r in records], records
 
 
 # ── CLI ────────────────────────────────────────────────────────────────
@@ -402,6 +458,11 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--json", action="store_true",
         help="Print raw records as JSON (skip NoticeData conversion).",
     )
+    p.add_argument(
+        "--no-seen-dedup", action="store_true",
+        help="Ignore .rl_seen_ids.json cross-run dedup — re-emit every "
+             "record currently on the portal (diagnostics / backfills).",
+    )
     return p
 
 
@@ -418,7 +479,6 @@ def _main(argv: list[str]) -> int:
         tiers = tuple(int(t) for t in args.tiers.split(",") if t.strip().isdigit())
 
     if args.json:
-        import json
         records = fetch_rubin_lublin_al()
         records = filter_records(records, counties=counties, tiers=tiers)
         if args.enrich_owner:
@@ -427,10 +487,15 @@ def _main(argv: list[str]) -> int:
         print(json.dumps([asdict(r) for r in records], indent=2))
         return 0
 
-    notices = fetch_all(
+    seen_ids = set() if args.no_seen_dedup else load_seen_ids()
+    logger.info("Loaded %d seen dedup keys from %s",
+                len(seen_ids), _SEEN_IDS_PATH.name)
+
+    notices, kept_records = fetch_all(
         counties=counties,
         tiers=tiers,
         enrich_owner=args.enrich_owner,
+        seen_ids=seen_ids if not args.no_seen_dedup else None,
     )
 
     print(f"\n=== Rubin Lublin AL — {len(notices)} notice(s) ===")
@@ -518,7 +583,23 @@ def _main(argv: list[str]) -> int:
         )
         print(f"Wrote DataSift CSV: {path}")
 
-    return 0 if notices else 1
+    # Persist seen-ids AFTER successful CSV write (defer until we've
+    # actually delivered the records, so a mid-pipeline crash doesn't
+    # lose them for tomorrow).
+    if not args.no_seen_dedup and kept_records:
+        for r in kept_records:
+            key = _dedup_key(r)
+            if key:
+                seen_ids.add(key)
+        save_seen_ids(seen_ids)
+        logger.info("Persisted %d dedup keys → %s",
+                    len(seen_ids), _SEEN_IDS_PATH.name)
+
+    # "0 new records after dedup" is a healthy no-op, not a failure. Only
+    # return non-zero on genuine unrecoverable errors (portal down, config
+    # missing). Prior behavior returned 1 on empty output which surfaced
+    # as red-X annotations on quiet dedup days.
+    return 0
 
 
 if __name__ == "__main__":

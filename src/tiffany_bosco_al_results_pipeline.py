@@ -858,7 +858,11 @@ def _main(argv: list[str]) -> int:
             logger.info("Updated seen_ids saved to %s (%d entries)",
                         SEEN_IDS_PATH, len(updated_seen))
 
-    return 0 if (cancelled or postponed) else 1
+    # "0 new records after dedup" is a healthy no-op, not a failure. The
+    # T&B Results feed is designed to be sparse — Cancellations/Postponements
+    # are sporadic and multi-day gaps are normal. Prior return-1 on empty
+    # surfaced as red-X GHA annotations that misrepresented healthy runs.
+    return 0
 
 
 if __name__ == "__main__":
