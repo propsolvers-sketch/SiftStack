@@ -1039,11 +1039,31 @@ def _build_property_section(notice: NoticeData) -> str:
     return " | ".join(parts)
 
 
-def _build_notes(notice: NoticeData) -> str:
+def _build_notes(notice: NoticeData, phone_tiers: dict | None = None) -> str:
     """Build a structured notes string for DataSift records.
 
-    Deceased records get a multi-section format with heir map and DM summary.
-    Living records get a simpler single-section format.
+    Deceased records get a multi-section format optimized for the call team:
+      1. DECEASED OWNER          — identity + confidence
+      2. DOD SANITY CHECK        — flags wrong-person matches / recent secondary deaths
+      3. WHO MUST SIGN TO SELL   — structured signer table with locale + risk flags
+      4. MASTER DIAL SHEET       — deduped phones across ALL signers, best-first,
+                                   Trestle-tier-sorted, annotated with whose line
+      5. HEIR VERIFICATION       — counts + names by verification status
+      6. OTHER FAMILY            — non-signing kin (compact)
+      7. PROPERTY                — situs details
+
+    Rewrites the pre-2026-07-14 format (which showed one SIGNING CHAIN
+    section with per-heir phones in ranked order) — the new format is
+    based on the Deep Prospecting v4 skill, focused on the two questions
+    every closer asks: "who has to sign?" and "which number do I dial
+    first?" Both now have dedicated sections.
+
+    ``phone_tiers`` is the {phone_str: {activity_score, assigned_tag, line_type, ...}}
+    dict returned by phone_validator.score_phones_for_pipeline. When None
+    or empty, the master dial sheet renders without tier ordering (falls
+    back to source order) but still dedupes across signers.
+
+    Living records get the same simple property-only format as before.
     """
     if notice.owner_deceased == "yes":
         sections = []
@@ -1070,17 +1090,32 @@ def _build_notes(notice: NoticeData) -> str:
                 body += f"\n{confidence_line}" if body else confidence_line
             sections.append(f"{header}\n{body}")
 
-        # Section 2: Decision makers
-        dm_section = _build_dm_section(notice)
-        if dm_section:
-            sections.append(dm_section)
+        # Section 2: DOD sanity check (skill-defined guard — publication-anchored)
+        dod_section = _build_dod_sanity(notice)
+        if dod_section:
+            sections.append(dod_section)
 
-        # Section 3: Heir map
-        heir_section = _build_heir_summary(notice)
-        if heir_section:
-            sections.append(heir_section)
+        # Section 3: WHO MUST SIGN TO SELL — structured signer table
+        signer_table = _build_signer_table(notice)
+        if signer_table:
+            sections.append(signer_table)
 
-        # Section 4: Property/notice details
+        # Section 4: MASTER DIAL SHEET — deduped across all signers
+        dial_sheet = _build_master_dial_sheet(notice, phone_tiers)
+        if dial_sheet:
+            sections.append(dial_sheet)
+
+        # Section 5: HEIR VERIFICATION — grouped by status
+        verify_section = _build_verification_summary(notice)
+        if verify_section:
+            sections.append(verify_section)
+
+        # Section 6: OTHER FAMILY (compact — kept from prior format)
+        other_family = _build_other_family_summary(notice)
+        if other_family:
+            sections.append(other_family)
+
+        # Section 7: Property/notice details
         prop_section = _build_property_section(notice)
         if prop_section:
             sections.append(f"=== PROPERTY ===\n{prop_section}")
@@ -1092,6 +1127,422 @@ def _build_notes(notice: NoticeData) -> str:
 
     # Living owner — simple format
     return _build_property_section(notice)
+
+
+# ── New sections (2026-07-14 — Deep Prospecting v4 skill Phase A) ─────
+
+
+def _normalize_phone_key(phone: str) -> str:
+    """Return last 10 digits of a phone string, or '' if fewer than 10 digits."""
+    digits = "".join(c for c in (phone or "") if c.isdigit())
+    return digits[-10:] if len(digits) >= 10 else ""
+
+
+def _classify_locale(heir: dict, notice: NoticeData) -> str:
+    """Categorize where a heir lives relative to the subject property.
+
+    Returns one of: "at property", "local", "in-state", "out-of-state",
+    or "unknown". Used to steer the call team toward on-site + local
+    signers first, and flag out-of-state signers as the usual closing
+    bottleneck.
+
+    "Local" means same county area — we approximate by matching the
+    heir's city to the property's city (case-insensitive). For metro
+    areas where the heir lives in a neighboring suburb we currently
+    return "in-state" which is intentionally softer than "local".
+    """
+    heir_street = (heir.get("street") or "").strip().upper()
+    heir_city = (heir.get("city") or "").strip().lower()
+    heir_state = (heir.get("state") or "").strip().upper()
+    prop_street = (notice.address or "").strip().upper()
+    prop_city = (notice.city or "").strip().lower()
+    prop_state = (notice.state or "AL").strip().upper()
+
+    if heir_street and prop_street and heir_street == prop_street:
+        return "at property"
+    if not heir_state:
+        return "unknown"
+    if heir_state != prop_state:
+        return "out-of-state"
+    if heir_city and prop_city and heir_city == prop_city:
+        return "local"
+    return "in-state"
+
+
+def _parse_publication_date(notice: NoticeData):
+    """Best-effort publication date for the DOD sanity check.
+
+    Prefers ``date_added`` (the pre-probate pipeline sets this to the
+    obit's date of death OR today's harvest date — either way it's the
+    "when did this lead enter our system" anchor). Falls back to
+    ``received_date`` then today. Returns a date object or None.
+    """
+    from datetime import datetime, date as _date
+    for candidate in (notice.received_date, notice.date_added):
+        s = (candidate or "").strip()
+        if not s:
+            continue
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%-m/%-d/%Y"):
+            try:
+                return datetime.strptime(s, fmt).date()
+            except ValueError:
+                continue
+    return _date.today()
+
+
+def _build_dod_sanity(notice: NoticeData) -> str:
+    """DOD sanity check anchored to publication date (Deep Prospecting v4).
+
+    - OK: DOD within 3 years before publication (typical probate cadence)
+    - FLAG (future DOD): DOD after publication — impossible, likely bad match
+    - FLAG (>3yr): DOD > 3 years before publication — possible wrong-person
+        OR a recent secondary death in the household triggered the filing
+        (see skill: "recent household death changes the call opener")
+
+    Returns "" if we don't have a parseable DOD.
+    """
+    from datetime import datetime
+    dod_raw = (notice.date_of_death or "").strip()
+    if not dod_raw:
+        return ""
+    dod = None
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%-m/%-d/%Y"):
+        try:
+            dod = datetime.strptime(dod_raw, fmt).date()
+            break
+        except ValueError:
+            continue
+    if not dod:
+        return ""
+
+    pub = _parse_publication_date(notice)
+    if not pub:
+        return ""
+
+    gap_days = (pub - dod).days
+    gap_yrs = gap_days / 365.25
+
+    lines = ["=== DOD SANITY CHECK ==="]
+    lines.append(f"Published: {pub.isoformat()}  ·  DOD: {dod.isoformat()}  ·  Gap: {gap_yrs:+.1f}yr")
+
+    if gap_days < 0:
+        lines.append(
+            f"⚠ FLAG — DOD is AFTER publication date. Impossible; likely a "
+            f"wrong-person obituary match. Verify decedent identity before dialing."
+        )
+    elif gap_yrs > 3.0:
+        lines.append(
+            f"⚠ FLAG — DOD is {gap_yrs:.1f} years before publication (>3yr). "
+            f"Possibilities: wrong-person match, OR a recent household death "
+            f"(e.g. surviving spouse) triggered this filing. The heir set below "
+            f"likely still stands; open with condolences for the recent loss "
+            f"rather than the decades-old estate."
+        )
+    else:
+        lines.append("✓ OK — DOD within normal probate cadence.")
+
+    return "\n".join(lines)
+
+
+def _build_signer_table(notice: NoticeData) -> str:
+    """Structured 'who must sign to sell' table with locale + risk flags."""
+    if not notice.heir_map_json:
+        return ""
+    try:
+        heirs = json.loads(notice.heir_map_json)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not heirs:
+        return ""
+
+    signers = [
+        h for h in heirs
+        if h.get("signing_authority") and h.get("status") != "deceased"
+    ]
+    if not signers:
+        return "=== WHO MUST SIGN TO SELL ===\nNo signing-authority heirs identified. Manual research required."
+
+    lines = [f"=== WHO MUST SIGN TO SELL ({len(signers)} heir{'s' if len(signers) != 1 else ''}) ==="]
+
+    # Header
+    lines.append(
+        f"{'Heir':<32} {'Rel':<10} {'Locale':<22} Sig Req?"
+    )
+    lines.append("─" * 78)
+
+    has_out_of_state = False
+    has_spouse = False
+    for h in signers:
+        name = (h.get("name") or "?")[:31]
+        rel = (h.get("relationship") or "unknown")[:9]
+        locale = _classify_locale(h, notice)
+        if locale == "out-of-state":
+            locale_str = f"{(h.get('city') or '?')}, {h.get('state') or '?'} ⚠"
+            has_out_of_state = True
+        elif locale == "at property":
+            locale_str = "at property"
+        elif locale == "local":
+            locale_str = f"{h.get('city') or '?'} (local)"
+        elif locale == "in-state":
+            locale_str = f"{h.get('city') or '?'}, {h.get('state') or 'AL'}"
+        else:
+            locale_str = "unknown"
+        locale_str = locale_str[:21]
+        if rel.lower() == "spouse":
+            has_spouse = True
+        lines.append(f"{name:<32} {rel:<10} {locale_str:<22} REQUIRED")
+
+    # Signing risk flags — the skill's "flags to verify" checklist
+    flag_lines = []
+    if has_spouse:
+        flag_lines.append(
+            "· Surviving spouse present — takes intestate share; cannot close without their signature"
+        )
+    if has_out_of_state:
+        flag_lines.append(
+            "· Out-of-state signer(s) — usual closing bottleneck; engage early"
+        )
+    deceased_signers = [
+        h for h in heirs
+        if h.get("signing_authority") and h.get("status") == "deceased"
+    ]
+    if deceased_signers:
+        flag_lines.append(
+            f"· {len(deceased_signers)} signing-authority heir(s) deceased — "
+            f"their share passes to THEIR children (per stirpes); adds signers"
+        )
+    unverified = [h for h in signers if h.get("status") != "verified_living"]
+    if unverified:
+        flag_lines.append(
+            f"· {len(unverified)}/{len(signers)} signer(s) unverified — "
+            f"confirm alive status before extensive skip-trace investment"
+        )
+    flag_lines.append(
+        "· No will detected in probate index — verify (a will would name "
+        "an executor and override equal-share intestate split)"
+    )
+
+    if flag_lines:
+        lines.append("")
+        lines.append("Signing risk flags (verify before closing — none are legal conclusions):")
+        lines.extend(flag_lines)
+
+    return "\n".join(lines)
+
+
+def _collect_phones_with_reach(notice: NoticeData) -> list[dict]:
+    """Walk all sources → list of {phone, sources, is_dm1} deduped by digits.
+
+    Sources include:
+      · Flat NoticeData fields (primary_phone / mobile_1-5 / landline_1-3),
+        attributed to DM #1
+      · heir_map_json[].phones[] on every signing-authority heir
+
+    Multiple heirs sharing a household landline collapse into ONE entry
+    with all sharers listed under "reaches".
+    """
+    dm1_name = (notice.decision_maker_name or "").strip() or "DM #1"
+
+    by_key: dict[str, dict] = {}   # normalized digit key → entry
+
+    def _add(raw_phone: str, reach: str):
+        raw = (raw_phone or "").strip()
+        if not raw:
+            return
+        key = _normalize_phone_key(raw)
+        if not key:
+            return
+        entry = by_key.get(key)
+        if entry is None:
+            by_key[key] = {"phone": raw, "reaches": [reach]}
+        else:
+            if reach not in entry["reaches"]:
+                entry["reaches"].append(reach)
+
+    # DM #1 flat fields
+    for attr in (
+        "primary_phone", "mobile_1", "mobile_2", "mobile_3", "mobile_4",
+        "mobile_5", "landline_1", "landline_2", "landline_3",
+    ):
+        val = getattr(notice, attr, "") or ""
+        if val:
+            _add(val, dm1_name)
+
+    # heir_map_json phones
+    if notice.heir_map_json:
+        try:
+            heirs = json.loads(notice.heir_map_json)
+        except (json.JSONDecodeError, TypeError):
+            heirs = []
+        for h in heirs:
+            if not h.get("signing_authority") or h.get("status") == "deceased":
+                continue
+            heir_name = (h.get("name") or "?").strip()
+            for p in (h.get("phones") or []):
+                if isinstance(p, str):
+                    _add(p, heir_name)
+                elif isinstance(p, dict):
+                    _add(p.get("phone_number") or p.get("phone") or "", heir_name)
+
+    return list(by_key.values())
+
+
+_TIER_ORDER = {
+    "Dial First": 0, "Dial Second": 1, "Dial Third": 2,
+    "Dial Fourth": 3, "Drop": 4,
+}
+
+
+def _build_master_dial_sheet(notice: NoticeData, phone_tiers: dict | None) -> str:
+    """Deduped, best-first dial list across ALL signers with tier + reach.
+
+    When phone_tiers is empty or None (Trestle disabled), still emits the
+    deduped list but without tier sorting — falls back to source order
+    (DM #1 first, then other heirs).
+    """
+    entries = _collect_phones_with_reach(notice)
+    if not entries:
+        # Distinguish "we tried and got nothing" vs "we didn't try"
+        heirs_json = notice.heir_map_json
+        if heirs_json and any(
+            h.get("signing_authority") for h in (json.loads(heirs_json) or [])
+        ):
+            return (
+                "=== MASTER DIAL SHEET ===\n"
+                "No phones recovered for any signing-authority heir. "
+                "Tracerfy skip-trace returned no matches for this family. "
+                "Consider Enformion Person Search (Phase B integration pending) "
+                "or manual research via TruePeopleSearch / FastPeopleSearch / "
+                "CyberBackgroundChecks."
+            )
+        return ""
+
+    phone_tiers = phone_tiers or {}
+
+    def _tier_data(phone: str) -> dict:
+        # phone_tiers keys are the raw phones from Trestle — try the exact
+        # key first, then a normalized-digits lookup
+        if phone in phone_tiers:
+            return phone_tiers[phone] or {}
+        key = _normalize_phone_key(phone)
+        for k, v in phone_tiers.items():
+            if _normalize_phone_key(k) == key:
+                return v or {}
+        return {}
+
+    # Enrich each entry with tier data
+    for e in entries:
+        td = _tier_data(e["phone"])
+        e["tier"] = td.get("assigned_tag") or ""
+        e["score"] = td.get("activity_score")
+        e["line_type"] = td.get("line_type") or ""
+        e["is_litigator_risk"] = td.get("is_litigator_risk")
+
+    # Sort by tier (best first), then score desc, then source order preserved
+    entries.sort(key=lambda e: (
+        _TIER_ORDER.get(e["tier"], 99),
+        -(e["score"] or 0),
+    ))
+
+    dropped = [e for e in entries if e["tier"] == "Drop"]
+    kept = [e for e in entries if e["tier"] != "Drop"]
+
+    lines = [f"=== MASTER DIAL SHEET (deduped across {len(entries)} raw hits → {len(entries)} unique) ==="]
+    lines.append(f"{'Phone':<16} {'Tier':<13} {'Type':<10} Reaches")
+    lines.append("─" * 78)
+
+    for e in kept:
+        phone_disp = e["phone"][:15]
+        tier = (e["tier"] or "(unscored)")[:12]
+        line_type = (e["line_type"] or "?")[:9]
+        reaches = ", ".join(e["reaches"])[:36]
+        marker = ""
+        if e["is_litigator_risk"]:
+            marker = " ⚠LITIGATOR"
+        lines.append(f"{phone_disp:<16} {tier:<13} {line_type:<10} {reaches}{marker}")
+
+    if dropped:
+        lines.append("")
+        lines.append(f"Dropped ({len(dropped)} disconnected/low-score):")
+        for e in dropped:
+            lines.append(f"  · {e['phone']} — reaches {', '.join(e['reaches'])}")
+
+    if not phone_tiers:
+        lines.append("")
+        lines.append(
+            "(Trestle scoring unavailable — phones listed in source order. "
+            "Set TRESTLE_API_KEY to enable dial-order tiers.)"
+        )
+
+    return "\n".join(lines)
+
+
+def _build_verification_summary(notice: NoticeData) -> str:
+    """Heir verification counts grouped by status."""
+    if not notice.heir_map_json:
+        return ""
+    try:
+        heirs = json.loads(notice.heir_map_json)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not heirs:
+        return ""
+
+    signers = [h for h in heirs if h.get("signing_authority")]
+    if not signers:
+        return ""
+
+    living = [h for h in signers if h.get("status") == "verified_living"]
+    deceased = [h for h in signers if h.get("status") == "verified_deceased"
+                or h.get("status") == "deceased"]
+    unverified = [h for h in signers if h.get("status") not in (
+        "verified_living", "verified_deceased", "deceased",
+    )]
+
+    lines = ["=== HEIR VERIFICATION STATUS ==="]
+    if living:
+        names = ", ".join(h.get("name", "?") for h in living)
+        lines.append(f"✓ VERIFIED LIVING ({len(living)}): {names}")
+    if deceased:
+        names = ", ".join(h.get("name", "?") for h in deceased)
+        lines.append(f"✗ VERIFIED DECEASED ({len(deceased)}): {names}")
+    if unverified:
+        names = ", ".join(h.get("name", "?") for h in unverified)
+        lines.append(
+            f"? UNVERIFIED ({len(unverified)}): {names}\n"
+            f"    → Currently no verification source integrated. Enformion "
+            f"(Phase B) will verify each signer's alive status."
+        )
+    return "\n".join(lines)
+
+
+def _build_other_family_summary(notice: NoticeData) -> str:
+    """Compact list of non-signing kin — carried over from prior format."""
+    if not notice.heir_map_json:
+        return ""
+    try:
+        heirs = json.loads(notice.heir_map_json)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    non_signers = [h for h in heirs if not h.get("signing_authority")
+                   or h.get("status") == "deceased"]
+    if not non_signers:
+        return ""
+    entries = []
+    for h in non_signers[:6]:
+        name = h.get("name", "?")
+        rel = h.get("relationship", "")
+        status = h.get("status", "unverified")
+        tag = ("living" if status == "verified_living"
+               else "deceased" if status in ("deceased", "verified_deceased")
+               else "unverified")
+        entries.append(f"{name} ({rel}) [{tag}]")
+    result = ["=== OTHER FAMILY (no signing authority) ===",
+              ", ".join(entries)]
+    remaining = len(non_signers) - 6
+    if remaining > 0:
+        result.append(f"(+{remaining} more)")
+    return "\n".join(result)
 
 
 def _build_dm_notes(notice: NoticeData) -> str:
@@ -1260,7 +1711,9 @@ def _build_row(
 
     tags = "Courthouse Data"
     list_name = NOTICE_TYPE_TO_LIST.get(notice.notice_type, "")
-    notes = notes_override if notes_override is not None else _build_notes(notice)
+    notes = notes_override if notes_override is not None else _build_notes(
+        notice, phone_tiers=phone_tiers,
+    )
 
     # Per-phone column block (Phone N + Phone Type N + Phone Status N +
     # Phone Tags N) — operator request 2026-06-12 after reviewing the
