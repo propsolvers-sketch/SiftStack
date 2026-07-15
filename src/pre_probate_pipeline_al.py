@@ -1673,6 +1673,118 @@ def prepare_notices(
     return notices, stats
 
 
+# ── Enformion Person Search waterfall (Deep Prospecting v4 Primary Path) ─
+
+
+def _run_enformion_waterfall(notices: list["NoticeData"], mode: str = "fallback") -> dict:
+    """Run the Enformion A→E waterfall across a batch of notices.
+
+    Mode semantics:
+      * "fallback" (default): only notices where Tracerfy returned no
+        DM #1 phone. Targets Enformion spend at records that need it.
+      * "always": every notice (highest coverage; ~$2-3 per notice).
+      * "never": skip entirely (equivalent to omitting the flag).
+
+    Silently no-ops when Enformion is not configured (env vars unset) —
+    logs one INFO line and returns zeros. This lets us ship the code
+    ahead of the credential add and enable it via `gh secret set`.
+
+    Returns a stats dict for logging + Slack surface:
+      {waterfalls_run, decedent_matches, dod_conflicts, signers_resolved,
+       phones_added, addresses_filled, verified_count, net_new_signers,
+       total_searches}
+    """
+    stats = {
+        "waterfalls_run": 0,
+        "decedent_matches": 0,
+        "dod_conflicts": 0,
+        "signers_resolved": 0,
+        "phones_added": 0,
+        "addresses_filled": 0,
+        "verified_count": 0,
+        "net_new_signers": 0,
+        "total_searches": 0,
+    }
+
+    if mode == "never":
+        return stats
+
+    try:
+        import enformion_client as enf
+        import enformion_heir_resolver as ehr
+    except ImportError as e:
+        logger.debug("Enformion module unavailable (%s) — skipping waterfall", e)
+        return stats
+
+    if not enf.is_configured():
+        logger.info(
+            "Enformion waterfall skipped — ENFORMION_AP_NAME / "
+            "ENFORMION_AP_PASSWORD not set. Set them via `gh secret set` "
+            "to enable heir resolution + phone recovery on Tracerfy misses.",
+        )
+        return stats
+
+    for notice in notices:
+        # Fallback gate: only records where Tracerfy returned nothing
+        # for DM #1 (the primary phone slot). This is the operator's
+        # highest-value target — records that would otherwise ship to
+        # DataSift with empty Phone 1-9 columns.
+        if mode == "fallback":
+            has_tracerfy_phone = bool(
+                (notice.primary_phone or "").strip()
+                or (notice.mobile_1 or "").strip()
+                or (notice.landline_1 or "").strip()
+            )
+            if has_tracerfy_phone:
+                continue
+
+        result = ehr.resolve_heirs(notice)
+        stats["total_searches"] += result.searches_used
+
+        if not result.ran:
+            # not_configured / budget_exhausted / missing_decedent_name /
+            # missing_property_zip — see resolver.disabled_reason
+            if result.disabled_reason == "budget_exhausted":
+                logger.warning(
+                    "Enformion budget exhausted during waterfall — stopping",
+                )
+                break
+            continue
+
+        stats["waterfalls_run"] += 1
+
+        if result.decedent_matched:
+            stats["decedent_matches"] += 1
+        if result.dod_conflict:
+            stats["dod_conflicts"] += 1
+            # Stash the conflict note in a NoticeData field the notes
+            # formatter can surface (leverages missing_data_flags — the
+            # Notes formatter already reads it for the ZIP-estimated flag).
+            existing = notice.missing_data_flags or ""
+            notice.missing_data_flags = (
+                f"{existing}|dod_conflict" if existing else "dod_conflict"
+            )
+        if result.signers:
+            stats["signers_resolved"] += len(result.signers)
+            merge_stats = ehr.merge_into_notice(notice, result)
+            stats["phones_added"] += merge_stats.get("phones_added", 0)
+            stats["addresses_filled"] += merge_stats.get("addresses_filled", 0)
+            stats["verified_count"] += merge_stats.get("verified_count", 0)
+            stats["net_new_signers"] += merge_stats.get("net_new_signers", 0)
+
+    logger.info(
+        "Enformion waterfall (mode=%s): ran=%d decedent_match=%d dod_conflict=%d "
+        "signers_resolved=%d phones_added=%d verified=%d net_new_signers=%d "
+        "searches=%d (est cost $%.2f)",
+        mode, stats["waterfalls_run"], stats["decedent_matches"],
+        stats["dod_conflicts"], stats["signers_resolved"],
+        stats["phones_added"], stats["verified_count"],
+        stats["net_new_signers"], stats["total_searches"],
+        stats["total_searches"] * 0.35,
+    )
+    return stats
+
+
 # ── Slack notification ───────────────────────────────────────────────
 
 
@@ -1898,6 +2010,19 @@ def _cli() -> int:
                    help="Write enriched results to a DataSift-formatted upload CSV.")
     p.add_argument("--skip-trace", action="store_true",
                    help="With --datasift-csv: also run Tracerfy skip-trace.")
+    p.add_argument(
+        "--enformion-mode", choices=("always", "fallback", "never"),
+        default="fallback",
+        help=(
+            "Enformion Person Search waterfall for heir resolution. "
+            "'fallback' (default): run only on notices where Tracerfy "
+            "returned no DM #1 phone — targets Enformion spend at the "
+            "records that need it. 'always': run on every notice — "
+            "highest coverage, highest cost (~$2-3/notice). 'never': "
+            "skip entirely. Requires ENFORMION_AP_NAME + ENFORMION_AP_PASSWORD "
+            "env vars; silently no-ops when unset."
+        ),
+    )
     p.add_argument("--notify-slack", action="store_true",
                    help="Post a run summary to Slack/Discord.")
     p.add_argument("--json", action="store_true",
@@ -1944,12 +2069,21 @@ def _cli() -> int:
             rate_tracker=rate_tracker,
         )
         if notices:
+            # Enformion Person Search waterfall — the Deep Prospecting v4
+            # skill's Primary Path. Runs AFTER Tracerfy so we have the
+            # Tracerfy phone-set to gate on when mode=fallback. Silently
+            # no-ops when ENFORMION_AP_NAME/PASSWORD unset — safe to ship
+            # before creds are added.
+            _run_enformion_waterfall(notices, mode=args.enformion_mode)
+
             # Trestle phone scoring before CSV write — operator review
             # 2026-06-13 found pre-probate records arriving in DataSift
             # with empty Phone Tags N columns because this pipeline
             # never ran Trestle (only main.py daily via full_pipeline.py
             # did). Shared helper returns {} if TRESTLE_API_KEY isn't
             # set OR no record has phones, so the call is safe either way.
+            # Running Trestle AFTER Enformion scores the newly-added
+            # Enformion phones too.
             from phone_validator import score_phones_for_pipeline
             phone_tiers = score_phones_for_pipeline(notices)
             csv_path = datasift_formatter.write_datasift_csv(

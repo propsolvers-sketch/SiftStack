@@ -1241,6 +1241,18 @@ def _build_dod_sanity(notice: NoticeData) -> str:
     else:
         lines.append("✓ OK — DOD within normal probate cadence.")
 
+    # Enformion vs obit DOD conflict — set by the Enformion resolver via
+    # the "dod_conflict" flag in missing_data_flags. Surface here so the
+    # closer sees it before dialing.
+    if "dod_conflict" in (notice.missing_data_flags or ""):
+        lines.append(
+            "⚠ FLAG — Enformion death index DOD disagrees with obituary/notice DOD "
+            "by 1+ year. Common cause: original owner died long ago, a family "
+            "member maintained the home, and THAT person's recent death triggered "
+            "this filing. The heir set stands; the estate currently in probate "
+            "may belong to the recent decedent. Verify with the closer."
+        )
+
     return "\n".join(lines)
 
 
@@ -1359,16 +1371,11 @@ def _collect_phones_with_reach(notice: NoticeData) -> list[dict]:
             if reach not in entry["reaches"]:
                 entry["reaches"].append(reach)
 
-    # DM #1 flat fields
-    for attr in (
-        "primary_phone", "mobile_1", "mobile_2", "mobile_3", "mobile_4",
-        "mobile_5", "landline_1", "landline_2", "landline_3",
-    ):
-        val = getattr(notice, attr, "") or ""
-        if val:
-            _add(val, dm1_name)
-
-    # heir_map_json phones
+    # Walk heir_map_json FIRST so per-heir phones get the correct attribution.
+    # Then flat slots (which are attributed to DM #1) only add reaches for
+    # phones NOT already in the heir map — those came from a DM-specific
+    # source (Tracerfy DM #1 or Enformion's DM #1 side of the merge).
+    heir_phone_keys: set[str] = set()
     if notice.heir_map_json:
         try:
             heirs = json.loads(notice.heir_map_json)
@@ -1379,10 +1386,26 @@ def _collect_phones_with_reach(notice: NoticeData) -> list[dict]:
                 continue
             heir_name = (h.get("name") or "?").strip()
             for p in (h.get("phones") or []):
+                phone_str = ""
                 if isinstance(p, str):
-                    _add(p, heir_name)
+                    phone_str = p
                 elif isinstance(p, dict):
-                    _add(p.get("phone_number") or p.get("phone") or "", heir_name)
+                    phone_str = p.get("phone_number") or p.get("phone") or ""
+                if phone_str:
+                    heir_phone_keys.add(_normalize_phone_key(phone_str))
+                    _add(phone_str, heir_name)
+
+    # Flat slots: attribute to DM #1 ONLY when the phone isn't already
+    # covered by a per-heir entry above. Prevents phones promoted from
+    # Enformion (which live per-heir in heir_map_json) from also being
+    # attributed to DM #1 via the flat slot.
+    for attr in (
+        "primary_phone", "mobile_1", "mobile_2", "mobile_3", "mobile_4",
+        "mobile_5", "landline_1", "landline_2", "landline_3",
+    ):
+        val = getattr(notice, attr, "") or ""
+        if val and _normalize_phone_key(val) not in heir_phone_keys:
+            _add(val, dm1_name)
 
     return list(by_key.values())
 

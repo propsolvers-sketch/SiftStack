@@ -209,8 +209,20 @@ jobs:
       # ── Pipeline 3: pre_probate (legacy.com obit harvest) ──
       # Independent of seen_ids.json (different data source — Firecrawl-rendered
       # obituary listings). Can run last without ordering concerns.
+      # --enformion-mode fallback: run Enformion Person Search waterfall
+      # only on records where Tracerfy returned no DM #1 phone. Targets
+      # spend at the records that actually need it (~$2-3 per notice,
+      # billed per match; misses free). Silently no-ops when the
+      # ENFORMION_AP_NAME / ENFORMION_AP_PASSWORD secrets are unset —
+      # safe to leave in place before creds are added. When activated,
+      # every waterfall records ~1-6 additional Person Search calls
+      # (1 for the decedent, N for signers, capped at 5 signers/notice).
       - name: Run pre_probate
         continue-on-error: true
+        env:
+          ENFORMION_AP_NAME: ${{ secrets.ENFORMION_AP_NAME }}
+          ENFORMION_AP_PASSWORD: ${{ secrets.ENFORMION_AP_PASSWORD }}
+          ENFORMION_BUDGET: "300"
         run: |
           python src/pre_probate_pipeline_al.py \
             --markets Birmingham,Huntsville,Marshall \
@@ -219,6 +231,7 @@ jobs:
             --tiers 1,2 \
             --datasift-csv \
             --skip-trace \
+            --enformion-mode fallback \
             -v 2>&1 | tee logs/daily_pre_${{ steps.run_start.outputs.ts }}.log
 
       # ── Pipeline 4: code_violation (cross-city unified pipeline) ──
