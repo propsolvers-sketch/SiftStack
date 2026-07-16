@@ -460,6 +460,33 @@ jobs:
       - name: Upload to DataSift + post Slack
         run: python scripts/daily_finalize.py
 
+      # ── DataSift → Send to → Skip Trace on today's uploads ──
+      # Operator validated 2026-07-16 that "Send to → Skip Trace" from the
+      # Records page is ADDITIVE ONLY — populates Phone/Email into next-empty
+      # slots without overwriting Owner Name or Mailing Address. Auto-Enrich
+      # (a different action) IS destructive; datasift_skip_trace.py has a
+      # hardcoded allowlist that refuses to click anything containing
+      # "Enrich" — see _ALLOWED_BUTTON_TEXTS / _BLOCKED_BUTTON_TEXTS.
+      #
+      # Ships DISABLED — the script defaults to dry-run mode (logs "would
+      # skip-trace N records" without clicking). Set DATASIFT_SKIPTRACE_ENABLED=true
+      # as a GHA env var here (or as a repo secret) to activate.
+      #
+      # Runs AFTER daily_finalize so it only sees TODAY's fresh uploads
+      # (Date Added=today filter). continue-on-error: true so a Playwright
+      # selector miss doesn't fail the whole cron — screenshots + logs go
+      # to the archive step below for debugging.
+      - name: Run DataSift skip-trace on today's uploads
+        continue-on-error: true
+        env:
+          DATASIFT_EMAIL: ${{ secrets.DATASIFT_EMAIL }}
+          DATASIFT_PASSWORD: ${{ secrets.DATASIFT_PASSWORD }}
+          # Flip to "true" to activate live clicks. Default (unset) = dry-run.
+          DATASIFT_SKIPTRACE_ENABLED: ${{ secrets.DATASIFT_SKIPTRACE_ENABLED }}
+        run: |
+          python src/datasift_skip_trace.py --headless -v \
+            2>&1 | tee logs/daily_datasift_st_${{ steps.run_start.outputs.ts }}.log
+
       # ── Persistence + observability ──
 
       - name: Archive output CSVs + logs + state + DataSift screenshots
