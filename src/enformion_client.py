@@ -89,6 +89,106 @@ def reset_budget(new_total: int | None = None) -> None:
 # ── Core POST ────────────────────────────────────────────────────────
 
 
+def household_search(
+    last_name: str, *,
+    street: str, city: str, state: str, zip_code: str,
+    max_results: int = 25,
+) -> dict[str, Any]:
+    """Address-anchored search — returns everyone at the household (LastName + full address).
+
+    Discovered 2026-07-16: Enformion's Person Search with FirstName+LastName
+    penalizes elderly recently-deceased people because their ranking
+    algorithm prefers active-digital-footprint candidates. On 5 real Alabama
+    pre_probate test cases, first-name-included search returned WRONG-person
+    namesakes 4/5 times (e.g. Jerry B Ange age 24 instead of our elderly
+    target). Dropping first name and anchoring on street+city+state+zip
+    returned the correct household in all 5 cases.
+
+    Use this as the PRIMARY heir-discovery search for pre_probate / probate.
+    The response includes phones + addresses + relativesSummary for every
+    person at the address, so signer resolution happens in ONE call instead
+    of the old (decedent + N signer) waterfall — much cheaper AND much
+    higher hit rate on our demographic.
+
+    Callers filter the returned persons by age (>= 55 for likely spouse,
+    25-55 for adult children) and by name-partial match against obit-known
+    survivors.
+    """
+    global _budget_used, _disabled_reason
+
+    if not is_configured():
+        return {}
+
+    with _lock:
+        if _disabled_reason:
+            return {}
+        if _budget_used >= _budget_total:
+            logger.warning(
+                "Enformion budget exhausted (%d/%d) — skipping household search",
+                _budget_used, _budget_total,
+            )
+            _disabled_reason = "budget_exhausted"
+            return {}
+        _budget_used += 1
+
+    body: dict[str, Any] = {
+        "LastName": last_name,
+        "Addresses": [{
+            "AddressLine1": street,
+            "AddressLine2": f"{city}, {state} {zip_code}",
+        }],
+        "Page": 1,
+        "ResultsPerPage": max_results,
+    }
+
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = requests.post(
+                PERSON_SEARCH_URL, headers=_headers(),
+                json=body, timeout=_TIMEOUT,
+            )
+        except requests.RequestException as e:
+            if attempt + 1 < _MAX_RETRIES:
+                logger.info(
+                    "Enformion household search request error (attempt %d/%d): %s",
+                    attempt + 1, _MAX_RETRIES, e,
+                )
+                time.sleep(5)
+                continue
+            logger.warning("Enformion household search failed for %s @ %s: %s",
+                           last_name, street, e)
+            return {}
+
+        if resp.status_code == 200:
+            try:
+                return resp.json()
+            except ValueError:
+                logger.warning("Enformion household search returned non-JSON body")
+                return {}
+
+        if resp.status_code in (429, 500, 502, 503, 504) and attempt + 1 < _MAX_RETRIES:
+            logger.info("Enformion HTTP %d — retrying in 5s", resp.status_code)
+            time.sleep(5)
+            continue
+
+        if resp.status_code in (401, 403):
+            with _lock:
+                _disabled_reason = f"http_{resp.status_code}"
+            logger.error(
+                "Enformion HTTP %d — credentials invalid. Disabling.",
+                resp.status_code,
+            )
+            return {}
+
+        logger.warning(
+            "Enformion household HTTP %d for %s @ %s: %s",
+            resp.status_code, last_name, street, (resp.text or "")[:160],
+        )
+        return {}
+
+    return {}
+
+
 def person_search(
     first: str, last: str, *,
     city: str = "", state: str = "", zip_code: str = "",
@@ -198,38 +298,129 @@ def person_search(
     return {}
 
 
-def first_match(response: dict[str, Any]) -> dict[str, Any] | None:
-    """Return the top-ranked person from a response, or None."""
+def first_match(
+    response: dict[str, Any],
+    *,
+    prefer_first_name: str = "",
+    prefer_deceased: bool = False,
+) -> dict[str, Any] | None:
+    """Return the best-matching person from a response, or None.
+
+    Enformion's Person Search returns up to N candidates (default 5)
+    ranked by their internal relevance model, which for our use case
+    often ranks by activity/completeness rather than exact-name match.
+    A search for "Thomas Williams @ Vestavia Hills" can legitimately
+    return "Cindnate Williams" first because she's a more active record
+    at the same address. That's a wrong-person hit for our purposes.
+
+    Selection priority:
+      1. If ``prefer_first_name`` is given, prefer candidates whose first
+         name matches (case-insensitive, exact OR starts-with — handles
+         "Thomas" matching "Thomas Russell")
+      2. If ``prefer_deceased=True``, among first-name matches prefer
+         one with a non-empty ``datesOfDeath[]`` (we're searching for
+         a KNOWN decedent — the living namesake is the wrong person)
+      3. Fall back to persons[0] (Enformion's own top pick) if no
+         preference matches
+    """
     if not response:
         return None
     persons = (response.get("persons") or response.get("people")
                or response.get("results") or [])
-    return persons[0] if persons else None
+    if not persons:
+        return None
+
+    if not prefer_first_name:
+        return persons[0]
+
+    target = prefer_first_name.lower().strip()
+
+    def _matches_first(p):
+        pf = _get_first_name(p).lower()
+        return pf and (pf == target or pf.startswith(target + " ")
+                       or target.startswith(pf + " "))
+
+    first_matches = [p for p in persons if _matches_first(p)]
+    if not first_matches:
+        return persons[0]  # no name matches — fall back to Enformion's top pick
+
+    if prefer_deceased:
+        deceased = [p for p in first_matches if p.get("datesOfDeath")]
+        if deceased:
+            return deceased[0]
+
+    return first_matches[0]
 
 
 # ── Field helpers (schema quirks) ────────────────────────────────────
 
 
-def full_name(rel: dict[str, Any]) -> str:
-    """Compose 'First Middle Last' from an Enformion relative/person dict.
+def full_name(record: dict[str, Any]) -> str:
+    """Compose 'First Middle Last' from an Enformion person or relative dict.
 
-    Falls back to `rawNames[].fullName` if the individual parts are empty
-    (some records only have the raw string form).
+    Handles two different shapes Enformion actually returns (verified against
+    live response 2026-07-16):
+
+      * PERSON records (top-level): name lives NESTED inside a "name" dict
+        (`{"name": {"firstName": ..., "lastName": ...}, "fullName": "..."}`).
+        Prefer top-level `fullName` string when present — it's the pre-joined
+        display name.
+      * RELATIVE records (inside relativesSummary[]): name fields are FLAT
+        at the top of the dict (`{"firstName": ..., "lastName": ...}`) with
+        no nested "name" wrapper.
+
+    Reference-doc schema said flat everywhere; live schema is nested for
+    persons. This helper tries both shapes in priority order.
     """
+    # 1) Top-level pre-joined fullName (person records only)
+    if record.get("fullName"):
+        return str(record["fullName"]).strip()
+
+    # 2) Nested "name" dict (person records)
+    name_dict = record.get("name")
+    if isinstance(name_dict, dict):
+        parts = [
+            name_dict.get("firstName", ""),
+            name_dict.get("middleName", ""),
+            name_dict.get("lastName", ""),
+        ]
+        composed = " ".join(p.strip() for p in parts if p and p.strip())
+        if composed:
+            return composed
+
+    # 3) Flat firstName/middleName/lastName (relatives + some persons)
     parts = [
-        rel.get("firstName", ""),
-        rel.get("middleName", ""),
-        rel.get("lastName", ""),
+        record.get("firstName", ""),
+        record.get("middleName", ""),
+        record.get("lastName", ""),
     ]
     composed = " ".join(p.strip() for p in parts if p and p.strip())
     if composed:
         return composed
-    raw = rel.get("rawNames") or rel.get("name")
+
+    # 4) Last resort — rawNames array (rare)
+    raw = record.get("rawNames") or record.get("name")
     if isinstance(raw, list) and raw:
         raw = raw[0]
     if isinstance(raw, dict):
         return (raw.get("fullName") or "").strip()
     return (raw or "").strip()
+
+
+def _get_first_name(record: dict[str, Any]) -> str:
+    """Pull the first name from a person/relative dict, handling both shapes."""
+    name_dict = record.get("name")
+    if isinstance(name_dict, dict) and name_dict.get("firstName"):
+        return str(name_dict["firstName"]).strip()
+    return str(record.get("firstName") or "").strip()
+
+
+def _get_last_name(record: dict[str, Any]) -> str:
+    """Pull the last name from a person/relative dict, handling both shapes."""
+    name_dict = record.get("name")
+    if isinstance(name_dict, dict) and name_dict.get("lastName"):
+        return str(name_dict["lastName"]).strip()
+    return str(record.get("lastName") or "").strip()
 
 
 _YEAR_RE = re.compile(r"(19|20)\d{2}")

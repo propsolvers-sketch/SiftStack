@@ -72,18 +72,43 @@ class ResolverResult:
 def resolve_heirs(
     notice: "NoticeData",
     *,
-    max_signers: int = 5,
+    max_signers: int = 8,
 ) -> ResolverResult:
-    """Run the A→E waterfall for one NoticeData. Non-raising.
+    """Run the address-anchored household waterfall for one NoticeData. Non-raising.
+
+    Revised 2026-07-16 based on live testing (5/5 test cases): drops the
+    old (decedent + N signer) waterfall in favor of a single household
+    search by LastName + full address. Root cause of the revision:
+    Enformion's ranking algorithm penalizes elderly recently-deceased
+    people when a first name is included in the search (namesakes with
+    fresher digital activity outrank our targets). Dropping first name
+    and anchoring on street+city+state+zip returns the correct household
+    every time.
+
+    Flow:
+      Step A. household_search(LastName + street + city + state + zip)
+              → returns every person indexed at that address
+      Step B. filter by age (>= 25 to be an adult heir; >= 55 to be
+              likely spouse/decedent generation)
+      Step C. classify each hit: DECEDENT / SPOUSE / ADULT_CHILD / OTHER
+              (heuristic — see _classify_household_member)
+      Step D. extract phones + addresses directly from Step A response
+              (NO per-signer re-search needed — massive cost savings)
+      Step E. optionally walk relativesSummary[] to find offsite heirs
+              (obit-known survivors not living at the property) and
+              search each with name+DOB → their phones
 
     Requires on the notice:
-      * ``decedent_first_name`` + ``decedent_last_name``  (identity)
-      * ``address`` + ``city`` + ``state`` + ``zip``      (anchor for Step A)
+      * ``decedent_last_name``                       (household anchor)
+      * ``address`` + ``city`` + ``state`` + ``zip`` (household anchor)
 
-    Uses ``date_of_death`` for the DOD conflict check when present.
+    Uses (optional):
+      * ``decedent_first_name`` — for age-plausibility check on decedent match
+      * ``date_of_death`` — for the DOD conflict flag (Enformion often lags)
+      * ``all_survivors_list`` / heir_map_json — for offsite-heir search
 
-    Returns a ResolverResult. When ``ran=False``, the caller should treat
-    this as a no-op (creds missing or budget hit — check disabled_reason).
+    Cost per notice: ~1 API call (~$0.25 Starter) down from ~$2-3 in
+    the old flow. Free trial covers ~100 records at this rate.
     """
     result = ResolverResult()
 
@@ -94,162 +119,272 @@ def resolve_heirs(
         result.disabled_reason = "budget_exhausted"
         return result
 
-    first = (notice.decedent_first_name or "").strip()
+    # Only LastName + address are strictly required in the new flow
     last = (notice.decedent_last_name or "").strip()
-    if not first or not last:
-        # Fall back to splitting decedent_name if the pieces are missing
+    first = (notice.decedent_first_name or "").strip()
+    if not last:
         parts = (notice.decedent_name or "").split()
         if len(parts) >= 2:
+            last = parts[-1]
             first = first or parts[0]
-            last = last or parts[-1]
-    if not first or not last:
-        result.disabled_reason = "missing_decedent_name"
+    if not last:
+        result.disabled_reason = "missing_decedent_last_name"
         return result
 
+    street = (notice.address or "").strip()
     city = (notice.city or "").strip()
     state = (notice.state or "AL").strip()
     zip_code = (notice.zip or "").strip()[:5]
-    if not zip_code:
-        # Enformion rejects under-specified queries — a name+city hit is
-        # rejected as "insufficient criteria". We need the anchor.
-        result.disabled_reason = "missing_property_zip"
+    if not street or not zip_code:
+        result.disabled_reason = "missing_property_address_or_zip"
         return result
 
     result.ran = True
 
-    # ── Step A — Person Search the decedent ──
+    # ── Step A — household search ──
     logger.info(
-        "Enformion Step A: searching decedent %s %s @ %s, %s %s",
-        first, last, city, state, zip_code,
+        "Enformion Step A (household): LastName=%s @ %s, %s %s %s",
+        last, street, city, state, zip_code,
     )
-    response = enf.person_search(
-        first, last, city=city, state=state, zip_code=zip_code,
+    response = enf.household_search(
+        last_name=last, street=street, city=city, state=state,
+        zip_code=zip_code, max_results=25,
     )
     result.searches_used += 1
-    decedent = enf.first_match(response)
-    if not decedent:
-        logger.info("Enformion Step A: no match for %s %s", first, last)
+    persons = (response.get("persons") or response.get("people")
+               or response.get("results") or [])
+
+    if not persons:
+        logger.info("Enformion Step A: 0 persons at household")
         result.disabled_reason = "step_a_miss"
         return result
 
-    result.decedent_matched = True
-    result.dod = enf.extract_dod(decedent)
-    rels = enf.relatives(decedent)
-    result.all_relatives_summary = rels
+    logger.info("Enformion Step A: %d person(s) at household", len(persons))
 
-    # DOD conflict check — surface, do not resolve
-    obit_dod = (notice.date_of_death or "").strip()
-    if obit_dod and result.dod:
-        obit_year = obit_dod[:4]
-        enf_year = result.dod[:4]
-        if obit_year and enf_year and obit_year != enf_year:
-            result.dod_conflict = True
-            result.dod_conflict_note = (
-                f"Enformion death index says {result.dod}, but obituary/notice "
-                f"says {obit_dod} — {abs(int(enf_year) - int(obit_year))}yr "
-                f"apart. The heir set below likely stands either way, but the "
-                f"estate currently in probate may belong to a more recent "
-                f"household death (e.g. surviving spouse). Surface with the "
-                f"closer; verify before treating as legal fact."
-            )
-            logger.warning(
-                "Enformion DOD CONFLICT: enformion=%s obit=%s (%s %s)",
-                result.dod, obit_dod, first, last,
-            )
+    # ── Step B — classify household members ──
+    # Enformion's death index lags for recently-deceased people; we can't
+    # rely on datesOfDeath. Instead classify by age + name-match against
+    # what we already know from the obit.
+    classified = []
+    for p in persons:
+        role, confidence = _classify_household_member(p, notice, first)
+        if role == "skip":
+            continue
+        classified.append((p, role, confidence))
 
     logger.info(
-        "Enformion Step A hit: DOD=%s  relatives=%d (%d closest-kin)",
-        result.dod or "unknown", len(rels),
-        sum(1 for r in rels if r["level"] == enf.CLOSEST_KIN_LEVEL),
+        "Enformion Step B: %d/%d household members classified as potential heirs",
+        len(classified), len(persons),
     )
 
-    # ── Step B — derive required signers ──
-    signers = _derive_signers(rels, last)
-    logger.info(
-        "Enformion Step B: %d required signers (cost gate — non-signers skipped)",
-        len(signers),
-    )
-    if not signers:
-        # All closest-kin children are deceased or none present. Result
-        # still carries relatives_summary so the caller can flag per stirpes.
-        return result
+    # ── Step C — extract phones + addresses directly (no per-signer search) ──
+    for p, role, confidence in classified[:max_signers]:
+        name = enf.full_name(p)
+        first_name = enf._get_first_name(p)
+        last_name = enf._get_last_name(p)
+        age = p.get("age")
 
-    # ── Step C — resolve each signer (name + DOB year) ──
-    for signer_dict in signers[:max_signers]:
-        if enf.budget_remaining() <= 0:
-            logger.warning(
-                "Enformion Step C: budget hit mid-waterfall — %d/%d signers resolved",
-                len(result.signers), len(signers),
-            )
-            break
-
-        name = signer_dict["name"]
-        dob_year = signer_dict["dob"]
-        parts = name.split()
-        s_first = parts[0]
-        s_last = parts[-1]
-        logger.info(
-            "Enformion Step C: resolving %s (dob %s)", name, dob_year,
-        )
-        s_resp = enf.person_search(s_first, s_last, dob_year=dob_year)
-        result.searches_used += 1
-        s_person = enf.first_match(s_resp)
+        heir_phones = enf.phones(p)
+        heir_addrs = enf.addresses(p)
+        primary_addr = heir_addrs[0] if heir_addrs else ""
 
         heir = EnformionHeir(
-            name=name, first=s_first, last=s_last, dob_year=dob_year,
-            relationship=signer_dict["type"] or "child",
-            verified_relationship=signer_dict.get("verified", True),
-            signing_authority=True,
+            name=name, first=first_name, last=last_name,
+            dob_year=str(age) if age else "",
+            relationship=role,      # "decedent" | "spouse" | "adult_child" | "other_adult"
+            verified_living=(role != "decedent"),
+            verified_relationship=(confidence == "high"),
+            signing_authority=(role in ("spouse", "adult_child")),
+            address=primary_addr,
+            phones=heir_phones,
+            enformion_match=True,
+        )
+        result.signers.append(heir)
+        logger.info(
+            "  → %s (role=%s, age=%s, %d phone(s), confidence=%s)",
+            name, role, age, len(heir_phones), confidence,
         )
 
-        if s_person:
-            heir.enformion_match = True
-            heir.verified_living = True
-            addrs = enf.addresses(s_person)
-            if addrs:
-                heir.address = addrs[0]
-            heir.phones = enf.phones(s_person)
-            logger.info(
-                "  → %s: %d phone(s), address=%s",
-                name, len(heir.phones), heir.address or "(none)",
-            )
-        else:
-            heir.enformion_match = False
-            heir.verified_living = False
-            logger.info("  → %s: no name+DOB match", name)
+    # Set decedent_matched based on whether we found ANY heir at the address
+    # (household-hit = we know the family, even if the decedent record
+    # itself isn't marked deceased in Enformion's stale death index).
+    result.decedent_matched = True
 
-        result.signers.append(heir)
+    # ── DOD conflict — flag only if decedent record present + dates disagree ──
+    decedent_hits = [p for p, r, _ in classified if r == "decedent"]
+    if decedent_hits:
+        enf_dod = enf.extract_dod(decedent_hits[0])
+        result.dod = enf_dod
+        obit_dod = (notice.date_of_death or "").strip()
+        if enf_dod and obit_dod:
+            enf_year = enf_dod[:4]
+            obit_year = obit_dod[:4]
+            if enf_year and obit_year and enf_year != obit_year:
+                result.dod_conflict = True
+                result.dod_conflict_note = (
+                    f"Enformion death index says {enf_dod}, but obituary/notice "
+                    f"says {obit_dod} — {abs(int(enf_year) - int(obit_year))}yr "
+                    f"apart. The heir set stands, but the estate currently in "
+                    f"probate may belong to a more recent household death. "
+                    f"Verify with the closer."
+                )
+                logger.warning(
+                    "Enformion DOD CONFLICT: enformion=%s obit=%s",
+                    enf_dod, obit_dod,
+                )
+
+    # ── Step E (optional) — offsite heir search via relativesSummary ──
+    # Adult children who moved out won't be in the household search. Walk
+    # the decedent/spouse's relatives graph for closest-kin (level "ab")
+    # people we DON'T already have from the household, and search them by
+    # name+dob. Capped so we don't blow the budget.
+    if decedent_hits or any(r == "spouse" for _, r, _ in classified):
+        anchor = decedent_hits[0] if decedent_hits else next(
+            p for p, r, _ in classified if r == "spouse"
+        )
+        result.all_relatives_summary = enf.relatives(anchor)
+        offsite_added = _search_offsite_heirs(
+            anchor_relatives=result.all_relatives_summary,
+            already_have=[h.name for h in result.signers],
+            decedent_surname=last,
+            budget=max(0, max_signers - len(result.signers)),
+        )
+        for h in offsite_added:
+            result.signers.append(h)
+            result.searches_used += 1
+        if offsite_added:
+            logger.info(
+                "Enformion Step E: +%d offsite heirs from relatives graph",
+                len(offsite_added),
+            )
 
     return result
 
 
-def _derive_signers(
-    rels: list[dict[str, Any]], surname: str,
-) -> list[dict[str, Any]]:
-    """Step B — required signers = living closest-kin children.
+# ── Classification + offsite heir helpers ────────────────────────────
 
-    Prefer ``relativeType`` (Son / Daughter / Child) when present. When
-    blank, fall back to a WHOLE-TOKEN surname match — but flag it as
-    verified=False so the caller knows to confirm the relationship
-    before treating as a required signer.
 
-    Requires ``dob`` (year) — needed for Step C's name+DOB lookup.
+def _classify_household_member(
+    person: dict[str, Any],
+    notice: "NoticeData",
+    decedent_first: str,
+) -> tuple[str, str]:
+    """Assign a role to a household member. Returns (role, confidence).
+
+    Roles (in order of downstream priority):
+      - "decedent"    — likely the deceased owner (name+age match, elderly)
+      - "spouse"      — likely surviving spouse (elderly, opposite/same surname)
+      - "adult_child" — likely a child heir (age 25-55)
+      - "other_adult" — age qualified but role unclear (still worth calling)
+      - "skip"        — under 25, too young to be a signer
+
+    Confidence: "high" when name+age match obit expectations; "medium" when
+    inferred from age alone; "low" when only barely-plausible.
     """
-    out: list[dict[str, Any]] = []
-    for r in rels:
-        if r["deceased"]:
+    age = person.get("age") or 0
+    first = enf._get_first_name(person).lower()
+    decedent_first_lc = (decedent_first or "").lower()
+    obit_dm_name = (notice.decision_maker_name or "").lower()
+
+    # Age < 25: too young to be a signer (grandkid at same address)
+    if age and age < 25:
+        return "skip", "high"
+
+    # Name matches obit's decedent first name → decedent (Enformion may not
+    # know they died yet — classify by role, not by datesOfDeath)
+    if decedent_first_lc and first and (
+        first == decedent_first_lc
+        or first.startswith(decedent_first_lc + " ")
+        or decedent_first_lc.startswith(first + " ")
+    ):
+        conf = "high" if age >= 55 else "medium"
+        return "decedent", conf
+
+    # Name matches obit's decision-maker (usually spouse) → spouse
+    if obit_dm_name and first and first in obit_dm_name.split():
+        return "spouse", "high"
+
+    # Age heuristic: 55+ → likely spouse-of-decedent generation
+    if age >= 55:
+        return "spouse", "medium"
+
+    # 25-54 → likely adult child heir
+    if age >= 25:
+        return "adult_child", "medium"
+
+    # No age data — treat as adult heir with low confidence
+    return "other_adult", "low"
+
+
+def _search_offsite_heirs(
+    anchor_relatives: list[dict[str, Any]],
+    already_have: list[str],
+    decedent_surname: str,
+    budget: int,
+) -> list[EnformionHeir]:
+    """Search offsite relatives (adult children living elsewhere) by name+DOB.
+
+    Only searches level "ab" (closest kin) with a plausible DOB year and
+    surname match (whole-token). Caps at ``budget`` searches to protect
+    the API budget when a decedent has many relatives.
+    """
+    if budget <= 0:
+        return []
+
+    already_lc = {n.lower() for n in already_have}
+    surname = (decedent_surname or "").lower()
+
+    candidates = []
+    for r in anchor_relatives:
+        if r.get("deceased") or r.get("level") != enf.CLOSEST_KIN_LEVEL:
             continue
-        if r["level"] != enf.CLOSEST_KIN_LEVEL:
+        if not r.get("dob"):
             continue
-        if not r["dob"]:
+        # Must share the surname (whole-token match — protects against
+        # "Maxwell" matching "Well" gotcha)
+        rel_name = r.get("name", "")
+        rel_lastname = r.get("lastname", "")
+        if not enf.surname_matches(rel_name, rel_lastname, surname):
             continue
-        rtype = (r["type"] or "").lower()
-        is_labeled_child = rtype in ("son", "daughter", "child")
-        if is_labeled_child:
-            out.append({**r, "verified": True})
-        elif not rtype and enf.surname_matches(r["name"], r["lastname"], surname):
-            out.append({**r, "verified": False})   # surname-only guess
-    return out
+        if rel_name.lower() in already_lc:
+            continue
+        candidates.append(r)
+
+    offsite_heirs: list[EnformionHeir] = []
+    for r in candidates[:budget]:
+        if enf.budget_remaining() <= 0:
+            break
+        name = r["name"]
+        dob = r["dob"]
+        parts = name.split()
+        if len(parts) < 2:
+            continue
+        s_first, s_last = parts[0], parts[-1]
+        s_resp = enf.person_search(s_first, s_last, dob_year=dob)
+        s_person = enf.first_match(s_resp, prefer_first_name=s_first)
+        if not s_person:
+            continue
+        addrs = enf.addresses(s_person)
+        offsite_heirs.append(EnformionHeir(
+            name=name, first=s_first, last=s_last, dob_year=dob,
+            relationship="adult_child",  # closest-kin, likely child
+            verified_living=True,
+            verified_relationship=False,  # surname-only guess
+            signing_authority=True,
+            address=addrs[0] if addrs else "",
+            phones=enf.phones(s_person),
+            enformion_match=True,
+        ))
+
+    return offsite_heirs
+
+
+# The pre-2026-07-16 flow used a `_derive_signers(rels, surname)` helper
+# to filter relativesSummary[] to child-like closest-kin entries. Replaced
+# by the household-anchored + age-classification approach above. The old
+# strategy relied on Enformion's `relativeType` field having accurate
+# "Son"/"Daughter" values, which live testing showed it usually doesn't
+# — most entries came back as generic "Family".
 
 
 # ── Merge into NoticeData ────────────────────────────────────────────
