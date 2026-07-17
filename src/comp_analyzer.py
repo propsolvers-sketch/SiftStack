@@ -786,7 +786,8 @@ def fetch_rental_comps(subject: SubjectProperty, radius_miles: float = 1.0,
 # ── Similarity scoring ────────────────────────────────────────────────
 
 def _score_similarity(subject: SubjectProperty, comp: CompProperty,
-                       pool_median_ppsf: float = 0.0) -> float:
+                       pool_median_ppsf: float = 0.0,
+                       as_is: bool = False) -> float:
     """Score comp similarity (0.0-1.0+, higher = more similar).
 
     Priority order (revised 2026-06-09 for fix-n-flip ARV accuracy):
@@ -853,16 +854,35 @@ def _score_similarity(subject: SubjectProperty, comp: CompProperty,
     #   renovated  → PPSF > pool_median × 1.25 → +0.15 bonus  (ARV-relevant)
     #   distressed → PPSF < pool_median × 0.75 → -0.10 penalty
     #   standard   → in between → neutral
+    # AS-IS MODE (2026-07-17): flip the bias — favor typical-condition comps
+    # (within ±15% of median PPSF), penalize both renovated AND distressed
+    # outliers. Use when subject is rent-ready and you're NOT renovating to
+    # top-of-market. Post-rehab ARV logic doesn't apply.
     if pool_median_ppsf and comp.ppsf:
         ratio = comp.ppsf / pool_median_ppsf
-        if ratio > 1.25:
-            score += 0.15
-            comp.tier = "renovated"
-        elif ratio < 0.75:
-            score -= 0.10
-            comp.tier = "distressed"
+        if as_is:
+            # As-is: reward middle band, penalize outliers in BOTH directions
+            if 0.85 <= ratio <= 1.15:
+                score += 0.15
+                comp.tier = "as-is (typical)"
+            elif ratio > 1.25:
+                score -= 0.10  # penalty — likely renovated / different product class
+                comp.tier = "renovated (not comparable to as-is)"
+            elif ratio < 0.75:
+                score -= 0.10  # penalty — distressed / not representative
+                comp.tier = "distressed"
+            else:
+                comp.tier = "standard"
         else:
-            comp.tier = "standard"
+            # Fix-n-flip (default): reward top-quartile (renovated = post-rehab target)
+            if ratio > 1.25:
+                score += 0.15
+                comp.tier = "renovated"
+            elif ratio < 0.75:
+                score -= 0.10
+                comp.tier = "distressed"
+            else:
+                comp.tier = "standard"
 
     # ── 4. SQFT — max -0.15 ──
     if subject.sqft and comp.sqft:
@@ -1006,7 +1026,8 @@ def _classify_bucket(comp: CompProperty) -> str:
 
 # ── ARV calculation ───────────────────────────────────────────────────
 
-def calculate_arv(subject: SubjectProperty, comps: list[CompProperty]) -> ARVResult:
+def calculate_arv(subject: SubjectProperty, comps: list[CompProperty],
+                  as_is: bool = False) -> ARVResult:
     """Calculate ARV using Top-N-by-Similarity mean of RAW SOLD prices (revised 2026-05-31).
 
     Methodology:
@@ -1018,6 +1039,11 @@ def calculate_arv(subject: SubjectProperty, comps: list[CompProperty]) -> ARVRes
            is no longer needed
       4. Property-specific adjustments still computed for reference column
       5. Confidence bands from price spread WITHIN the top-N used for ARV
+
+    as_is: When True, flip PPSF-tier bias in _score_similarity to favor typical-
+    condition comps (median PPSF band) instead of top-quartile renovated comps.
+    Use for rent-ready deals where subject is habitable and you're NOT
+    renovating to top-of-market. Default False (fix-n-flip renovation-driven ARV).
     """
     if not comps:
         return ARVResult(confidence="none", confidence_reason="No comparable sales found")
@@ -1032,7 +1058,7 @@ def calculate_arv(subject: SubjectProperty, comps: list[CompProperty]) -> ARVRes
 
     # Score and sort by similarity (with PPSF tier bonus applied)
     for comp in comps:
-        comp.similarity_score = _score_similarity(subject, comp, pool_median_ppsf)
+        comp.similarity_score = _score_similarity(subject, comp, pool_median_ppsf, as_is=as_is)
     comps.sort(key=lambda c: c.similarity_score, reverse=True)
     selected = comps[:MAX_COMPS]  # top 10 for display
 
@@ -1043,7 +1069,7 @@ def calculate_arv(subject: SubjectProperty, comps: list[CompProperty]) -> ARVRes
 
     # Re-score after year_built enrichment (some comps may now score higher)
     for comp in selected:
-        comp.similarity_score = _score_similarity(subject, comp, pool_median_ppsf)
+        comp.similarity_score = _score_similarity(subject, comp, pool_median_ppsf, as_is=as_is)
     selected.sort(key=lambda c: c.similarity_score, reverse=True)
 
     # Apply adjustments + bucket classification (adjustments kept for reference column)

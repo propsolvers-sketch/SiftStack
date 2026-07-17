@@ -246,6 +246,13 @@ class DealPackage:
     rental_comps: list = field(default_factory=list)
     # Pending sales (PENDING/UNDER_CONTRACT listings near subject) — directional ARV signal
     pending_comps: list = field(default_factory=list)
+    # Market Reality Check (2026-07-17): pending-median vs ARV divergence detection.
+    # ran_as_is: True if analysis was run with --as-is flag (affects tier bias).
+    # arv_pending_delta_pct: (arv_mid - pending_median) / pending_median. Positive = ARV
+    # is above pending market. If > 30%, the report flags a warning.
+    ran_as_is: bool = False
+    pending_median_price: float = 0.0
+    arv_pending_delta_pct: float = 0.0
 
 
 # ── Calculation engine ────────────────────────────────────────────────
@@ -1097,6 +1104,44 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
         # ── R25 footnote (small uppercase eyebrow) ──
         c = ws0.cell(row=25, column=1, value="RED FILL (D8) = REHAB INPUT  ·  RED/GOLD-TINT CELLS ARE EDITABLE  ·  RUNNING TOTALS UPDATE LIVE")
         c.font = Font(name="Calibri", bold=True, size=9, color=_PB_INK_FAINT)
+
+        # ── MARKET REALITY CHECK (row 26) — pending-median vs ARV divergence banner ──
+        # Compares algorithm's ARV against the median of pending/contingent listings
+        # (the strongest "current market today" signal). If divergence >30%, flag with
+        # red warning + as-is mode suggestion. Otherwise green confirmation.
+        if pkg.pending_median_price > 0:
+            delta_pct = pkg.arv_pending_delta_pct
+            arv_val = pkg.arv.arv_mid
+            pending_val = pkg.pending_median_price
+            mode_label = "AS-IS" if pkg.ran_as_is else "FIX-N-FLIP"
+            if abs(delta_pct) > 0.30:
+                # Divergence warning
+                direction = "above" if delta_pct > 0 else "below"
+                fix_suggestion = ("Try `--as-is` for rent-ready deals" if not pkg.ran_as_is and delta_pct > 0
+                                  else "Verify subject condition + rehab scope")
+                banner = (
+                    f"⚠️  MARKET REALITY CHECK ({mode_label})  ·  ARV ${arv_val:,.0f} is {abs(delta_pct)*100:.0f}% {direction} "
+                    f"pending median ${pending_val:,.0f}  ·  {fix_suggestion}"
+                )
+                c = ws0.cell(row=26, column=1, value=banner)
+                c.font = Font(name="Calibri", bold=True, size=10, color="9C0006")
+                c.fill = _RED_FILL
+                for col in range(1, 6):
+                    ws0.cell(row=26, column=col).fill = _RED_FILL
+                    ws0.cell(row=26, column=col).border = _PB_BORDER_BOTTOM_RULE
+            else:
+                # Aligned confirmation
+                banner = (
+                    f"✓  MARKET REALITY CHECK ({mode_label})  ·  ARV ${arv_val:,.0f}  ·  Pending median ${pending_val:,.0f}  ·  "
+                    f"Δ {delta_pct*100:+.0f}%  ·  Aligned with current market"
+                )
+                c = ws0.cell(row=26, column=1, value=banner)
+                c.font = Font(name="Calibri", bold=True, size=10, color=_PB_MONEY)
+                c.fill = _PB_FILL_MONEY_TINT
+                for col in range(1, 6):
+                    ws0.cell(row=26, column=col).fill = _PB_FILL_MONEY_TINT
+                    ws0.cell(row=26, column=col).border = _PB_BORDER_BOTTOM_RULE
+            ws0.row_dimensions[26].height = 22
 
         # ── MAO Summary block (rows 27-31) — quick-glance cross-strategy comparison.
         # C29/C30/C31 are the CANONICAL source-of-truth inputs for target profit %,
@@ -2704,12 +2749,18 @@ def run_deal_analysis(address: str, city: str = "", state: str = "",
                       region: str = DEFAULT_REGION,
                       radius: float = DEFAULT_RADIUS_MILES,
                       months: int = DEFAULT_MONTHS_BACK,
-                      output_path: str = "") -> dict:
+                      output_path: str = "",
+                      as_is: bool = False) -> dict:
     """Run complete deal analysis: comp → rehab → MAO → projections → report.
 
     Returns dict with the DealPackage and report path. Empty state
     falls back to DEFAULT_PROPERTY_STATE (currently AL — single knob
     to flip when scaling to new states).
+
+    as_is: When True, flip PPSF-tier bias in similarity scoring to favor
+    typical-condition comps (median PPSF band) instead of top-quartile
+    renovated comps. Use for rent-ready deals where you're NOT renovating
+    to top-of-market. Default False = fix-n-flip renovation-driven ARV.
     """
     if not state:
         from state_resolver import DEFAULT_PROPERTY_STATE
@@ -2723,7 +2774,7 @@ def run_deal_analysis(address: str, city: str = "", state: str = "",
 
     # Step 2: Fetch comps and calculate ARV
     comps = fetch_comparable_sales(subject, radius, months)
-    arv = calculate_arv(subject, comps)
+    arv = calculate_arv(subject, comps, as_is=as_is)
     # Also fetch rental comps for the Rental Calc tab (active FOR_RENT listings)
     rental_comps = fetch_rental_comps(subject, radius_miles=1.0, n=6)
     # Pending sales — directional ARV signal (under-contract listings front-run sold by 30-60d)
@@ -2824,6 +2875,25 @@ def run_deal_analysis(address: str, city: str = "", state: str = "",
         rental_comps=rental_comps,
         pending_comps=pending_comps,
     )
+
+    # ── Market Reality Check (2026-07-17) ──
+    # Compute pending-median vs ARV delta. Pendings are the strongest "current
+    # market today" signal — they represent what buyers just agreed to pay at
+    # today's terms. If ARV diverges >30% from pending median, flag on report.
+    pkg.ran_as_is = as_is
+    if pending_comps:
+        pending_prices = sorted([p.get("list_price", 0) for p in pending_comps if p.get("list_price", 0) > 0])
+        if pending_prices:
+            pkg.pending_median_price = float(pending_prices[len(pending_prices) // 2])
+            if pkg.pending_median_price > 0:
+                pkg.arv_pending_delta_pct = (arv.arv_mid - pkg.pending_median_price) / pkg.pending_median_price
+                if abs(pkg.arv_pending_delta_pct) > 0.30:
+                    direction = "above" if pkg.arv_pending_delta_pct > 0 else "below"
+                    logger.warning(
+                        "ARV divergence: $%s ARV is %.0f%% %s pending median $%s (%d pendings)",
+                        f"{arv.arv_mid:,.0f}", abs(pkg.arv_pending_delta_pct) * 100, direction,
+                        f"{pkg.pending_median_price:,.0f}", len(pending_prices),
+                    )
 
     # Step 7: Generate report
     report_path = generate_deal_report(pkg, output_path)

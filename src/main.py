@@ -1517,6 +1517,8 @@ def cli_main() -> None:
                         help="Exit strategy (analyze-deal mode, default: flip)")
     parser.add_argument("--share", action="store_true",
                         help="Upload report to Dropbox and print shareable link (analyze mode). Uses existing DROPBOX_* env vars.")
+    parser.add_argument("--as-is", action="store_true", dest="as_is",
+                        help="Rent-ready / as-is comp mode (analyze mode). Flips PPSF-tier bonus to favor typical-condition comps (within ±15%% of pool median PPSF) instead of top-quartile renovated comps. Use when subject is habitable + rent-ready and you're NOT renovating to top-of-market. Default: off (fix-n-flip renovation-driven ARV).")
 
     # Market analysis
     parser.add_argument("--zip-codes", type=str, default=None,
@@ -1720,6 +1722,7 @@ def cli_main() -> None:
             purchase_price=args.purchase_price, rehab_tier=rehab_level,
             exit_strategy=args.exit_strategy, region=args.region,
             radius=args.radius, months=args.months,
+            as_is=getattr(args, "as_is", False),
         )
         if "error" in result:
             logger.error("Analyze failed: %s", result["error"])
