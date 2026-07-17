@@ -896,20 +896,43 @@ def _score_similarity(subject: SubjectProperty, comp: CompProperty,
         else:
             score -= 0.15
 
-    # ── 5. YEAR BUILT (SOFTENED 2026-06-09) — max -0.10, ±10yr no penalty ──
-    # Real-estate convention: a 10-year vintage delta is functionally
-    # negligible for housing stock built post-WWII. Drop the harsh penalty.
+    # ── 5. YEAR BUILT (SHARPENED 2026-07-17) — max -0.20 + spec-build check ──
+    # Prior ±10yr no-penalty band was too flat: it let a 2026 spec build
+    # tie a 2018 resale against a 2014 subject. Real market behavior:
+    # brand-new construction carries a builder premium (warranty, code,
+    # permits) that a 5-15yr-old resale can't command, and the closer the
+    # age match, the more directly the comp's sold price reflects subject's
+    # ARV. Bands are tighter (±5yr sweet spot) and the max delta penalty
+    # doubles (-0.10 → -0.20) so age-match beats a same-street outlier.
+    current_year = datetime.now().year
     if subject.year_built and comp.year_built:
         age_diff = abs(subject.year_built - comp.year_built)
-        if age_diff <= 10:
-            score -= 0.00       # within typical market variance
+        if age_diff <= 5:
+            score -= 0.00       # sweet spot — direct vintage match
+        elif age_diff <= 10:
+            score -= 0.03       # close — mild rounding
         elif age_diff <= 20:
-            score -= 0.03
+            score -= 0.08
         elif age_diff <= 30:
-            score -= 0.06
+            score -= 0.14
         else:
-            score -= 0.10
-    # else: missing year_built data → neutral (no deduction)
+            score -= 0.20
+
+        # Spec-build penalty (NEW 2026-07-17): comp is brand-new construction
+        # AND subject is materially older. Targets the literal "2026 spec
+        # build vs 2014 resale on the same street" pattern where a builder
+        # premium contaminates ARV. Layered ON TOP of age_diff penalty.
+        subject_age_years = current_year - subject.year_built
+        comp_new = comp.year_built >= current_year - 2   # built in last 2 years
+        subject_older = subject_age_years >= 5           # subject 5+ years old
+        if comp_new and subject_older:
+            score -= 0.20
+
+    elif subject.year_built and not comp.year_built:
+        # Missing year on comp — small penalty so known-in-band comps outrank
+        # unknowns. Unknowns are often new-build spec listings where the
+        # data source hasn't indexed year yet.
+        score -= 0.05
 
     # ── 6. Secondary factors (smaller weights) ──
     # Bedrooms — max -0.05
