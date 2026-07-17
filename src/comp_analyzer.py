@@ -1027,7 +1027,7 @@ def _classify_bucket(comp: CompProperty) -> str:
 # ── ARV calculation ───────────────────────────────────────────────────
 
 def calculate_arv(subject: SubjectProperty, comps: list[CompProperty],
-                  as_is: bool = False) -> ARVResult:
+                  as_is: bool = False, max_comp_year: int = None) -> ARVResult:
     """Calculate ARV using Top-N-by-Similarity mean of RAW SOLD prices (revised 2026-05-31).
 
     Methodology:
@@ -1044,6 +1044,12 @@ def calculate_arv(subject: SubjectProperty, comps: list[CompProperty],
     condition comps (median PPSF band) instead of top-quartile renovated comps.
     Use for rent-ready deals where subject is habitable and you're NOT
     renovating to top-of-market. Default False (fix-n-flip renovation-driven ARV).
+
+    max_comp_year: When set, hard-cap comps by build year. Applied AFTER
+    year_built enrichment (Zillow /search doesn't return year_built, so we
+    can't filter until we enrich). Enriches 2× the normal pool so post-filter
+    we still have ~10 comps for scoring. Use when subject is a resale and
+    nearby new-construction is inflating the pool with builder-premium comps.
     """
     if not comps:
         return ARVResult(confidence="none", confidence_reason="No comparable sales found")
@@ -1060,17 +1066,43 @@ def calculate_arv(subject: SubjectProperty, comps: list[CompProperty],
     for comp in comps:
         comp.similarity_score = _score_similarity(subject, comp, pool_median_ppsf, as_is=as_is)
     comps.sort(key=lambda c: c.similarity_score, reverse=True)
-    selected = comps[:MAX_COMPS]  # top 10 for display
 
-    # Enrich top comps with yearBuilt (/search doesn't include it — needs an extra
-    # call per comp to /property-details-address). Adds ~10s but lets the Comp
+    # Enrichment pool: 2× normal size when max_comp_year is set so post-filter
+    # we still have ~10 comps. Otherwise stay at MAX_COMPS (~10s enrichment cost).
+    enrich_size = MAX_COMPS * 2 if max_comp_year is not None else MAX_COMPS
+    enrich_pool = comps[:enrich_size]
+
+    # Enrich with yearBuilt (/search doesn't include it — needs an extra call
+    # per comp to /property-details-address). Adds ~10s but lets the Comp
     # Analysis tab show comp age, which matters for visual comp-vetting.
-    _enrich_comp_year_built(selected)
+    _enrich_comp_year_built(enrich_pool)
 
-    # Re-score after year_built enrichment (some comps may now score higher)
-    for comp in selected:
+    # ── Optional new-construction filter (2026-07-17) ──
+    # Drops comps built after max_comp_year. Comps with unknown year_built
+    # are KEPT (can't confirm they're new construction — visual review on
+    # the report catches them). If filter over-drops, warn.
+    if max_comp_year is not None:
+        before = len(enrich_pool)
+        enrich_pool = [c for c in enrich_pool if not c.year_built or c.year_built <= max_comp_year]
+        dropped = before - len(enrich_pool)
+        if dropped:
+            logger.info("max_comp_year=%d filter dropped %d/%d comps (built after cap)",
+                        max_comp_year, dropped, before)
+        if len(enrich_pool) < MIN_COMPS:
+            logger.warning("Post-filter comp count %d below minimum %d — consider widening --radius/--months",
+                           len(enrich_pool), MIN_COMPS)
+
+    # Re-score after year_built enrichment (year_built now factors in) + take top 10
+    for comp in enrich_pool:
         comp.similarity_score = _score_similarity(subject, comp, pool_median_ppsf, as_is=as_is)
-    selected.sort(key=lambda c: c.similarity_score, reverse=True)
+    enrich_pool.sort(key=lambda c: c.similarity_score, reverse=True)
+    selected = enrich_pool[:MAX_COMPS]  # top 10 for display
+
+    # Reflect final ordering + max_comp_year filter in the caller's list so
+    # downstream (pkg.comps, vintage sanity check in deal_analyzer) sees the
+    # SAME pool that drove ARV — not the raw pre-filter pool. Anything
+    # dropped by the filter is discarded here too.
+    comps[:] = enrich_pool
 
     # Apply adjustments + bucket classification (adjustments kept for reference column)
     for comp in selected:

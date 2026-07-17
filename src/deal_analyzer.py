@@ -253,6 +253,13 @@ class DealPackage:
     ran_as_is: bool = False
     pending_median_price: float = 0.0
     arv_pending_delta_pct: float = 0.0
+    # Vintage sanity check (2026-07-17): detect new-construction bias when
+    # subject is older resale. vintage_delta_years = top5_median_year_built -
+    # subject.year_built. Positive = comps are newer than subject. If > 5yr,
+    # banner warns + suggests --max-comp-year cap.
+    top5_median_year_built: int = 0
+    vintage_delta_years: int = 0
+    max_comp_year_used: int = 0  # 0 = no cap applied
 
 
 # ── Calculation engine ────────────────────────────────────────────────
@@ -1105,43 +1112,75 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
         c = ws0.cell(row=25, column=1, value="RED FILL (D8) = REHAB INPUT  ·  RED/GOLD-TINT CELLS ARE EDITABLE  ·  RUNNING TOTALS UPDATE LIVE")
         c.font = Font(name="Calibri", bold=True, size=9, color=_PB_INK_FAINT)
 
-        # ── MARKET REALITY CHECK (row 26) — pending-median vs ARV divergence banner ──
-        # Compares algorithm's ARV against the median of pending/contingent listings
-        # (the strongest "current market today" signal). If divergence >30%, flag with
-        # red warning + as-is mode suggestion. Otherwise green confirmation.
-        if pkg.pending_median_price > 0:
-            delta_pct = pkg.arv_pending_delta_pct
-            arv_val = pkg.arv.arv_mid
-            pending_val = pkg.pending_median_price
-            mode_label = "AS-IS" if pkg.ran_as_is else "FIX-N-FLIP"
-            if abs(delta_pct) > 0.30:
-                # Divergence warning
-                direction = "above" if delta_pct > 0 else "below"
-                fix_suggestion = ("Try `--as-is` for rent-ready deals" if not pkg.ran_as_is and delta_pct > 0
-                                  else "Verify subject condition + rehab scope")
-                banner = (
-                    f"⚠️  MARKET REALITY CHECK ({mode_label})  ·  ARV ${arv_val:,.0f} is {abs(delta_pct)*100:.0f}% {direction} "
-                    f"pending median ${pending_val:,.0f}  ·  {fix_suggestion}"
-                )
+        # ── SANITY CHECKS (row 26) — multi-signal divergence banner ──
+        # Two independent checks feed one banner:
+        #   (1) Market Reality: ARV vs pending median (>30% divergence)
+        #   (2) Vintage: subject year_built vs top-5 comp median year_built (>5yr newer)
+        # Any signal firing → red warning. All signals aligned → green confirmation.
+        mode_label = "AS-IS" if pkg.ran_as_is else "FIX-N-FLIP"
+        market_fires = pkg.pending_median_price > 0 and abs(pkg.arv_pending_delta_pct) > 0.30
+        vintage_fires = pkg.vintage_delta_years > 5
+        any_fired = market_fires or vintage_fires
+        has_data = pkg.pending_median_price > 0 or pkg.top5_median_year_built > 0
+
+        if has_data:
+            warnings = []
+            confirmations = []
+
+            if pkg.pending_median_price > 0:
+                delta_pct = pkg.arv_pending_delta_pct
+                arv_val = pkg.arv.arv_mid
+                pending_val = pkg.pending_median_price
+                if market_fires:
+                    direction = "above" if delta_pct > 0 else "below"
+                    fix = ("try --as-is for rent-ready deals" if not pkg.ran_as_is and delta_pct > 0
+                           else "verify subject condition + rehab scope")
+                    warnings.append(
+                        f"MARKET: ARV ${arv_val:,.0f} is {abs(delta_pct)*100:.0f}% {direction} "
+                        f"pending median ${pending_val:,.0f} — {fix}"
+                    )
+                else:
+                    confirmations.append(
+                        f"MARKET: ARV ${arv_val:,.0f} vs pending ${pending_val:,.0f} (Δ {delta_pct*100:+.0f}%)"
+                    )
+
+            if pkg.top5_median_year_built > 0:
+                subj_yr = pkg.subject.year_built
+                comp_yr = pkg.top5_median_year_built
+                if vintage_fires:
+                    cap_suggestion = f"subject built {subj_yr}, top-5 median {comp_yr} (Δ +{pkg.vintage_delta_years}yr) — new-construction bias likely"
+                    if pkg.max_comp_year_used:
+                        fix = f"currently capped at {pkg.max_comp_year_used}, still diverging — tighten further"
+                    else:
+                        fix = f"try --max-comp-year {subj_yr + 3}"
+                    warnings.append(f"VINTAGE: {cap_suggestion} — {fix}")
+                else:
+                    delta = pkg.vintage_delta_years
+                    delta_str = f"+{delta}yr" if delta >= 0 else f"{delta}yr"
+                    confirmations.append(f"VINTAGE: subject {subj_yr} vs top-5 median {comp_yr} ({delta_str})")
+
+            if any_fired:
+                banner = f"⚠️  SANITY CHECK ({mode_label})  ·  " + "  ·  ".join(warnings)
+                if confirmations:
+                    banner += "  ·  " + " · ".join(confirmations)
                 c = ws0.cell(row=26, column=1, value=banner)
                 c.font = Font(name="Calibri", bold=True, size=10, color="9C0006")
                 c.fill = _RED_FILL
+                c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
                 for col in range(1, 6):
                     ws0.cell(row=26, column=col).fill = _RED_FILL
                     ws0.cell(row=26, column=col).border = _PB_BORDER_BOTTOM_RULE
+                ws0.row_dimensions[26].height = 34 if len(warnings) > 1 else 24
             else:
-                # Aligned confirmation
-                banner = (
-                    f"✓  MARKET REALITY CHECK ({mode_label})  ·  ARV ${arv_val:,.0f}  ·  Pending median ${pending_val:,.0f}  ·  "
-                    f"Δ {delta_pct*100:+.0f}%  ·  Aligned with current market"
-                )
+                banner = f"✓  SANITY CHECK ({mode_label})  ·  " + "  ·  ".join(confirmations) + "  ·  Aligned"
                 c = ws0.cell(row=26, column=1, value=banner)
                 c.font = Font(name="Calibri", bold=True, size=10, color=_PB_MONEY)
                 c.fill = _PB_FILL_MONEY_TINT
+                c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
                 for col in range(1, 6):
                     ws0.cell(row=26, column=col).fill = _PB_FILL_MONEY_TINT
                     ws0.cell(row=26, column=col).border = _PB_BORDER_BOTTOM_RULE
-            ws0.row_dimensions[26].height = 22
+                ws0.row_dimensions[26].height = 22
 
         # ── MAO Summary block (rows 27-31) — quick-glance cross-strategy comparison.
         # C29/C30/C31 are the CANONICAL source-of-truth inputs for target profit %,
@@ -2750,7 +2789,8 @@ def run_deal_analysis(address: str, city: str = "", state: str = "",
                       radius: float = DEFAULT_RADIUS_MILES,
                       months: int = DEFAULT_MONTHS_BACK,
                       output_path: str = "",
-                      as_is: bool = False) -> dict:
+                      as_is: bool = False,
+                      max_comp_year: int = None) -> dict:
     """Run complete deal analysis: comp → rehab → MAO → projections → report.
 
     Returns dict with the DealPackage and report path. Empty state
@@ -2761,6 +2801,10 @@ def run_deal_analysis(address: str, city: str = "", state: str = "",
     typical-condition comps (median PPSF band) instead of top-quartile
     renovated comps. Use for rent-ready deals where you're NOT renovating
     to top-of-market. Default False = fix-n-flip renovation-driven ARV.
+
+    max_comp_year: When set, hard-cap comps by build year (excludes anything
+    built after YYYY). Use when subject is a resale and nearby new-construction
+    is inflating comps. Rule of thumb: cap at subject.year_built + 3.
     """
     if not state:
         from state_resolver import DEFAULT_PROPERTY_STATE
@@ -2774,7 +2818,7 @@ def run_deal_analysis(address: str, city: str = "", state: str = "",
 
     # Step 2: Fetch comps and calculate ARV
     comps = fetch_comparable_sales(subject, radius, months)
-    arv = calculate_arv(subject, comps, as_is=as_is)
+    arv = calculate_arv(subject, comps, as_is=as_is, max_comp_year=max_comp_year)
     # Also fetch rental comps for the Rental Calc tab (active FOR_RENT listings)
     rental_comps = fetch_rental_comps(subject, radius_miles=1.0, n=6)
     # Pending sales — directional ARV signal (under-contract listings front-run sold by 30-60d)
@@ -2876,11 +2920,30 @@ def run_deal_analysis(address: str, city: str = "", state: str = "",
         pending_comps=pending_comps,
     )
 
-    # ── Market Reality Check (2026-07-17) ──
-    # Compute pending-median vs ARV delta. Pendings are the strongest "current
-    # market today" signal — they represent what buyers just agreed to pay at
-    # today's terms. If ARV diverges >30% from pending median, flag on report.
+    # ── Sanity Checks (2026-07-17) ──
+    # Two independent divergence signals feed the R26 banner:
+    #  (1) Market Reality Check — ARV vs pending median (>30% divergence)
+    #  (2) Vintage Check — subject year_built vs top-5 median year_built (>5yr newer)
     pkg.ran_as_is = as_is
+    if max_comp_year:
+        pkg.max_comp_year_used = max_comp_year
+
+    # Vintage check: compare subject year_built vs top-5 comp median year_built.
+    # comps arrives sorted by similarity (calculate_arv already sorted it), so
+    # the first 5 with a known year_built are the ARV-driving set.
+    if subject.year_built and comps:
+        top5_years = [c.year_built for c in comps[:5] if c.year_built]
+        if top5_years:
+            top5_years.sort()
+            pkg.top5_median_year_built = top5_years[len(top5_years) // 2]
+            pkg.vintage_delta_years = pkg.top5_median_year_built - subject.year_built
+            if pkg.vintage_delta_years > 5:
+                logger.warning(
+                    "Vintage divergence: subject built %d, top-5 comps median %d (Δ +%dyr) — new-construction bias likely",
+                    subject.year_built, pkg.top5_median_year_built, pkg.vintage_delta_years,
+                )
+
+    # Market Reality Check: pending median vs ARV.
     if pending_comps:
         pending_prices = sorted([p.get("list_price", 0) for p in pending_comps if p.get("list_price", 0) > 0])
         if pending_prices:

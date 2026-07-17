@@ -1519,6 +1519,8 @@ def cli_main() -> None:
                         help="Upload report to Dropbox and print shareable link (analyze mode). Uses existing DROPBOX_* env vars.")
     parser.add_argument("--as-is", action="store_true", dest="as_is",
                         help="Rent-ready / as-is comp mode (analyze mode). Flips PPSF-tier bonus to favor typical-condition comps (within ±15%% of pool median PPSF) instead of top-quartile renovated comps. Use when subject is habitable + rent-ready and you're NOT renovating to top-of-market. Default: off (fix-n-flip renovation-driven ARV).")
+    parser.add_argument("--max-comp-year", type=int, default=None, dest="max_comp_year",
+                        help="Hard-cap comp pool by build year (analyze mode). Excludes any comp built after YYYY. Use when subject is a resale and nearby new-construction is inflating comps (builder premium doesn't transfer to 5-15yr-old resales). Rule of thumb: cap at subject.year_built + 3.")
 
     # Market analysis
     parser.add_argument("--zip-codes", type=str, default=None,
@@ -1723,6 +1725,7 @@ def cli_main() -> None:
             exit_strategy=args.exit_strategy, region=args.region,
             radius=args.radius, months=args.months,
             as_is=getattr(args, "as_is", False),
+            max_comp_year=getattr(args, "max_comp_year", None),
         )
         if "error" in result:
             logger.error("Analyze failed: %s", result["error"])
