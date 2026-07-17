@@ -1357,7 +1357,7 @@ def _collect_phones_with_reach(notice: NoticeData) -> list[dict]:
 
     by_key: dict[str, dict] = {}   # normalized digit key → entry
 
-    def _add(raw_phone: str, reach: str):
+    def _add(raw_phone: str, reach: str, sources: list[str] | None = None):
         raw = (raw_phone or "").strip()
         if not raw:
             return
@@ -1366,10 +1366,17 @@ def _collect_phones_with_reach(notice: NoticeData) -> list[dict]:
             return
         entry = by_key.get(key)
         if entry is None:
-            by_key[key] = {"phone": raw, "reaches": [reach]}
+            by_key[key] = {
+                "phone": raw, "reaches": [reach],
+                "sources": list(sources) if sources else [],
+            }
         else:
             if reach not in entry["reaches"]:
                 entry["reaches"].append(reach)
+            if sources:
+                for s in sources:
+                    if s not in entry["sources"]:
+                        entry["sources"].append(s)
 
     # Walk heir_map_json FIRST so per-heir phones get the correct attribution.
     # Then flat slots (which are attributed to DM #1) only add reaches for
@@ -1385,6 +1392,8 @@ def _collect_phones_with_reach(notice: NoticeData) -> list[dict]:
             if not h.get("signing_authority") or h.get("status") == "deceased":
                 continue
             heir_name = (h.get("name") or "?").strip()
+            # phone_sources sidecar dict (added 2026-07-16 — vendor comparison)
+            heir_phone_sources = h.get("phone_sources") or {}
             for p in (h.get("phones") or []):
                 phone_str = ""
                 if isinstance(p, str):
@@ -1393,19 +1402,21 @@ def _collect_phones_with_reach(notice: NoticeData) -> list[dict]:
                     phone_str = p.get("phone_number") or p.get("phone") or ""
                 if phone_str:
                     heir_phone_keys.add(_normalize_phone_key(phone_str))
-                    _add(phone_str, heir_name)
+                    srcs = heir_phone_sources.get(phone_str)
+                    _add(phone_str, heir_name, sources=srcs)
 
     # Flat slots: attribute to DM #1 ONLY when the phone isn't already
     # covered by a per-heir entry above. Prevents phones promoted from
     # Enformion (which live per-heir in heir_map_json) from also being
-    # attributed to DM #1 via the flat slot.
+    # attributed to DM #1 via the flat slot. These flat-slot phones came
+    # from Tracerfy (the only source that populates flat slots directly).
     for attr in (
         "primary_phone", "mobile_1", "mobile_2", "mobile_3", "mobile_4",
         "mobile_5", "landline_1", "landline_2", "landline_3",
     ):
         val = getattr(notice, attr, "") or ""
         if val and _normalize_phone_key(val) not in heir_phone_keys:
-            _add(val, dm1_name)
+            _add(val, dm1_name, sources=["tracerfy"])
 
     return list(by_key.values())
 
@@ -1415,17 +1426,58 @@ _TIER_ORDER = {
     "Dial Fourth": 3, "Drop": 4,
 }
 
+# Precision-focused display caps (added 2026-07-16 — operator flagged
+# "I don't need 89 phones per person; I want the highest-probability
+# working number"). We show only the top-tier phones in the Notes
+# Master Dial Sheet; lower-tier phones stay in heir_map_json for
+# reference but don't crowd the closer's view.
+_DIAL_SHEET_MAX_ROWS = 10          # cap Master Dial Sheet display
+_DIAL_SHEET_TIER_FLOOR = "Dial Third"   # exclude Dial Fourth + Drop from display
+
+
+def _source_badge(sources: list[str]) -> str:
+    """Compact source label for the Master Dial Sheet 'Sources' column.
+
+    - "Tracerfy + Enformion"  → corroborated by both (highest confidence)
+    - "Enformion" / "Tracerfy" → single source
+    - "" → unknown provenance (older heir_map_json without phone_sources)
+    """
+    if not sources:
+        return ""
+    if len(sources) == 1:
+        return sources[0].capitalize()
+    # Corroborated — join in canonical order (Tracerfy first if present)
+    ordered = []
+    for s in ("tracerfy", "enformion", "datasift"):
+        if s in sources:
+            ordered.append(s.capitalize())
+    for s in sources:
+        cap = s.capitalize()
+        if cap not in ordered:
+            ordered.append(cap)
+    return " + ".join(ordered)
+
 
 def _build_master_dial_sheet(notice: NoticeData, phone_tiers: dict | None) -> str:
-    """Deduped, best-first dial list across ALL signers with tier + reach.
+    """Deduped, best-first dial list across ALL signers with tier + source.
+
+    Precision-focused (2026-07-16): filters to top-tier phones only
+    (default Dial First / Dial Second / Dial Third — see _DIAL_SHEET_TIER_FLOOR),
+    caps display to _DIAL_SHEET_MAX_ROWS. Lower-tier phones stay in
+    heir_map_json for reference but don't clutter the closer's view.
+
+    Sort priority within the displayed set:
+      1. Trestle tier (Dial First → Dial Third)
+      2. Corroboration (phones found by 2+ sources > single source —
+         cross-source agreement is a strong accuracy signal)
+      3. Line type (Mobile > Landline > Voip)
+      4. Trestle activity score (higher first, tiebreak within tier)
 
     When phone_tiers is empty or None (Trestle disabled), still emits the
-    deduped list but without tier sorting — falls back to source order
-    (DM #1 first, then other heirs).
+    deduped list but without tier filtering — falls back to source order.
     """
     entries = _collect_phones_with_reach(notice)
     if not entries:
-        # Distinguish "we tried and got nothing" vs "we didn't try"
         heirs_json = notice.heir_map_json
         if heirs_json and any(
             h.get("signing_authority") for h in (json.loads(heirs_json) or [])
@@ -1433,18 +1485,15 @@ def _build_master_dial_sheet(notice: NoticeData, phone_tiers: dict | None) -> st
             return (
                 "=== MASTER DIAL SHEET ===\n"
                 "No phones recovered for any signing-authority heir. "
-                "Tracerfy skip-trace returned no matches for this family. "
-                "Consider Enformion Person Search (Phase B integration pending) "
-                "or manual research via TruePeopleSearch / FastPeopleSearch / "
-                "CyberBackgroundChecks."
+                "Tracerfy + Enformion both returned no matches for this family. "
+                "Consider manual research via TruePeopleSearch / FastPeopleSearch / "
+                "CyberBackgroundChecks, or DataSift's post-upload Skip Trace pass."
             )
         return ""
 
     phone_tiers = phone_tiers or {}
 
     def _tier_data(phone: str) -> dict:
-        # phone_tiers keys are the raw phones from Trestle — try the exact
-        # key first, then a normalized-digits lookup
         if phone in phone_tiers:
             return phone_tiers[phone] or {}
         key = _normalize_phone_key(phone)
@@ -1453,48 +1502,93 @@ def _build_master_dial_sheet(notice: NoticeData, phone_tiers: dict | None) -> st
                 return v or {}
         return {}
 
-    # Enrich each entry with tier data
+    # Enrich each entry with Trestle tier + line type
     for e in entries:
         td = _tier_data(e["phone"])
         e["tier"] = td.get("assigned_tag") or ""
         e["score"] = td.get("activity_score")
         e["line_type"] = td.get("line_type") or ""
         e["is_litigator_risk"] = td.get("is_litigator_risk")
+        # sources already populated by _collect_phones_with_reach
+        e.setdefault("sources", [])
 
-    # Sort by tier (best first), then score desc, then source order preserved
-    entries.sort(key=lambda e: (
-        _TIER_ORDER.get(e["tier"], 99),
-        -(e["score"] or 0),
-    ))
+    # Line-type priority (Mobile beats Landline beats Voip for reachability)
+    line_order = {"mobile": 0, "landline": 1, "voip": 2, "": 9}
 
-    dropped = [e for e in entries if e["tier"] == "Drop"]
-    kept = [e for e in entries if e["tier"] != "Drop"]
+    def _sort_key(e):
+        tier_rank = _TIER_ORDER.get(e["tier"], 99)
+        # Corroborated (2+ sources) sorts BEFORE single-source at same tier
+        corrob_rank = 0 if len(e["sources"]) >= 2 else 1
+        lt_rank = line_order.get((e["line_type"] or "").lower(), 9)
+        score = e.get("score") or 0
+        return (tier_rank, corrob_rank, lt_rank, -score)
 
-    lines = [f"=== MASTER DIAL SHEET (deduped across {len(entries)} raw hits → {len(entries)} unique) ==="]
-    lines.append(f"{'Phone':<16} {'Tier':<13} {'Type':<10} Reaches")
-    lines.append("─" * 78)
+    entries.sort(key=_sort_key)
 
-    for e in kept:
+    tier_floor_rank = _TIER_ORDER.get(_DIAL_SHEET_TIER_FLOOR, 99)
+    displayable = [e for e in entries
+                   if _TIER_ORDER.get(e["tier"], 99) <= tier_floor_rank]
+    below_floor = [e for e in entries
+                   if _TIER_ORDER.get(e["tier"], 99) > tier_floor_rank]
+    truncated = displayable[_DIAL_SHEET_MAX_ROWS:]
+    displayable = displayable[:_DIAL_SHEET_MAX_ROWS]
+
+    # Source-mix summary — 1-line snapshot of vendor contribution
+    src_counter: dict[str, int] = {}
+    corroborated = 0
+    for e in entries:
+        srcs = e.get("sources") or []
+        if len(srcs) >= 2:
+            corroborated += 1
+        for s in srcs:
+            src_counter[s] = src_counter.get(s, 0) + 1
+    src_summary_bits = [f"{s.capitalize()}={ct}" for s, ct in
+                        sorted(src_counter.items(), key=lambda x: -x[1])]
+    if corroborated:
+        src_summary_bits.append(f"corroborated={corroborated}")
+    src_summary = "  ·  ".join(src_summary_bits) if src_summary_bits else "no source data"
+
+    header = (
+        f"=== MASTER DIAL SHEET  "
+        f"({len(entries)} unique · showing top {len(displayable)} "
+        f"at or above {_DIAL_SHEET_TIER_FLOOR}) ==="
+    )
+    lines = [header]
+    lines.append(f"Source mix: {src_summary}")
+    lines.append("")
+    lines.append(f"{'Phone':<16}{'Tier':<13}{'Type':<10}{'Reaches':<26}Sources")
+    lines.append("─" * 88)
+
+    for e in displayable:
         phone_disp = e["phone"][:15]
         tier = (e["tier"] or "(unscored)")[:12]
         line_type = (e["line_type"] or "?")[:9]
-        reaches = ", ".join(e["reaches"])[:36]
+        reaches = ", ".join(e["reaches"])[:25]
+        sources_disp = _source_badge(e.get("sources") or [])[:22]
         marker = ""
         if e["is_litigator_risk"]:
             marker = " ⚠LITIGATOR"
-        lines.append(f"{phone_disp:<16} {tier:<13} {line_type:<10} {reaches}{marker}")
+        lines.append(
+            f"{phone_disp:<16}{tier:<13}{line_type:<10}{reaches:<26}"
+            f"{sources_disp}{marker}"
+        )
 
-    if dropped:
+    hidden = len(truncated) + len(below_floor)
+    if hidden:
+        parts = []
+        if truncated:
+            parts.append(f"{len(truncated)} additional at-or-above-tier")
+        if below_floor:
+            parts.append(f"{len(below_floor)} below {_DIAL_SHEET_TIER_FLOOR}")
         lines.append("")
-        lines.append(f"Dropped ({len(dropped)} disconnected/low-score):")
-        for e in dropped:
-            lines.append(f"  · {e['phone']} — reaches {', '.join(e['reaches'])}")
+        lines.append(f"(+{hidden} more phones hidden — {'; '.join(parts)}. "
+                     f"Full list in heir_map_json / CSV columns.)")
 
     if not phone_tiers:
         lines.append("")
         lines.append(
-            "(Trestle scoring unavailable — phones listed in source order. "
-            "Set TRESTLE_API_KEY to enable dial-order tiers.)"
+            "(Trestle scoring unavailable — phones listed in source order, "
+            "tier filter skipped. Set TRESTLE_API_KEY to enable priority ordering.)"
         )
 
     return "\n".join(lines)

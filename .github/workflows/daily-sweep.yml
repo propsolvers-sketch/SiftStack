@@ -529,6 +529,7 @@ jobs:
             .adhunter_probate_seen_ids.json \
             output/observability/service_rates.json \
             output/observability/foreclosure_owner_cache.json \
+            output/observability/skip_trace_source_stats.json \
             2>/dev/null || true
           if ! git diff --cached --quiet; then
             git commit -m "chore(bot): update seen_ids + last_run + rolling rates + code-violation dedup after daily sweep"

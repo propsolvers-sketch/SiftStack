@@ -1785,6 +1785,154 @@ def _run_enformion_waterfall(notices: list["NoticeData"], mode: str = "fallback"
     return stats
 
 
+def _emit_source_stats(notices: list["NoticeData"], phone_tiers: dict) -> None:
+    """Emit + persist per-source Trestle tier distribution for vendor comparison.
+
+    Reads ``phone_sources`` from each heir in heir_map_json (populated by
+    Enformion merge with Tracerfy attribution) and joins against Trestle
+    ``phone_tiers`` scores. Produces:
+
+      · One INFO log line per source with tier % distribution
+      · One appended entry in output/observability/skip_trace_source_stats.json
+        for weekly / monthly rollup (kept rolling 90 days)
+
+    The comparison lens: precision, not recall. A source whose phones
+    average "Dial First" is more accurate than one whose phones average
+    "Dial Fourth". Corroboration rate (% of phones a source finds that
+    another source ALSO found) is a secondary accuracy signal.
+    """
+    if not notices:
+        return
+
+    import json as _json
+    from pathlib import Path as _Path
+
+    # source_name → {tier_name → count}
+    tier_counts: dict[str, dict[str, int]] = {}
+    # source_name → total phones seen (denominator)
+    total_by_source: dict[str, int] = {}
+    # source_name → phones corroborated (found by 2+ sources)
+    corroborated_by_source: dict[str, int] = {}
+    # records where source contributed at least 1 phone
+    records_by_source: dict[str, set[str]] = {}
+
+    def _normalize(phone: str) -> str:
+        digits = "".join(c for c in (phone or "") if c.isdigit())
+        return digits[-10:] if len(digits) >= 10 else ""
+
+    def _lookup_tier(phone: str) -> str:
+        if phone in phone_tiers:
+            return (phone_tiers[phone] or {}).get("assigned_tag", "") or "(unscored)"
+        key = _normalize(phone)
+        for k, v in phone_tiers.items():
+            if _normalize(k) == key:
+                return (v or {}).get("assigned_tag", "") or "(unscored)"
+        return "(unscored)"
+
+    for n in notices:
+        record_id = (n.decedent_name or n.address or "?").strip()
+        if not n.heir_map_json:
+            continue
+        try:
+            heirs = _json.loads(n.heir_map_json) or []
+        except (_json.JSONDecodeError, TypeError):
+            continue
+        for h in heirs:
+            phone_sources = h.get("phone_sources") or {}
+            for phone, sources in phone_sources.items():
+                tier = _lookup_tier(phone)
+                is_corroborated = len(sources) >= 2
+                for src in sources:
+                    tier_counts.setdefault(src, {}).setdefault(tier, 0)
+                    tier_counts[src][tier] += 1
+                    total_by_source[src] = total_by_source.get(src, 0) + 1
+                    if is_corroborated:
+                        corroborated_by_source[src] = (
+                            corroborated_by_source.get(src, 0) + 1
+                        )
+                    records_by_source.setdefault(src, set()).add(record_id)
+
+    if not tier_counts:
+        logger.info(
+            "Skip-trace source stats: no phone_sources data to aggregate "
+            "(either 0 records had heir_map_json phones, or the merge "
+            "code hasn't tagged sources yet)",
+        )
+        return
+
+    # Log human-readable summary
+    logger.info("═" * 72)
+    logger.info("SKIP-TRACE VENDOR COMPARISON — Trestle tier distribution per source")
+    logger.info("═" * 72)
+    tier_columns = ("Dial First", "Dial Second", "Dial Third",
+                    "Dial Fourth", "Drop", "(unscored)")
+    header = f"{'Source':<12}{'Records':>9}{'Phones':>8}"
+    for t in tier_columns:
+        header += f"{t:>13}"
+        header += f"{'%':>4}"
+    header += f"{'Corrob':>9}{'%':>5}"
+    logger.info(header)
+    logger.info("─" * 72)
+
+    for src in sorted(total_by_source, key=lambda s: -total_by_source[s]):
+        total = total_by_source[src]
+        rec_count = len(records_by_source.get(src, set()))
+        line = f"{src.capitalize():<12}{rec_count:>9}{total:>8}"
+        for t in tier_columns:
+            ct = tier_counts.get(src, {}).get(t, 0)
+            pct = (100 * ct / total) if total else 0
+            line += f"{ct:>13}{pct:>3.0f}%"
+        corr = corroborated_by_source.get(src, 0)
+        corr_pct = (100 * corr / total) if total else 0
+        line += f"{corr:>9}{corr_pct:>4.0f}%"
+        logger.info(line)
+    logger.info("═" * 72)
+
+    # Persist to observability JSON for weekly rollup
+    from datetime import datetime as _dt
+    stats_path = _Path("output/observability/skip_trace_source_stats.json")
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+
+    entry = {
+        "run_date": date.today().isoformat(),
+        "run_time": _dt.now().strftime("%H:%M:%S"),
+        "pipeline": "pre_probate",
+        "notices_analyzed": len(notices),
+        "sources": {
+            src: {
+                "records_contributed_to": len(records_by_source.get(src, set())),
+                "total_phones": total_by_source[src],
+                "tier_distribution": tier_counts.get(src, {}),
+                "corroborated_phones": corroborated_by_source.get(src, 0),
+            }
+            for src in total_by_source
+        },
+    }
+
+    # Load existing, append, prune to 90 days, save
+    try:
+        existing = _json.loads(stats_path.read_text()) if stats_path.exists() else []
+    except (_json.JSONDecodeError, OSError):
+        existing = []
+    if not isinstance(existing, list):
+        existing = []
+
+    existing.append(entry)
+
+    # Prune to 90 days
+    from datetime import timedelta as _td
+    cutoff = (date.today() - _td(days=90)).isoformat()
+    existing = [e for e in existing
+                if isinstance(e, dict) and e.get("run_date", "") >= cutoff]
+
+    try:
+        stats_path.write_text(_json.dumps(existing, indent=2))
+        logger.info("Source stats persisted → %s (%d entries in file)",
+                    stats_path, len(existing))
+    except OSError as e:
+        logger.warning("Could not persist source stats: %s", e)
+
+
 # ── Slack notification ───────────────────────────────────────────────
 
 
@@ -2086,6 +2234,16 @@ def _cli() -> int:
             # Enformion phones too.
             from phone_validator import score_phones_for_pipeline
             phone_tiers = score_phones_for_pipeline(notices)
+
+            # Skip-trace vendor comparison — emit + persist a per-source
+            # tier distribution using phone_sources (set by Enformion merge
+            # + Tracerfy attribution in _promote_heir_contacts_to_csv_slots)
+            # joined against phone_tiers (Trestle scores). Answers the
+            # operator's precision question: which vendor's phones score
+            # Dial First most often? (see observability JSON for weekly
+            # rollup.)
+            _emit_source_stats(notices, phone_tiers)
+
             csv_path = datasift_formatter.write_datasift_csv(
                 notices, phone_tiers=phone_tiers,
             )

@@ -435,9 +435,26 @@ def merge_into_notice(
         "addresses_filled": 0,
     }
 
+    # ── Source attribution setup ──
+    # Snapshot the phones each existing heir has BEFORE Enformion merges
+    # in. Anything already present must have come from Tracerfy (or LLM
+    # extraction — same category for source-comparison purposes). Anything
+    # Enformion adds fresh gets source="enformion". Anything present in
+    # BOTH sets is corroborated — source list = [tracerfy, enformion].
+    # Written to each heir's ``phone_sources`` dict for downstream
+    # Master-Dial-Sheet rendering + source-stats aggregation.
+    pre_enformion_phones: dict[str, set[str]] = {}
+    for existing_heir in existing_heirs:
+        pre_enformion_phones[_key(existing_heir.get("name", ""))] = set(
+            existing_heir.get("phones") or []
+        )
+    stats["corroborated_phones"] = 0
+
     for heir in result.signers:
         key = _key(heir.name)
         existing = by_key.get(key)
+        enformion_phones = {p["number"] for p in heir.phones}
+        prior_phones = pre_enformion_phones.get(key, set())
 
         if existing is None:
             # New signer Enformion found that LLM's obit extraction missed
@@ -449,6 +466,9 @@ def merge_into_notice(
                 "source": "enformion_person_search",
                 "enformion_matched": heir.enformion_match,
                 "phones": [p["number"] for p in heir.phones],
+                # All phones on this new heir came from Enformion — no
+                # prior Tracerfy pass ever saw this heir.
+                "phone_sources": {p["number"]: ["enformion"] for p in heir.phones},
             }
             if heir.address:
                 new_entry["mailing_address"] = heir.address
@@ -491,13 +511,29 @@ def merge_into_notice(
                     existing["zip"] = zip5
                 existing["mailing_address"] = heir.address
                 stats["addresses_filled"] += 1
-            # Merge phones (dedup by digits)
+            # Merge phones + source attribution
+            phone_sources: dict[str, list[str]] = existing.get("phone_sources") or {}
             existing_phones = set(existing.get("phones") or [])
+            # Backfill source="tracerfy" on any prior phone that doesn't
+            # already have an entry (older heir_map_json entries didn't
+            # carry phone_sources — assume Tracerfy for those).
+            for prior in prior_phones:
+                phone_sources.setdefault(prior, ["tracerfy"])
             for p in heir.phones:
-                if p["number"] not in existing_phones:
-                    existing.setdefault("phones", []).append(p["number"])
-                    existing_phones.add(p["number"])
+                num = p["number"]
+                if num not in existing_phones:
+                    existing.setdefault("phones", []).append(num)
+                    existing_phones.add(num)
                     stats["phones_added"] += 1
+                    phone_sources.setdefault(num, ["enformion"])
+                else:
+                    # This phone was already present (from Tracerfy) AND
+                    # Enformion also returned it → CORROBORATED
+                    src_list = phone_sources.setdefault(num, ["tracerfy"])
+                    if "enformion" not in src_list:
+                        src_list.append("enformion")
+                        stats["corroborated_phones"] += 1
+            existing["phone_sources"] = phone_sources
 
     merged = list(by_key.values())
     notice.heir_map_json = _json.dumps(merged, ensure_ascii=False)
