@@ -928,20 +928,28 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
     """Generate deal analysis Excel workbook (Google investor sheet format)."""
     wb = Workbook()
 
-    # ── Tab 1: Profit Calculator (Flip / Wholesale Assignment) ────
+    # ── Tab 1: Profit Calculator — beautified 2026-06-13 (in-place restyle) ──
+    # IN-PLACE: all cell coordinates preserved. Bidirectional refs from MAO Calc
+    # to C29/C30/C31 remain intact. Snippet cross-refs to Comp Analysis / Rental
+    # Calc also preserved. Only visual styling changes.
     ws0 = wb.active
     ws0.title = "Profit Calculator"
-    ws0.cell(row=1, column=1, value="Profit Calculator (Flip / Wholesale Assignment)").font = _TITLE_FONT
+    # R1 — editorial eyebrow (uppercase, letter-spaced)
+    c = ws0.cell(row=1, column=1, value="PROFIT CALCULATOR  ·  FLIP / WHOLESALE ASSIGNMENT")
+    c.font = Font(name="Calibri", bold=True, size=9, color=_PB_INK_MUTE)
+    ws0.row_dimensions[1].height = 20
+
     addr = f"{pkg.subject.address}, {pkg.subject.city}, {pkg.subject.state} {pkg.subject.zip_code}"
-    # Row 2 — Address (clickable hyperlink → Zillow subject page with photos)
+    # R2 — Address (clickable hyperlink → Zillow subject page with photos), editorial serif treatment
     subj_zillow_url = (
         f"https://www.zillow.com/homes/{pkg.subject.address.replace(' ', '-')}-"
         f"{pkg.subject.city.replace(' ', '-')}-{pkg.subject.state}-{pkg.subject.zip_code}/"
     )
-    addr_cell = ws0.cell(row=2, column=1, value=f"🏠 {addr}  📷 (click to view pics on Zillow)")
+    addr_cell = ws0.cell(row=2, column=1, value=f"🏠 {addr}  📷 (click for pics on Zillow)")
     addr_cell.hyperlink = subj_zillow_url
-    addr_cell.font = Font(name="Calibri", bold=True, size=13, color="0563C1", underline="single")
-    # Row 3 — Subject property detail line: sqft / beds-baths / year / lot / property type / zestimate
+    addr_cell.font = Font(name="Georgia", bold=True, size=22, color="0563C1", underline="single")
+    ws0.row_dimensions[2].height = 32
+    # R3 — Subject property detail line: sqft / beds-baths / year / lot / property type / zestimate
     s = pkg.subject
     subj_parts = []
     if s.sqft: subj_parts.append(f"{s.sqft:,} sqft")
@@ -952,8 +960,9 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
     if s.zestimate: subj_parts.append(f"Zestimate ${s.zestimate:,.0f}")
     if s.last_sold_price and s.last_sold_date:
         subj_parts.append(f"Last sold {s.last_sold_date} ${s.last_sold_price:,.0f}")
-    ws0.cell(row=3, column=1, value=" · ".join(subj_parts)).font = Font(
-        name="Calibri", bold=True, size=11, color="2F5496")
+    c = ws0.cell(row=3, column=1, value=" · ".join(subj_parts))
+    c.font = Font(name="Georgia", italic=True, size=12, color=_PB_INK_MUTE)
+    ws0.row_dimensions[3].height = 22
     # Generated date stamp + headline summary — pushed to a smaller line further down
     # (kept in cell metadata via the headline at row 4, no longer needs its own row)
 
@@ -966,107 +975,128 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
     INPUT_FILL = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")  # light yellow
     HEADLINE_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # bright green
     if pb:
-        # ── HEADLINE — MAO at editable target profit % ──
-        # Headline formula at E4 references the editable target % at C12 (next to
-        # the Profit % row for visual alignment). Changing C12 updates the headline
-        # MAO + Contract Seller + Profit % all live.
-        ws0.cell(row=4, column=1, value="🎯 RECOMMENDED MAX OFFER (at target profit % set below)").font = Font(
-            name="Calibri", bold=True, size=14, color="006100")
-        ws0.cell(row=4, column=1).fill = HEADLINE_FILL
-        ws0.cell(row=4, column=1).alignment = Alignment(horizontal="left", vertical="center")
+        # ── R4 HEADLINE — MAO at editable target profit % (money-green in tint) ──
+        c = ws0.cell(row=4, column=1, value="  RECOMMENDED MAX OFFER  ·  AT TARGET PROFIT %")
+        c.font = Font(name="Calibri", bold=True, size=9, color=_PB_MONEY)
+        c.fill = _PB_FILL_MONEY_TINT
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        for col in range(2, 5):
+            ws0.cell(row=4, column=col).fill = _PB_FILL_MONEY_TINT
         # E4 — MAO formula, references C12 (editable target %)
         headline_cell = ws0.cell(row=4, column=5, value="=E6*(1-C7-C9-C12)-D8-E15")
         headline_cell.number_format = '"$"#,##0'
-        headline_cell.font = Font(name="Calibri", bold=True, size=16, color="006100")
-        headline_cell.fill = HEADLINE_FILL
+        headline_cell.font = Font(name="Consolas", bold=True, size=18, color=_PB_MONEY)
+        headline_cell.fill = _PB_FILL_MONEY_TINT
         headline_cell.alignment = Alignment(horizontal="right", vertical="center")
-        ws0.row_dimensions[4].height = 28
+        ws0.row_dimensions[4].height = 32
 
-        r = 5
-        for col, h in enumerate(["", "", "%", "Amount", "Running"], 1):
-            cell = ws0.cell(row=r, column=col, value=h)
-            if h: cell.font = _HEADER_FONT; cell.fill = _HEADER_FILL; cell.alignment = _HEADER_ALIGN
+        # ── R5 column labels ──
+        _pb_col_headers(ws0, 5, [(3, "%"), (4, "AMOUNT"), (5, "RUNNING")])
 
-        # R6 — ARV / CMV (INPUT)
-        ws0.cell(row=6, column=1, value="ARV / CMV").font = Font(name="Calibri", bold=True, size=12, color="2F5496")
-        c = ws0.cell(row=6, column=5, value=pb["arv"])
-        c.number_format = '"$"#,##0'; c.font = Font(name="Calibri", bold=True, size=12); c.fill = INPUT_FILL; c.border = _THIN_BORDER
+        # ── R6 ARV / CMV (P1 red tint) ──
+        _pb_label(ws0, 6, "ARV / CMV")
+        c = ws0.cell(row=6, column=5, value=pb["arv"]); c.number_format = '"$"#,##0'
+        c.font = Font(name="Consolas", bold=True, size=11, color=_PB_INK)
+        c.fill = _PB_FILL_P1T; c.border = _PB_BORDER_BOTTOM_SOFT
+        c.alignment = Alignment(horizontal="right", vertical="center")
 
-        # R7 — Closing Costs (C7 INPUT %, D7 + E7 FORMULAS)
-        ws0.cell(row=7, column=1, value="Less Closing Costs").font = _LABEL_FONT
-        c = ws0.cell(row=7, column=3, value=pb["closing_pct"]); c.number_format = "0.00%"; c.fill = INPUT_FILL; c.border = _THIN_BORDER
-        c = ws0.cell(row=7, column=4, value="=E6*C7"); c.number_format = '"$"#,##0'; c.border = _THIN_BORDER
-        c = ws0.cell(row=7, column=5, value="=E6-D7"); c.number_format = '"$"#,##0'; c.border = _THIN_BORDER
+        # ── R7 Closing Costs ──
+        _pb_label(ws0, 7, "Less Closing Costs")
+        _pb_input(ws0, 7, 3, pb["closing_pct"], _PB_FILL_P1T, "0.00%")
+        for col_num, formula in [(4, "=E6*C7"), (5, "=E6-D7")]:
+            c = ws0.cell(row=7, column=col_num, value=formula)
+            c.number_format = '"$"#,##0'
+            c.font = Font(name="Consolas", size=11, color=_PB_INK_FAINT, italic=True)
+            c.alignment = Alignment(horizontal="right", vertical="center")
+            c.border = _PB_BORDER_BOTTOM_SOFT
 
-        # R8 — Repairs (D8 INPUT, E8 FORMULA)
-        ws0.cell(row=8, column=1, value="Less Repairs").font = _LABEL_FONT
-        # D8 — Repairs input (red fill 2026-06-10 per user request for at-a-glance review)
-        c = ws0.cell(row=8, column=4, value=pb["repairs"]); c.number_format = '"$"#,##0'; c.fill = _RED_FILL; c.border = _THIN_BORDER
-        c = ws0.cell(row=8, column=5, value="=E7-D8"); c.number_format = '"$"#,##0'; c.border = _THIN_BORDER
+        # ── R8 Repairs (RED input — at-a-glance rehab convention) ──
+        _pb_label(ws0, 8, "Less Repairs")
+        c = ws0.cell(row=8, column=4, value=pb["repairs"]); c.number_format = '"$"#,##0'
+        c.fill = _RED_FILL; c.border = _PB_BORDER_BOTTOM_SOFT
+        c.font = Font(name="Consolas", bold=True, size=11, color=_PB_INK)
+        c.alignment = Alignment(horizontal="right", vertical="center")
+        c = ws0.cell(row=8, column=5, value="=E7-D8"); c.number_format = '"$"#,##0'
+        c.font = Font(name="Consolas", size=11, color=_PB_INK_FAINT, italic=True)
+        c.alignment = Alignment(horizontal="right", vertical="center")
+        c.border = _PB_BORDER_BOTTOM_SOFT
 
-        # R9 — Holding Costs → All-In (C9 INPUT %, D9 + E9 FORMULAS)
-        ws0.cell(row=9, column=1, value="Holding Costs (= All-In)").font = Font(name="Calibri", bold=True, size=12, color="2F5496")
-        c = ws0.cell(row=9, column=3, value=pb["holding_pct"]); c.number_format = "0.00%"; c.fill = INPUT_FILL; c.border = _THIN_BORDER
-        c = ws0.cell(row=9, column=4, value="=E6*C9"); c.number_format = '"$"#,##0'; c.border = _THIN_BORDER
-        c = ws0.cell(row=9, column=5, value="=E8-D9"); c.number_format = '"$"#,##0'; c.fill = _YELLOW_FILL; c.font = Font(name="Calibri", bold=True, size=13); c.border = _THIN_BORDER
+        # ── R9 Holding → All-In (highlighted running total in money-tint) ──
+        _pb_label(ws0, 9, "Holding Costs (= All-In)")
+        _pb_input(ws0, 9, 3, pb["holding_pct"], _PB_FILL_P1T, "0.00%")
+        c = ws0.cell(row=9, column=4, value="=E6*C9"); c.number_format = '"$"#,##0'
+        c.font = Font(name="Consolas", size=11, color=_PB_INK_FAINT, italic=True)
+        c.alignment = Alignment(horizontal="right", vertical="center"); c.border = _PB_BORDER_BOTTOM_SOFT
+        c = ws0.cell(row=9, column=5, value="=E8-D9"); c.number_format = '"$"#,##0'
+        c.fill = _PB_FILL_P1T; c.border = _PB_BORDER_BOTTOM_SOFT
+        c.font = Font(name="Consolas", bold=True, size=13, color=_PB_INK)
+        c.alignment = Alignment(horizontal="right", vertical="center")
 
-        # Reordered 2026-05-31: Potential Profit + Profit % above the Contract block
-        # so the headline result reads first, contract derivation reads as supporting.
+        # ── R11 Potential Profit (money-tint if positive, red if negative) ──
+        profit_fill = _PB_FILL_MONEY_TINT if pb["potential_profit"] > 0 else _RED_FILL
+        profit_color = _PB_MONEY if pb["potential_profit"] > 0 else "9C0006"
+        _pb_label(ws0, 11, "Potential Profit")
+        c = ws0.cell(row=11, column=5, value="=E9-E16"); c.number_format = '"$"#,##0;[Red]-"$"#,##0'
+        c.font = Font(name="Consolas", bold=True, size=13, color=profit_color)
+        c.fill = profit_fill; c.border = _PB_BORDER_BOTTOM_SOFT
+        c.alignment = Alignment(horizontal="right", vertical="center")
 
-        # R11 — Potential Profit (FORMULA) — references new Contract Buyer at E16
-        profit_fill = _GREEN_FILL if pb["potential_profit"] > 0 else _RED_FILL
-        ws0.cell(row=11, column=1, value="Potential Profit").font = Font(name="Calibri", bold=True, size=12, color="2F5496")
-        c = ws0.cell(row=11, column=5, value="=E9-E16"); c.number_format = '"$"#,##0;[Red]-"$"#,##0'; c.font = Font(name="Calibri", bold=True, size=13); c.fill = profit_fill; c.border = _THIN_BORDER
-
-        # R12 — Profit % (actual, formula at E12) + editable Target % (input at C12)
-        ws0.cell(row=12, column=1, value="Profit % (FOR DISPO)").font = Font(name="Calibri", bold=True, size=12, color="2F5496")
-        # C12 — editable target profit % input. Headline at E4 + Contract Seller default
-        # both reference this cell. Edit C12 → MAO + Contract Seller + actual Profit % all snap.
+        # ── R12 Profit % (editable target C12 + actual E12) ──
+        _pb_label(ws0, 12, "Profit % (FOR DISPO)")
         target_cell = ws0.cell(row=12, column=3, value=DEFAULT_FLIP_TARGET_PROFIT_PCT)
         target_cell.number_format = "0.00%"
-        target_cell.font = Font(name="Calibri", bold=True, size=12, color="006100")
-        target_cell.fill = INPUT_FILL
+        target_cell.font = Font(name="Consolas", bold=True, size=11, color=_PB_MONEY)
+        target_cell.fill = _PB_FILL_P1T
         target_cell.alignment = Alignment(horizontal="center", vertical="center")
-        target_cell.border = _THIN_BORDER
-        # Label between C12 (target) and E12 (actual) for visual context
-        ws0.cell(row=12, column=4, value="← target | actual →").font = Font(name="Calibri", italic=True, size=9, color="555555")
-        ws0.cell(row=12, column=4).alignment = Alignment(horizontal="center")
-        # E12 — actual computed profit %
-        c = ws0.cell(row=12, column=5, value="=IFERROR(E11/E6,0)"); c.number_format = "0.00%"; c.font = Font(name="Calibri", bold=True, size=13); c.fill = profit_fill; c.border = _THIN_BORDER
+        target_cell.border = _PB_BORDER_BOTTOM_SOFT
+        c = ws0.cell(row=12, column=4, value="← target | actual →")
+        c.font = Font(name="Calibri", italic=True, size=9, color=_PB_INK_FAINT)
+        c.alignment = Alignment(horizontal="center")
+        c = ws0.cell(row=12, column=5, value="=IFERROR(E11/E6,0)"); c.number_format = "0.00%"
+        c.font = Font(name="Consolas", bold=True, size=13, color=profit_color)
+        c.fill = profit_fill; c.border = _PB_BORDER_BOTTOM_SOFT
+        c.alignment = Alignment(horizontal="right", vertical="center")
 
-        # R14 — Contract Price to Seller (defaults to headline MAO via =E4, but
-        # user can override by typing a static value to model "what if I offer $X?")
-        ws0.cell(row=14, column=1, value="Contract Price to Seller").font = _LABEL_FONT
-        c = ws0.cell(row=14, column=5, value="=E4"); c.number_format = '"$"#,##0'; c.fill = INPUT_FILL; c.border = _THIN_BORDER
+        # ── R14-R16 Contract block ──
+        _pb_label(ws0, 14, "Contract Price to Seller")
+        c = ws0.cell(row=14, column=5, value="=E4"); c.number_format = '"$"#,##0'
+        c.fill = _PB_FILL_P1T; c.border = _PB_BORDER_BOTTOM_SOFT
+        c.font = Font(name="Consolas", bold=True, size=11, color=_PB_INK)
+        c.alignment = Alignment(horizontal="right", vertical="center")
+        _pb_label(ws0, 15, "Your Wholesale Fee")
+        _pb_input(ws0, 15, 5, pb["wholesale_fee"], _PB_FILL_P1T)
+        _pb_label(ws0, 16, "Contract Price to Buyer")
+        c = ws0.cell(row=16, column=5, value="=E14+E15"); c.number_format = '"$"#,##0'
+        c.font = Font(name="Consolas", bold=True, size=12, color=_PB_INK)
+        c.alignment = Alignment(horizontal="right", vertical="center"); c.border = _PB_BORDER_BOTTOM_SOFT
 
-        # R15 — Wholesale Fee (INPUT)
-        ws0.cell(row=15, column=1, value="Your Wholesale Fee").font = _LABEL_FONT
-        c = ws0.cell(row=15, column=5, value=pb["wholesale_fee"]); c.number_format = '"$"#,##0'; c.fill = INPUT_FILL; c.border = _THIN_BORDER
+        # ── R18-R22 Buyer Ceiling Lookup (uppercase eyebrow section) ──
+        c = ws0.cell(row=18, column=1, value="BUYER CEILING LOOKUP  ·  MAX CONTRACT PRICE AT EACH PROFIT TARGET")
+        c.font = Font(name="Calibri", bold=True, size=9, color=_PB_INK_MUTE)
+        for col in range(1, 6):
+            ws0.cell(row=18, column=col).border = _PB_BORDER_BOTTOM_RULE
+        ws0.row_dimensions[18].height = 20
+        c = ws0.cell(row=19, column=1, value="Edit ARV / Closing % / Repairs / Holding % / WS Fee above → these recalc live.")
+        c.font = Font(name="Georgia", italic=True, size=10, color=_PB_INK_MUTE)
 
-        # R16 — Contract Price to Buyer (FORMULA) — = Seller + WS Fee
-        ws0.cell(row=16, column=1, value="Contract Price to Buyer").font = Font(name="Calibri", bold=True, size=12, color="2F5496")
-        c = ws0.cell(row=16, column=5, value="=E14+E15"); c.number_format = '"$"#,##0'; c.font = Font(name="Calibri", bold=True, size=12); c.border = _THIN_BORDER
-
-        # R18+ — Buyer Ceiling Lookup mini-table (WS Fee now at E15, was E12)
-        ws0.cell(row=18, column=1, value="── BUYER CEILING LOOKUP (max contract price at each profit target) ──").font = Font(name="Calibri", bold=True, size=13, color="2F5496")
-        ws0.cell(row=19, column=1, value="Edit ARV / Closing % / Repairs / Holding % / WS Fee above → these recalc live.").font = _LABEL_FONT
-        for offset, (label, target_pct, fill) in enumerate([
-            ("At 15% profit target (default / typical disp)", 0.15, _GREEN_FILL),
-            ("At 20% profit target (moderate / hard-money flipper)", 0.20, _YELLOW_FILL),
+        for offset, (label, target_pct, tint) in enumerate([
+            ("At 15% profit target (default / typical disp)", 0.15, _PB_FILL_MONEY_TINT),
+            ("At 20% profit target (moderate / hard-money flipper)", 0.20, _PB_FILL_P1T),
             ("At 25% profit target (conservative / heavy rehab)", 0.25, None),
         ]):
             row = 20 + offset
-            ws0.cell(row=row, column=1, value=label).font = _LABEL_FONT
-            # MAO formula: ARV × (1 - closing% - holding% - target%) - Repairs - WS Fee
+            _pb_label(ws0, row, label)
             formula = f"=E6*(1-C7-C9-{target_pct})-D8-E15"
             c = ws0.cell(row=row, column=5, value=formula)
             c.number_format = '"$"#,##0'
-            c.font = Font(name="Calibri", bold=True, size=12)
-            if fill: c.fill = fill
-            c.border = _THIN_BORDER
+            c.font = Font(name="Consolas", bold=True, size=12, color=_PB_INK)
+            c.alignment = Alignment(horizontal="right", vertical="center")
+            c.border = _PB_BORDER_BOTTOM_SOFT
+            if tint: c.fill = tint
 
-        # Footnote
-        ws0.cell(row=25, column=1, value="🟨 Yellow-filled cells are INPUTS — edit them and all formulas update.").font = Font(name="Calibri", italic=True, size=10, color="555555")
+        # ── R25 footnote (small uppercase eyebrow) ──
+        c = ws0.cell(row=25, column=1, value="RED FILL (D8) = REHAB INPUT  ·  RED/GOLD-TINT CELLS ARE EDITABLE  ·  RUNNING TOTALS UPDATE LIVE")
+        c.font = Font(name="Calibri", bold=True, size=9, color=_PB_INK_FAINT)
 
         # ── MAO Summary block (rows 27-31) — quick-glance cross-strategy comparison.
         # C29/C30/C31 are the CANONICAL source-of-truth inputs for target profit %,
@@ -1076,8 +1106,13 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
         # Calc tab — that would create a circular ref since MAO Calc B8/B17/B25
         # now reference back here). Other inputs (ARV/closing/holding/rehab/WS fee)
         # still pull from MAO Calc tab.
-        ws0.cell(row=27, column=1, value="── EXIT STRATEGY MAO SUMMARY (edit C29/C30/C31 → MAO Calc tab updates too) ──").font = Font(name="Calibri", bold=True, size=13, color="2F5496")
-        ws0.cell(row=28, column=1, value="C29/C30/C31 are the canonical inputs. MAO Calc B8/B17/B25 mirror these cells.").font = Font(name="Calibri", italic=True, size=10, color="555555")
+        c = ws0.cell(row=27, column=1, value="EXIT STRATEGY MAO SUMMARY  ·  EDIT C29/C30/C31 → MAO CALC UPDATES TOO")
+        c.font = Font(name="Calibri", bold=True, size=9, color=_PB_INK_MUTE)
+        for col in range(1, 6):
+            ws0.cell(row=27, column=col).border = _PB_BORDER_BOTTOM_RULE
+        ws0.row_dimensions[27].height = 20
+        c = ws0.cell(row=28, column=1, value="C29/C30/C31 are the canonical inputs. MAO Calc B13/B25/B36 mirror these cells.")
+        c.font = Font(name="Georgia", italic=True, size=10, color=_PB_INK_MUTE)
 
         # (label, editable_default, input_fmt, input_label, mao_formula, fill)
         # mao_formula references local Cnn (NOT MAO Calc) to avoid circular refs.
@@ -1183,8 +1218,11 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
     # ⚠️ FRAGILE: source-row mapping assumes Comp Analysis methodology block has
     # 9 lines (revised 2026-06-09 added 3 lines for PPSF tier methodology).
     # If you add/remove methodology lines, MUST update COMP_HDR_SRC_ROW.
-    ws0.cell(row=13, column=SC, value="── SOLD ARV COMP SNIPPET (top 10 by similarity — top 5 green = used for ARV) ──").font = Font(
-        name="Calibri", bold=True, size=12, color="2F5496")
+    c = ws0.cell(row=13, column=SC, value="SOLD ARV COMP SNIPPET  ·  TOP 10 BY SIMILARITY  ·  TOP 5 GREEN = USED FOR ARV")
+    c.font = Font(name="Calibri", bold=True, size=9, color=_PB_INK_MUTE)
+    for col in range(SC, SC + 11):
+        ws0.cell(row=13, column=col).border = _PB_BORDER_BOTTOM_RULE
+    ws0.row_dimensions[13].height = 20
     HYPERLINK_FONT = Font(name="Calibri", size=10, color="0563C1", underline="single")
     USED_FILL_SNIPPET = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
     _comps_for_links = sorted(pkg.comps or [], key=lambda c: -c.similarity_score)[:10]
@@ -1266,8 +1304,11 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
     # List prices, not sold prices — these show where the market is heading next.
     # Written directly from pkg.pending_comps (no cross-sheet ref to keep this block
     # decoupled from Comp Analysis layout shifts).
-    ws0.cell(row=27, column=SC, value="── PENDING / CONTINGENT LISTINGS (under-contract — Redfin MLS data) ──").font = Font(
-        name="Calibri", bold=True, size=12, color="2F5496")
+    c = ws0.cell(row=27, column=SC, value="PENDING / CONTINGENT LISTINGS  ·  UNDER-CONTRACT  ·  REDFIN MLS DATA")
+    c.font = Font(name="Calibri", bold=True, size=9, color=_PB_INK_MUTE)
+    for col in range(SC, SC + 9):
+        ws0.cell(row=27, column=col).border = _PB_BORDER_BOTTOM_RULE
+    ws0.row_dimensions[27].height = 20
     pending_headers = ["Address", "Distance", "List Price", "Sqft", "Bd/Ba", "Year", "PPSF", "DOM", "Status"]
     for col_off, h in enumerate(pending_headers):
         c = ws0.cell(row=28, column=SC + col_off, value=h)
@@ -1369,10 +1410,13 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
         )
 
     # ── DEAL TYPE RECOMMENDATION (rows 33-39) — moved to column A under MAO Summary ──
-    ws0.cell(row=33, column=1, value="── DEAL TYPE RECOMMENDATION (Fix-n-Flip vs Rental vs Both) ──").font = Font(
-        name="Calibri", bold=True, size=12, color="2F5496")
+    c = ws0.cell(row=33, column=1, value="DEAL TYPE RECOMMENDATION  ·  FIX-N-FLIP  ·  RENTAL  ·  BOTH")
+    c.font = Font(name="Calibri", bold=True, size=9, color=_PB_INK_MUTE)
+    for col in range(1, 8):
+        ws0.cell(row=33, column=col).border = _PB_BORDER_BOTTOM_RULE
+    ws0.row_dimensions[33].height = 20
     vcell = ws0.cell(row=34, column=1, value=f"VERDICT: {verdict}")
-    vcell.font = Font(name="Calibri", bold=True, size=14, color=verdict_color)
+    vcell.font = Font(name="Georgia", bold=True, size=16, color=verdict_color)
     vcell.fill = verdict_fill
     ws0.cell(row=35, column=1, value=(
         f"Sold comps: {sold_count}  ·  Rental comps: {rental_count}  ·  Pending: {len(pendings_local)}  ·  "
@@ -1391,8 +1435,11 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
     # Just the headline rent + rent% from Rental Calculator tab. Full comp table
     # moved to the right-side I area at row 37 (under the pending block).
     if pkg.rental_breakdown:
-        ws0.cell(row=41, column=1, value="── RENTAL SNIPPET (Monthly Rent + Rent % from Rental Calculator) ──").font = Font(
-            name="Calibri", bold=True, size=12, color="2F5496")
+        c = ws0.cell(row=41, column=1, value="RENTAL SNIPPET  ·  MONTHLY RENT + RENT %  ·  LIVE FROM RENTAL CALCULATOR")
+        c.font = Font(name="Calibri", bold=True, size=9, color=_PB_INK_MUTE)
+        for col in range(1, 8):
+            ws0.cell(row=41, column=col).border = _PB_BORDER_BOTTOM_RULE
+        ws0.row_dimensions[41].height = 20
 
         # Row 42 — Monthly Rent (label A:C merged, value at E to align with deal-math layout)
         lbl = ws0.cell(row=42, column=1, value="='Rental Calculator'!A18")
@@ -1670,144 +1717,204 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
         ws_n.column_dimensions["D"].width = 16
         ws_n.column_dimensions["E"].width = 22
 
-    # ── Tab 4: Rental Calculator (mirrors Profit Calc layout) ─────────
+    # ── Tab 5: Rental Calculator — beautified 2026-06-13 with P3 blue-gray aesthetic ──
+    # IN-PLACE restyle: all cell coordinates preserved (E4 headline, E6 ARV, C7 closing%,
+    # C9 holding%, D8 repairs, C12 target equity%, E15 WS fee, E18 rent, E19 rent%,
+    # A21/A22 comp section headers, B23:F29 comp table). The Profit Calc rental snippet
+    # cross-refs these exact cells — moving them would break the snippet.
     if pkg.rental_breakdown:
         rb = pkg.rental_breakdown
         ws_r = wb.create_sheet("Rental Calculator")
-        ws_r.cell(row=1, column=1, value="Rental Calculator (Hold for Cashflow)").font = _TITLE_FONT
-        ws_r.cell(row=2, column=1, value=addr).font = _SUBTITLE_FONT
-        ws_r.cell(row=3, column=1, value=f"Market tier: {rb['market_tier']} · Tier rent % range {rb['tier_min_rent_pct']*100:.1f}%-{rb['tier_max_rent_pct']*100:.1f}% · 🟨 yellow cells are editable").font = _LABEL_FONT
 
-        # ── R4 HEADLINE — MAO at editable target equity % (mirrors Profit Calc) ──
-        ws_r.cell(row=4, column=1, value="🎯 RECOMMENDED MAX OFFER (rental — at target equity % set below)").font = Font(
-            name="Calibri", bold=True, size=14, color="006100")
-        ws_r.cell(row=4, column=1).fill = HEADLINE_FILL
-        ws_r.cell(row=4, column=1).alignment = Alignment(horizontal="left", vertical="center")
-        # E4 — MAO formula references C12 (editable target equity)
+        # ── R1-3 Editorial hero (Georgia serif, uppercase eyebrow) ──
+        c = ws_r.cell(row=1, column=1, value="RENTAL CALCULATOR  ·  HOLD FOR CASHFLOW")
+        c.font = Font(name="Calibri", bold=True, size=9, color=_PB_INK_MUTE)
+        ws_r.row_dimensions[1].height = 20
+        c = ws_r.cell(row=2, column=1, value="Rental Hold")
+        c.font = Font(name="Georgia", bold=True, size=28, color=_PB_INK)
+        ws_r.merge_cells(start_row=2, end_row=2, start_column=1, end_column=6)
+        ws_r.row_dimensions[2].height = 40
+        subj_line = f"{pkg.subject.address}, {pkg.subject.city}, {pkg.subject.state} {pkg.subject.zip_code}  ·  Market tier {rb['market_tier']}  ·  Rent % target {rb['tier_min_rent_pct']*100:.1f}%-{rb['tier_max_rent_pct']*100:.1f}%"
+        c = ws_r.cell(row=3, column=1, value=subj_line)
+        c.font = Font(name="Georgia", italic=True, size=12, color=_PB_INK_MUTE)
+        ws_r.merge_cells(start_row=3, end_row=3, start_column=1, end_column=6)
+        ws_r.row_dimensions[3].height = 22
+
+        # ── R4 HEADLINE — MAO in money-tint, mono value ──
+        c = ws_r.cell(row=4, column=1, value="  RECOMMENDED MAX OFFER  ·  AT TARGET EQUITY %")
+        c.font = Font(name="Calibri", bold=True, size=9, color=_PB_MONEY)
+        c.fill = _PB_FILL_MONEY_TINT
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        for col in range(2, 5):
+            ws_r.cell(row=4, column=col).fill = _PB_FILL_MONEY_TINT
         headline = ws_r.cell(row=4, column=5, value="=E6*(1-C7-C9-C12)-D8-E15")
         headline.number_format = '"$"#,##0'
-        headline.font = Font(name="Calibri", bold=True, size=16, color="006100")
-        headline.fill = HEADLINE_FILL
+        headline.font = Font(name="Consolas", bold=True, size=18, color=_PB_MONEY)
+        headline.fill = _PB_FILL_MONEY_TINT
         headline.alignment = Alignment(horizontal="right", vertical="center")
-        ws_r.row_dimensions[4].height = 28
+        ws_r.row_dimensions[4].height = 32
 
-        r = 5
-        for col, h in enumerate(["", "", "%", "Amount", "Running"], 1):
-            cell = ws_r.cell(row=r, column=col, value=h)
-            if h: cell.font = _HEADER_FONT; cell.fill = _HEADER_FILL; cell.alignment = _HEADER_ALIGN
+        # ── R5 column labels (uppercase small) ──
+        _pb_col_headers(ws_r, 5, [(3, "%"), (4, "AMOUNT"), (5, "RUNNING")])
 
-        # R6 — ARV / CMV (INPUT)
-        ws_r.cell(row=6, column=1, value="ARV / CMV").font = Font(name="Calibri", bold=True, size=12, color="2F5496")
-        c = ws_r.cell(row=6, column=5, value=rb["arv"]); c.number_format = '"$"#,##0'; c.font = Font(name="Calibri", bold=True, size=12); c.fill = INPUT_FILL; c.border = _THIN_BORDER
+        # ── R6 ARV / CMV (P3 tint) ──
+        _pb_label(ws_r, 6, "ARV / CMV")
+        c = ws_r.cell(row=6, column=5, value=rb["arv"]); c.number_format = '"$"#,##0'
+        c.font = Font(name="Consolas", bold=True, size=11, color=_PB_INK)
+        c.fill = _PB_FILL_P3T; c.border = _PB_BORDER_BOTTOM_SOFT
+        c.alignment = Alignment(horizontal="right", vertical="center")
 
-        # R7 — Closing Costs (INPUT %, FORMULAS)
-        ws_r.cell(row=7, column=1, value="Less Closing Costs").font = _LABEL_FONT
-        c = ws_r.cell(row=7, column=3, value=rb["closing_pct"]); c.number_format = "0.00%"; c.fill = INPUT_FILL; c.border = _THIN_BORDER
-        c = ws_r.cell(row=7, column=4, value="=E6*C7"); c.number_format = '"$"#,##0'; c.border = _THIN_BORDER
-        c = ws_r.cell(row=7, column=5, value="=E6-D7"); c.number_format = '"$"#,##0'; c.border = _THIN_BORDER
+        # ── R7 Closing Costs (P3 tint) ──
+        _pb_label(ws_r, 7, "Less Closing Costs")
+        _pb_input(ws_r, 7, 3, rb["closing_pct"], _PB_FILL_P3T, "0.00%")
+        for col_num, formula in [(4, "=E6*C7"), (5, "=E6-D7")]:
+            c = ws_r.cell(row=7, column=col_num, value=formula)
+            c.number_format = '"$"#,##0'
+            c.font = Font(name="Consolas", size=11, color=_PB_INK_FAINT, italic=True)
+            c.alignment = Alignment(horizontal="right", vertical="center")
+            c.border = _PB_BORDER_BOTTOM_SOFT
 
-        # R8 — Repairs (INPUT)
-        ws_r.cell(row=8, column=1, value="Less Repairs").font = _LABEL_FONT
-        c = ws_r.cell(row=8, column=4, value=rb["repairs"]); c.number_format = '"$"#,##0'; c.fill = INPUT_FILL; c.border = _THIN_BORDER
-        c = ws_r.cell(row=8, column=5, value="=E7-D8"); c.number_format = '"$"#,##0'; c.border = _THIN_BORDER
+        # ── R8 Repairs (RED fill — matches Profit Calc D8) ──
+        _pb_label(ws_r, 8, "Less Repairs")
+        c = ws_r.cell(row=8, column=4, value=rb["repairs"]); c.number_format = '"$"#,##0'
+        c.fill = _RED_FILL; c.border = _PB_BORDER_BOTTOM_SOFT
+        c.font = Font(name="Consolas", bold=True, size=11, color=_PB_INK)
+        c.alignment = Alignment(horizontal="right", vertical="center")
+        c = ws_r.cell(row=8, column=5, value="=E7-D8"); c.number_format = '"$"#,##0'
+        c.font = Font(name="Consolas", size=11, color=_PB_INK_FAINT, italic=True)
+        c.alignment = Alignment(horizontal="right", vertical="center")
+        c.border = _PB_BORDER_BOTTOM_SOFT
 
-        # R9 — Holding Costs → All-In (INPUT %, FORMULAS)
-        ws_r.cell(row=9, column=1, value="Holding Costs (= All-In)").font = Font(name="Calibri", bold=True, size=12, color="2F5496")
-        c = ws_r.cell(row=9, column=3, value=rb["holding_pct"]); c.number_format = "0.00%"; c.fill = INPUT_FILL; c.border = _THIN_BORDER
-        c = ws_r.cell(row=9, column=4, value="=E6*C9"); c.number_format = '"$"#,##0'; c.border = _THIN_BORDER
-        c = ws_r.cell(row=9, column=5, value="=E8-D9"); c.number_format = '"$"#,##0'; c.fill = _YELLOW_FILL; c.font = Font(name="Calibri", bold=True, size=13); c.border = _THIN_BORDER
+        # ── R9 Holding → All-In (highlighted running total) ──
+        _pb_label(ws_r, 9, "Holding Costs (= All-In)")
+        _pb_input(ws_r, 9, 3, rb["holding_pct"], _PB_FILL_P3T, "0.00%")
+        c = ws_r.cell(row=9, column=4, value="=E6*C9"); c.number_format = '"$"#,##0'
+        c.font = Font(name="Consolas", size=11, color=_PB_INK_FAINT, italic=True)
+        c.alignment = Alignment(horizontal="right", vertical="center"); c.border = _PB_BORDER_BOTTOM_SOFT
+        c = ws_r.cell(row=9, column=5, value="=E8-D9"); c.number_format = '"$"#,##0'
+        c.fill = _PB_FILL_P3T; c.border = _PB_BORDER_BOTTOM_SOFT
+        c.font = Font(name="Consolas", bold=True, size=13, color=_PB_INK)
+        c.alignment = Alignment(horizontal="right", vertical="center")
 
-        # ── R11-R12 reordered ABOVE Contract block (mirrors Profit Calc) ──
-        eq_fill = _GREEN_FILL if rb["equity_ok"] else _RED_FILL
+        # ── R11-R12 Equity block (money-tint if in target, red if not) ──
+        eq_fill = _PB_FILL_MONEY_TINT if rb["equity_ok"] else _RED_FILL
+        eq_color = _PB_MONEY if rb["equity_ok"] else "9C0006"
+        _pb_label(ws_r, 11, "Equity (All-In minus Contract+WS)")
+        c = ws_r.cell(row=11, column=5, value="=E9-E16"); c.number_format = '"$"#,##0;[Red]-"$"#,##0'
+        c.font = Font(name="Consolas", bold=True, size=13, color=eq_color)
+        c.fill = eq_fill; c.border = _PB_BORDER_BOTTOM_SOFT
+        c.alignment = Alignment(horizontal="right", vertical="center")
 
-        # R11 — Equity (FORMULA) — references new Contract Buyer at E16
-        ws_r.cell(row=11, column=1, value="Equity (All-In minus Contract+WS)").font = Font(name="Calibri", bold=True, size=12, color="2F5496")
-        c = ws_r.cell(row=11, column=5, value="=E9-E16"); c.number_format = '"$"#,##0;[Red]-"$"#,##0'; c.font = Font(name="Calibri", bold=True, size=13); c.fill = eq_fill; c.border = _THIN_BORDER
-
-        # R12 — Equity % + editable Target Equity % at C12 (mirrors Profit Calc C12 pattern)
-        ws_r.cell(row=12, column=1, value="Equity Percentage").font = Font(name="Calibri", bold=True, size=12, color="2F5496")
-        # C12 — editable target equity % (default 20%)
+        _pb_label(ws_r, 12, "Equity Percentage")
         target_eq = ws_r.cell(row=12, column=3, value=DEFAULT_TARGET_EQUITY_PCT)
         target_eq.number_format = "0.00%"
-        target_eq.font = Font(name="Calibri", bold=True, size=12, color="006100")
-        target_eq.fill = INPUT_FILL
+        target_eq.font = Font(name="Consolas", bold=True, size=11, color=_PB_MONEY)
+        target_eq.fill = _PB_FILL_P3T; target_eq.border = _PB_BORDER_BOTTOM_SOFT
         target_eq.alignment = Alignment(horizontal="center", vertical="center")
-        target_eq.border = _THIN_BORDER
-        ws_r.cell(row=12, column=4, value="← target | actual →").font = Font(name="Calibri", italic=True, size=9, color="555555")
-        ws_r.cell(row=12, column=4).alignment = Alignment(horizontal="center")
-        # E12 — actual computed equity %
-        c = ws_r.cell(row=12, column=5, value="=IFERROR(E11/E6,0)"); c.number_format = "0.00%"; c.font = Font(name="Calibri", bold=True, size=13); c.fill = eq_fill; c.border = _THIN_BORDER
+        c = ws_r.cell(row=12, column=4, value="← target | actual →")
+        c.font = Font(name="Calibri", italic=True, size=9, color=_PB_INK_FAINT)
+        c.alignment = Alignment(horizontal="center")
+        c = ws_r.cell(row=12, column=5, value="=IFERROR(E11/E6,0)"); c.number_format = "0.00%"
+        c.font = Font(name="Consolas", bold=True, size=13, color=eq_color)
+        c.fill = eq_fill; c.border = _PB_BORDER_BOTTOM_SOFT
+        c.alignment = Alignment(horizontal="right", vertical="center")
 
-        # R14 — Contract Price to Seller (defaults to =E4 like Profit Calc)
-        ws_r.cell(row=14, column=1, value="Contract Price to Seller").font = _LABEL_FONT
-        c = ws_r.cell(row=14, column=5, value="=E4"); c.number_format = '"$"#,##0'; c.fill = INPUT_FILL; c.border = _THIN_BORDER
+        # ── R14-R16 Contract block ──
+        _pb_label(ws_r, 14, "Contract Price to Seller")
+        c = ws_r.cell(row=14, column=5, value="=E4"); c.number_format = '"$"#,##0'
+        c.fill = _PB_FILL_P3T; c.border = _PB_BORDER_BOTTOM_SOFT
+        c.font = Font(name="Consolas", bold=True, size=11, color=_PB_INK)
+        c.alignment = Alignment(horizontal="right", vertical="center")
+        _pb_label(ws_r, 15, "Wholesale Fee")
+        _pb_input(ws_r, 15, 5, rb["wholesale_fee"], _PB_FILL_P3T)
+        _pb_label(ws_r, 16, "Contract Price to Buyer")
+        c = ws_r.cell(row=16, column=5, value="=E14+E15"); c.number_format = '"$"#,##0'
+        c.font = Font(name="Consolas", bold=True, size=12, color=_PB_INK)
+        c.alignment = Alignment(horizontal="right", vertical="center"); c.border = _PB_BORDER_BOTTOM_SOFT
 
-        # R15 — Wholesale Fee (INPUT)
-        ws_r.cell(row=15, column=1, value="Wholesale Fee").font = _LABEL_FONT
-        c = ws_r.cell(row=15, column=5, value=rb["wholesale_fee"]); c.number_format = '"$"#,##0'; c.fill = INPUT_FILL; c.border = _THIN_BORDER
+        # ── R18 Monthly Rent + R19 Rent % (cross-sheet refs land here) ──
+        _pb_label(ws_r, 18, "Monthly Rent (Zillow est — validate via comps below)")
+        _pb_input(ws_r, 18, 5, rb["monthly_rent"] or 0, _PB_FILL_P3T)
+        rent_fill = _PB_FILL_MONEY_TINT if rb.get("rent_pct_ok") else _RED_FILL
+        rent_color = _PB_MONEY if rb.get("rent_pct_ok") else "9C0006"
+        _pb_label(ws_r, 19, f"Rent % of All-In (Market {rb['market_tier']} target {rb['tier_min_rent_pct']*100:.1f}%+)")
+        c = ws_r.cell(row=19, column=5, value="=IFERROR(E18/E9,0)"); c.number_format = "0.00%"
+        c.font = Font(name="Consolas", bold=True, size=13, color=rent_color)
+        c.fill = rent_fill; c.border = _PB_BORDER_BOTTOM_SOFT
+        c.alignment = Alignment(horizontal="right", vertical="center")
 
-        # R16 — Contract Price to Buyer (FORMULA) — =E14+E15
-        ws_r.cell(row=16, column=1, value="Contract Price to Buyer").font = Font(name="Calibri", bold=True, size=12, color="2F5496")
-        c = ws_r.cell(row=16, column=5, value="=E14+E15"); c.number_format = '"$"#,##0'; c.font = Font(name="Calibri", bold=True, size=12); c.border = _THIN_BORDER
+        # ── R21-R22 Rental comps section eyebrow + subhead ──
+        # NOTE: A21/A22 are referenced by Profit Calc rental snippet — preserve literal text.
+        c = ws_r.cell(row=21, column=1, value="── NEARBY RENTAL COMPS (validates Monthly Rent input at E18) ──")
+        c.font = Font(name="Calibri", bold=True, size=9, color=_PB_INK_MUTE)
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        for col in range(1, 7):
+            ws_r.cell(row=21, column=col).border = _PB_BORDER_BOTTOM_RULE
+        ws_r.row_dimensions[21].height = 20
+        c = ws_r.cell(row=22, column=1, value="Active FOR_RENT listings within 1 mi — click address for pics + listing detail")
+        c.font = Font(name="Georgia", italic=True, size=10, color=_PB_INK_MUTE)
 
-        # R18 — Monthly Rent (INPUT)
-        ws_r.cell(row=18, column=1, value="Monthly Rent (Zillow est — validate via comps below)").font = _LABEL_FONT
-        c = ws_r.cell(row=18, column=5, value=rb["monthly_rent"] or 0); c.number_format = '"$"#,##0'; c.fill = INPUT_FILL; c.border = _THIN_BORDER
-
-        # R19 — Rent % (FORMULA)
-        rent_fill = _GREEN_FILL if rb.get("rent_pct_ok") else _YELLOW_FILL
-        ws_r.cell(row=19, column=1, value=f"Rent % of All-In (Market {rb['market_tier']} target {rb['tier_min_rent_pct']*100:.1f}%+)").font = Font(name="Calibri", bold=True, size=12, color="2F5496")
-        c = ws_r.cell(row=19, column=5, value="=IFERROR(E18/E9,0)"); c.number_format = "0.00%"; c.font = Font(name="Calibri", bold=True, size=13); c.fill = rent_fill; c.border = _THIN_BORDER
-
-        # R21+ — RENTAL COMPS (active FOR_RENT listings within 1mi — clickable Zillow links)
-        ws_r.cell(row=21, column=1, value="── NEARBY RENTAL COMPS (validates Monthly Rent input at E18) ──").font = Font(name="Calibri", bold=True, size=12, color="2F5496")
-        ws_r.cell(row=22, column=1, value="Active FOR_RENT listings within 1 mi — click address for pics + listing detail").font = _LABEL_FONT
-        # Header row
+        # ── R23 comp table header (B23:F23 also referenced by Profit Calc snippet) ──
         rc_hdr_row = 23
         for off, h in enumerate(["#", "Address (click for Zillow)", "Rent/mo", "Sqft", "Bd/Ba", "Distance"]):
             c = ws_r.cell(row=rc_hdr_row, column=1 + off, value=h)
-            c.font = _HEADER_FONT; c.fill = _HEADER_FILL; c.alignment = _HEADER_ALIGN
-        # Comp rows
+            c.font = Font(name="Calibri", bold=True, size=8, color=_PB_INK_FAINT)
+            c.alignment = Alignment(horizontal="right" if off > 1 else "left", vertical="bottom", indent=1)
+            c.border = _PB_BORDER_BOTTOM_RULE
+
         HYPERLINK_FONT = Font(name="Calibri", size=11, color="0563C1", underline="single")
         rental_comps = pkg.rental_comps or []
         for i, rc in enumerate(rental_comps[:6], 1):
             rc_row = rc_hdr_row + i
-            ws_r.cell(row=rc_row, column=1, value=i).font = _LABEL_FONT
+            c = ws_r.cell(row=rc_row, column=1, value=i)
+            c.font = Font(name="Calibri", size=10, color=_PB_INK_FAINT); c.alignment = Alignment(horizontal="left", indent=1)
             addr_cell = ws_r.cell(row=rc_row, column=2, value=rc.get("address", ""))
             if rc.get("detail_url"):
                 addr_cell.hyperlink = rc["detail_url"]
                 addr_cell.font = HYPERLINK_FONT
             else:
-                addr_cell.font = _LABEL_FONT
-            c = ws_r.cell(row=rc_row, column=3, value=rc.get("rent", 0)); c.number_format = '"$"#,##0'; c.font = _LABEL_FONT
-            c = ws_r.cell(row=rc_row, column=4, value=rc.get("sqft", 0)); c.number_format = '#,##0'; c.font = _LABEL_FONT
-            c = ws_r.cell(row=rc_row, column=5, value=f"{rc.get('bedrooms', 0)}/{rc.get('bathrooms', 0)}"); c.font = _LABEL_FONT
-            c = ws_r.cell(row=rc_row, column=6, value=f"{rc.get('distance_miles', 0):.2f} mi"); c.font = _LABEL_FONT
+                addr_cell.font = Font(name="Calibri", size=11, color=_PB_INK)
+            c = ws_r.cell(row=rc_row, column=3, value=rc.get("rent", 0)); c.number_format = '"$"#,##0'
+            c.font = Font(name="Consolas", size=11, color=_PB_INK); c.alignment = Alignment(horizontal="right")
+            c = ws_r.cell(row=rc_row, column=4, value=rc.get("sqft", 0)); c.number_format = '#,##0'
+            c.font = Font(name="Consolas", size=11, color=_PB_INK); c.alignment = Alignment(horizontal="right")
+            c = ws_r.cell(row=rc_row, column=5, value=f"{rc.get('bedrooms', 0)}/{rc.get('bathrooms', 0)}")
+            c.font = Font(name="Consolas", size=11, color=_PB_INK); c.alignment = Alignment(horizontal="right")
+            c = ws_r.cell(row=rc_row, column=6, value=f"{rc.get('distance_miles', 0):.2f} mi")
+            c.font = Font(name="Consolas", size=11, color=_PB_INK); c.alignment = Alignment(horizontal="right")
             for col in range(1, 7):
-                ws_r.cell(row=rc_row, column=col).border = _THIN_BORDER
+                ws_r.cell(row=rc_row, column=col).border = _PB_BORDER_BOTTOM_SOFT
         if not rental_comps:
-            ws_r.cell(row=rc_hdr_row + 1, column=1, value="(No active rental listings returned from Zillow for this ZIP within 1 mi.)").font = _LABEL_FONT
+            c = ws_r.cell(row=rc_hdr_row + 1, column=1, value="(No active rental listings returned from Zillow for this ZIP within 1 mi.)")
+            c.font = Font(name="Georgia", italic=True, size=10, color=_PB_INK_MUTE)
 
-        # R31+ — RENTAL MAO LOOKUP at 10/15/20% target equity (was 15/20/25%)
-        mao_start_row = rc_hdr_row + 8  # leave room for up to 6 comps + buffer
-        ws_r.cell(row=mao_start_row, column=1, value="── RENTAL MAO LOOKUP (max contract at different equity targets) ──").font = Font(name="Calibri", bold=True, size=12, color="2F5496")
-        for offset, (label, target_eq_val, fill) in enumerate([
-            ("At 10% target equity (aggressive)", 0.10, _YELLOW_FILL),
-            ("At 15% target equity (moderate)", 0.15, _GREEN_FILL),
+        # ── R31+ RENTAL MAO LOOKUP ──
+        mao_start_row = rc_hdr_row + 8
+        c = ws_r.cell(row=mao_start_row, column=1, value="RENTAL MAO LOOKUP  ·  MAX CONTRACT AT DIFFERENT EQUITY TARGETS")
+        c.font = Font(name="Calibri", bold=True, size=9, color=_PB_INK_MUTE)
+        for col in range(1, 7):
+            ws_r.cell(row=mao_start_row, column=col).border = _PB_BORDER_BOTTOM_RULE
+        ws_r.row_dimensions[mao_start_row].height = 20
+
+        for offset, (label, target_eq_val, tint) in enumerate([
+            ("At 10% target equity (aggressive)", 0.10, _PB_FILL_P3T),
+            ("At 15% target equity (moderate)", 0.15, _PB_FILL_MONEY_TINT),
             ("At 20% target equity (conservative — default)", 0.20, None),
         ]):
             row = mao_start_row + 1 + offset
-            ws_r.cell(row=row, column=1, value=label).font = _LABEL_FONT
-            # MAO = ARV × (1 - closing% - holding% - target_eq) - Repairs - WS Fee (E15 now)
+            _pb_label(ws_r, row, label)
             formula = f"=E6*(1-C7-C9-{target_eq_val})-D8-E15"
             c = ws_r.cell(row=row, column=5, value=formula)
             c.number_format = '"$"#,##0'
-            c.font = Font(name="Calibri", bold=True, size=12)
-            if fill: c.fill = fill
-            c.border = _THIN_BORDER
+            c.font = Font(name="Consolas", bold=True, size=12, color=_PB_INK)
+            c.alignment = Alignment(horizontal="right", vertical="center")
+            c.border = _PB_BORDER_BOTTOM_SOFT
+            if tint: c.fill = tint
 
-        ws_r.column_dimensions["A"].width = 48
-        ws_r.column_dimensions["B"].width = 40
+        _pb_footer(ws_r, mao_start_row + 5, "REPAIRS (D8) IS RED  ·  EQUITY/RENT % TURN GREEN WHEN IN TARGET RANGE")
+
+        ws_r.column_dimensions["A"].width = 52
+        ws_r.column_dimensions["B"].width = 42
         for col in ["C", "D", "E", "F"]:
             ws_r.column_dimensions[col].width = 16
 
