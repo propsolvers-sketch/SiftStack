@@ -923,23 +923,27 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
 
         # (label, editable_default, input_fmt, input_label, mao_formula, fill)
         # mao_formula references local Cnn (NOT MAO Calc) to avoid circular refs.
+        # MAO Calc cell coordinates updated 2026-06-13 after MAO tab beautification:
+        #   Flip:      ARV=B10, closing=B11, holding=B12, target=B13(→C29), rehab=B14, WSfee=B15 → MAO=B16
+        #   Wholetail: CMV=B22, closing=B23, rehab=B24, buyer=B25(→C30), WSfee=B26 → MAO=B27
+        #   Rental:    ARV=B33, closing=B34, holding=B35, equity=B36(→C31), rehab=B37, WSfee=B38 → MAO=B39
         rows_def = [
             (
                 "Flip MAO",
                 DEFAULT_FLIP_TARGET_PROFIT_PCT, '0.00%', "← target profit %",
-                "='MAO Calculation'!B5*(1-'MAO Calculation'!B6-'MAO Calculation'!B7-C29)-'MAO Calculation'!B9-'MAO Calculation'!B10",
+                "='MAO Calculation'!B10*(1-'MAO Calculation'!B11-'MAO Calculation'!B12-C29)-'MAO Calculation'!B14-'MAO Calculation'!B15",
                 _GREEN_FILL,
             ),
             (
                 "Wholetail MAO (cosmetic only)",
                 DEFAULT_WHOLETAIL_BUYER_PROFIT, '"$"#,##0', "← buyer profit $",
-                "='MAO Calculation'!B14*(1-'MAO Calculation'!B15)-'MAO Calculation'!B16-C30-'MAO Calculation'!B18",
+                "='MAO Calculation'!B22*(1-'MAO Calculation'!B23)-'MAO Calculation'!B24-C30-'MAO Calculation'!B26",
                 _YELLOW_FILL,
             ),
             (
                 "Rental Hold MAO",
                 DEFAULT_TARGET_EQUITY_PCT, '0.00%', "← target equity %",
-                "='MAO Calculation'!B22*(1-'MAO Calculation'!B23-'MAO Calculation'!B24-C31)-'MAO Calculation'!B26-'MAO Calculation'!B27",
+                "='MAO Calculation'!B33*(1-'MAO Calculation'!B34-'MAO Calculation'!B35-C31)-'MAO Calculation'!B37-'MAO Calculation'!B38",
                 None,
             ),
         ]
@@ -2068,97 +2072,209 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
     for col in ["B", "C", "D", "E"]:
         ws3.column_dimensions[col].width = 16
 
-    # ── Tab 4: MAO Calculation — editable inputs + formulas ──
-    # Layout: col A = label, col B = input (% or $), col C = $ equivalent (live derived from B × base).
-    # Phone-friendly: every % shows the $ it equates to, so you can negotiate from either side.
+    # ── Tab 4: MAO Calculation — beautified 2026-06-13 with playbook aesthetic ──
+    # Design tokens borrowed from the SiftStack Marketing Playbook Q3 2026:
+    #   Ink #1B1D22, Ink-mute #55575E, Ink-faint #8A8B8F
+    #   Rule #C0BCB2 (borders), Money #0B6B47 (financial results), Money-tint #E4EFE8
+    #   Priority stripes: P1 red #A63232 (Flip), P2 gold #B98A2E (Wholetail),
+    #                     P3 blue-gray #4A6D74 (Rental)
+    # Typography: Georgia serif for editorial titles; Consolas mono for numbers;
+    # Calibri sans for labels + uppercase tags.
     ws4 = wb.create_sheet("MAO Calculation")
-    ws4.cell(row=1, column=1, value="Maximum Allowable Offer — by Exit Strategy").font = _TITLE_FONT
-    ws4.cell(row=2, column=1, value="🟨 Yellow cells = editable inputs (edit % OR $ — the other recalcs). Green cells = MAO result.").font = Font(name="Calibri", italic=True, size=10, color="555555")
 
-    # Column header row
-    h = ws4.cell(row=3, column=2, value="Input"); h.font = _HEADER_FONT; h.fill = _HEADER_FILL; h.alignment = _HEADER_ALIGN
-    h = ws4.cell(row=3, column=3, value="$ Equivalent"); h.font = _HEADER_FONT; h.fill = _HEADER_FILL; h.alignment = _HEADER_ALIGN
+    # Playbook color tokens (light-theme values from the artifact)
+    _INK       = "1B1D22"
+    _INK_MUTE  = "55575E"
+    _INK_FAINT = "8A8B8F"
+    _RULE      = "C0BCB2"
+    _RULE_SOFT = "E1DED4"
+    _MONEY     = "0B6B47"
+    _MONEY_TINT = "E4EFE8"
+    _P1        = "A63232"   # Flip
+    _P1_TINT   = "F4E5E2"
+    _P2        = "B98A2E"   # Wholetail
+    _P2_TINT   = "F5EBD5"
+    _P3        = "4A6D74"   # Rental
+    _P3_TINT   = "DDE7EA"
+
+    _FILL_MONEY_TINT = PatternFill(start_color=_MONEY_TINT, end_color=_MONEY_TINT, fill_type="solid")
+    _FILL_P1  = PatternFill(start_color=_P1, end_color=_P1, fill_type="solid")
+    _FILL_P2  = PatternFill(start_color=_P2, end_color=_P2, fill_type="solid")
+    _FILL_P3  = PatternFill(start_color=_P3, end_color=_P3, fill_type="solid")
+    _FILL_P1T = PatternFill(start_color=_P1_TINT, end_color=_P1_TINT, fill_type="solid")
+    _FILL_P2T = PatternFill(start_color=_P2_TINT, end_color=_P2_TINT, fill_type="solid")
+    _FILL_P3T = PatternFill(start_color=_P3_TINT, end_color=_P3_TINT, fill_type="solid")
+    _FILL_RULE_SOFT = PatternFill(start_color=_RULE_SOFT, end_color=_RULE_SOFT, fill_type="solid")
+
+    _BORDER_BOTTOM_RULE = Border(bottom=Side(style="thin", color=_RULE))
+    _BORDER_TOP_RULE = Border(top=Side(style="thin", color=_RULE))
+    _BORDER_BOTTOM_SOFT = Border(bottom=Side(style="thin", color=_RULE_SOFT))
+
+    # ── Editorial hero (rows 1-4) ──
+    # eyebrow (uppercase letter-spaced) + big serif title + subject subtitle + rule
+    c = ws4.cell(row=1, column=1, value="MAO CALCULATION  ·  BY EXIT STRATEGY")
+    c.font = Font(name="Calibri", bold=True, size=9, color=_INK_MUTE)
+    c.alignment = Alignment(horizontal="left", vertical="bottom")
+    ws4.row_dimensions[1].height = 20
+
+    c = ws4.cell(row=2, column=1, value="Maximum Allowable Offer")
+    c.font = Font(name="Georgia", bold=True, size=28, color=_INK)
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    ws4.merge_cells(start_row=2, end_row=2, start_column=1, end_column=3)
+    ws4.row_dimensions[2].height = 40
+
+    subj = pkg.subject
+    subj_line = f"{subj.address}, {subj.city}, {subj.state} {subj.zip_code}"
+    if subj.sqft: subj_line += f"  ·  {subj.sqft:,} sqft"
+    if subj.bedrooms or subj.bathrooms: subj_line += f"  ·  {subj.bedrooms}bd/{subj.bathrooms}ba"
+    c = ws4.cell(row=3, column=1, value=subj_line)
+    c.font = Font(name="Georgia", italic=True, size=12, color=_INK_MUTE)
+    ws4.merge_cells(start_row=3, end_row=3, start_column=1, end_column=3)
+    ws4.row_dimensions[3].height = 22
+
+    # Row 4 — rule (thin bottom border on empty row across A:C)
+    for col in range(1, 4):
+        ws4.cell(row=4, column=col).border = _BORDER_BOTTOM_RULE
+    ws4.row_dimensions[4].height = 4
+
+    # ── Helper: input value (light tint per strategy) ──
+    def _input(row, col, value, tint_fill, fmt='"$"#,##0'):
+        c = ws4.cell(row=row, column=col, value=value)
+        c.number_format = fmt
+        c.fill = tint_fill
+        c.border = _BORDER_BOTTOM_SOFT
+        # Consolas mono, tabular-aligned numbers per playbook aesthetic
+        c.font = Font(name="Consolas", bold=True, size=11, color=_INK)
+        c.alignment = Alignment(horizontal="right", vertical="center")
+        return c
+
+    def _derived(row, formula, tint_fill):
+        c = ws4.cell(row=row, column=3, value=formula)
+        c.number_format = '"$"#,##0'
+        c.fill = tint_fill
+        c.border = _BORDER_BOTTOM_SOFT
+        c.font = Font(name="Consolas", size=11, color=_INK_FAINT, italic=True)
+        c.alignment = Alignment(horizontal="right", vertical="center")
+        return c
+
+    def _label(row, text):
+        c = ws4.cell(row=row, column=1, value=text)
+        c.font = Font(name="Calibri", size=11, color=_INK)
+        c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        c.border = _BORDER_BOTTOM_SOFT
+        return c
+
+    def _mao_row(row, formula, stripe_fill, big=False):
+        """Big money-green MAO result — the headline number for each section."""
+        # Column A: "MAO" label with strategy color
+        lbl = ws4.cell(row=row, column=1, value="MAO")
+        lbl.font = Font(name="Calibri", bold=True, size=11, color=_INK_MUTE)
+        lbl.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        lbl.fill = _FILL_MONEY_TINT
+        # Column B: the big MAO number in money green
+        c = ws4.cell(row=row, column=2, value=formula)
+        c.number_format = '"$"#,##0'
+        c.fill = _FILL_MONEY_TINT
+        c.font = Font(name="Consolas", bold=True, size=18 if big else 15, color=_MONEY)
+        c.alignment = Alignment(horizontal="right", vertical="center")
+        # Column C: caption (uppercase eyebrow "Contract to seller")
+        cap = ws4.cell(row=row, column=3, value="CONTRACT TO SELLER")
+        cap.font = Font(name="Calibri", bold=True, size=9, color=_MONEY)
+        cap.fill = _FILL_MONEY_TINT
+        cap.alignment = Alignment(horizontal="right", vertical="center", indent=1)
+        ws4.row_dimensions[row].height = 36 if big else 30
+
+    def _section_header(row, tag_text, section_title, thesis, stripe_fill, tint_fill, tag_ink):
+        """Playbook-style section header: colored strip + tag chip + serif title + thesis."""
+        # Left color stripe (1-col wide, spans header row height)
+        # Approximate with a colored left border on column A
+        # Row structure: 2 rows tall — [tag chip] [serif title / thesis]
+        # Row `row`: uppercase tag chip in column A (with tint fill)
+        c = ws4.cell(row=row, column=1, value=f"  {tag_text}")
+        c.font = Font(name="Calibri", bold=True, size=9, color=tag_ink)
+        c.fill = tint_fill
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        c.border = Border(left=Side(style="thick", color=stripe_fill.start_color.value if hasattr(stripe_fill.start_color, 'value') else stripe_fill.start_color.rgb[-6:]))
+        ws4.row_dimensions[row].height = 20
+
+        # Row row+1: big serif section title
+        c = ws4.cell(row=row + 1, column=1, value=section_title)
+        c.font = Font(name="Georgia", bold=True, size=18, color=_INK)
+        c.alignment = Alignment(horizontal="left", vertical="center", indent=0)
+        ws4.merge_cells(start_row=row + 1, end_row=row + 1, start_column=1, end_column=3)
+        ws4.row_dimensions[row + 1].height = 28
+
+        # Row row+2: italic thesis
+        c = ws4.cell(row=row + 2, column=1, value=thesis)
+        c.font = Font(name="Georgia", italic=True, size=10, color=_INK_MUTE)
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        ws4.merge_cells(start_row=row + 2, end_row=row + 2, start_column=1, end_column=3)
+        ws4.row_dimensions[row + 2].height = 18
+
+    def _col_header(row):
+        """Small uppercase column labels ala playbook table headers."""
+        specs = [(2, "INPUT"), (3, "$ EQUIVALENT")]
+        for col, text in specs:
+            c = ws4.cell(row=row, column=col, value=text)
+            c.font = Font(name="Calibri", bold=True, size=8, color=_INK_FAINT)
+            c.alignment = Alignment(horizontal="right", vertical="bottom", indent=1)
+            c.border = _BORDER_BOTTOM_RULE
+        # Also add rule to column A for continuity
+        ws4.cell(row=row, column=1).border = _BORDER_BOTTOM_RULE
+        ws4.row_dimensions[row].height = 18
 
     arv = pkg.arv.arv_mid
     rehab_full_base = pkg.rehab_full.rooms[0].total if pkg.rehab_full.rooms else pkg.rehab_full.grand_total
     rehab_wt_base = pkg.rehab_wholetail.rooms[0].total if pkg.rehab_wholetail.rooms else pkg.rehab_wholetail.grand_total
 
-    def _yellow_input(row, col, value, fmt='"$"#,##0'):
-        c = ws4.cell(row=row, column=col, value=value)
-        c.number_format = fmt
-        c.fill = INPUT_FILL
-        c.border = _THIN_BORDER
-        c.font = Font(name="Calibri", bold=True, size=11)
-        return c
+    # ── FLIP section (rows 6-14) — P1 red stripe ──
+    _section_header(6, "P1 · PRIMARY OFFER", "Flip", "Target profit % on retail sale. The primary MAO you present to seller.", _FILL_P1, _FILL_P1T, _P1)
+    _col_header(9)
+    _label(10, "ARV / CMV");                                       _input(10, 2, arv, _FILL_P1T)
+    _label(11, "Closing % (sale-side)");                           _input(11, 2, DEFAULT_FLIP_CLOSING_PCT, _FILL_P1T, '0.00%'); _derived(11, "=B10*B11", _FILL_P1T)
+    _label(12, "Holding %");                                       _input(12, 2, DEFAULT_FLIP_HOLDING_PCT, _FILL_P1T, '0.00%'); _derived(12, "=B10*B12", _FILL_P1T)
+    _label(13, "Target Profit % ← Profit Calc C29");               _input(13, 2, "='Profit Calculator'!C29", _FILL_P1T, '0.00%'); _derived(13, "=B10*B13", _FILL_P1T)
+    _label(14, "Rehab (base, no permits/contingency)");            _input(14, 2, rehab_full_base, _FILL_P1T)
+    _label(15, "Wholesale Fee");                                   _input(15, 2, DEFAULT_FLIP_WHOLESALE_FEE, _FILL_P1T)
+    _mao_row(16, "=B10*(1-B11-B12-B13)-B14-B15", _FILL_P1, big=True)
 
-    def _dollar_derived(row, formula):
-        """Col C shows the $ equivalent of a % input (computed live from base × pct)."""
-        c = ws4.cell(row=row, column=3, value=formula)
-        c.number_format = '"$"#,##0'
-        c.border = _THIN_BORDER
-        c.font = Font(name="Calibri", size=11, color="555555", italic=True)
-        return c
+    # ── WHOLETAIL section (rows 18-25) — P2 gold stripe ──
+    _section_header(18, "P2 · LIGHT COSMETIC", "Wholetail", "Cosmetic-only, sell as-is to retail buyer. Buyer profit is downstream flipper's margin.", _FILL_P2, _FILL_P2T, _P2)
+    _col_header(21)
+    _label(22, "CMV (defaults to flip ARV)")
+    c = ws4.cell(row=22, column=2, value="=B10"); c.number_format='"$"#,##0'; c.fill=_FILL_P2T; c.border=_BORDER_BOTTOM_SOFT
+    c.font = Font(name="Consolas", bold=True, size=11, color=_INK); c.alignment=Alignment(horizontal="right", vertical="center")
+    _label(23, "Closing %");                                       _input(23, 2, DEFAULT_WHOLETAIL_CLOSING_PCT, _FILL_P2T, '0.00%'); _derived(23, "=B22*B23", _FILL_P2T)
+    _label(24, "Wholetail Rehab (base)");                          _input(24, 2, rehab_wt_base, _FILL_P2T)
+    _label(25, "Buyer Profit ← Profit Calc C30");                  _input(25, 2, "='Profit Calculator'!C30", _FILL_P2T, '"$"#,##0')
+    _label(26, "Wholesale Fee");                                   _input(26, 2, DEFAULT_WHOLETAIL_WS_FEE, _FILL_P2T)
+    _mao_row(27, "=B22*(1-B23)-B24-B25-B26", _FILL_P2)
 
-    def _formula_cell(row, col, formula, fmt='"$"#,##0', bold_green=False, big=False):
-        c = ws4.cell(row=row, column=col, value=formula)
-        c.number_format = fmt
-        c.border = _THIN_BORDER
-        if bold_green:
-            c.fill = _GREEN_FILL
-            sz = 14 if big else 12
-            c.font = Font(name="Calibri", bold=True, size=sz, color="006100")
-        return c
+    # ── RENTAL section (rows 29-36) — P3 blue-gray stripe ──
+    _section_header(29, "P3 · HOLD FOR CASHFLOW", "Rental Hold", "Buy-and-hold at target equity %. MAO reflects long-term cashflow acquisition price.", _FILL_P3, _FILL_P3T, _P3)
+    _col_header(32)
+    _label(33, "ARV (defaults to flip ARV)")
+    c = ws4.cell(row=33, column=2, value="=B10"); c.number_format='"$"#,##0'; c.fill=_FILL_P3T; c.border=_BORDER_BOTTOM_SOFT
+    c.font = Font(name="Consolas", bold=True, size=11, color=_INK); c.alignment=Alignment(horizontal="right", vertical="center")
+    _label(34, "Closing %");                                       _input(34, 2, DEFAULT_RENTAL_CLOSING_PCT, _FILL_P3T, '0.00%'); _derived(34, "=B33*B34", _FILL_P3T)
+    _label(35, "Holding %");                                       _input(35, 2, DEFAULT_RENTAL_HOLDING_PCT, _FILL_P3T, '0.00%'); _derived(35, "=B33*B35", _FILL_P3T)
+    _label(36, "Target Equity % ← Profit Calc C31");               _input(36, 2, "='Profit Calculator'!C31", _FILL_P3T, '0.00%'); _derived(36, "=B33*B36", _FILL_P3T)
+    _label(37, "Rehab (base)");                                    _input(37, 2, rehab_full_base, _FILL_P3T)
+    _label(38, "Wholesale Fee");                                   _input(38, 2, DEFAULT_RENTAL_WS_FEE, _FILL_P3T)
+    _mao_row(39, "=B33*(1-B34-B35-B36)-B37-B38", _FILL_P3)
 
-    def _label(row, value, big=False, color="222222", bold=False):
-        c = ws4.cell(row=row, column=1, value=value)
-        if big:
-            c.font = Font(name="Calibri", bold=True, size=13, color=color)
-        elif bold:
-            c.font = Font(name="Calibri", bold=True, size=12, color=color)
-        else:
-            c.font = _LABEL_FONT
-        return c
+    # ── Footer eyebrow (row 41) ──
+    c = ws4.cell(row=41, column=1, value="EDIT LINKED CELLS ON PROFIT CALCULATOR TAB  ·  MAO RESULTS RECALC LIVE")
+    c.font = Font(name="Calibri", bold=True, size=8, color=_INK_FAINT)
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    for col in range(1, 4):
+        ws4.cell(row=41, column=col).border = _BORDER_TOP_RULE
+    ws4.row_dimensions[41].height = 22
 
-    # ── FLIP section (rows 4-11) — base for % derivations is B5 (ARV) ──
-    # B8 (Target Profit %) is bidirectionally linked to Profit Calc C29 — edit either
-    # cell and the other updates. Excel can't do true bidirectional bindings without
-    # macros, so the convention is: Profit Calc C29 is the canonical input; B8 here
-    # is a formula reference to it. Overwriting B8 with a number breaks the link
-    # (edit C29 on Profit Calc instead).
-    _label(4, "🎯 FLIP (target profit % — primary seller offer)", big=True, color="2F5496")
-    _label(5, "ARV / CMV");                                _yellow_input(5, 2, arv)
-    _label(6, "Closing % (sale-side)");                    _yellow_input(6, 2, DEFAULT_FLIP_CLOSING_PCT, '0.00%'); _dollar_derived(6, "=B5*B6")
-    _label(7, "Holding %");                                _yellow_input(7, 2, DEFAULT_FLIP_HOLDING_PCT, '0.00%'); _dollar_derived(7, "=B5*B7")
-    _label(8, "Target Profit % (← linked to Profit Calc C29)"); _yellow_input(8, 2, "='Profit Calculator'!C29", '0.00%'); _dollar_derived(8, "=B5*B8")
-    _label(9, "Rehab (base, no permits/contingency)");     _yellow_input(9, 2, rehab_full_base)
-    _label(10, "Wholesale Fee");                           _yellow_input(10, 2, DEFAULT_FLIP_WHOLESALE_FEE)
-    _label(11, "→ MAO (Flip)", bold=True, color="006100"); _formula_cell(11, 2, "=B5*(1-B6-B7-B8)-B9-B10", bold_green=True, big=True)
-    ws4.row_dimensions[11].height = 24
-
-    # ── WHOLETAIL section (rows 13-19) — base for % derivations is B14 (CMV) ──
-    # B17 (Buyer Profit) is linked to Profit Calc C30 — see note above.
-    _label(13, "WHOLETAIL (cosmetic only, sell as-is)", big=True, color="2F5496")
-    _label(14, "CMV (defaults to flip ARV)");              c = ws4.cell(row=14, column=2, value="=B5"); c.number_format = '"$"#,##0'; c.fill = INPUT_FILL; c.border = _THIN_BORDER
-    _label(15, "Closing %");                               _yellow_input(15, 2, DEFAULT_WHOLETAIL_CLOSING_PCT, '0.00%'); _dollar_derived(15, "=B14*B15")
-    _label(16, "Wholetail Rehab (base)");                  _yellow_input(16, 2, rehab_wt_base)
-    _label(17, "Buyer Profit (← linked to Profit Calc C30)"); _yellow_input(17, 2, "='Profit Calculator'!C30", '"$"#,##0')
-    _label(18, "Wholesale Fee");                           _yellow_input(18, 2, DEFAULT_WHOLETAIL_WS_FEE)
-    _label(19, "→ MAO (Wholetail)", bold=True, color="006100"); _formula_cell(19, 2, "=B14*(1-B15)-B16-B17-B18", bold_green=True)
-
-    # ── RENTAL section (rows 21-28) — base for % derivations is B22 (ARV) ──
-    # B25 (Target Equity %) is linked to Profit Calc C31 — see note above.
-    _label(21, "RENTAL HOLD (target equity %)", big=True, color="2F5496")
-    _label(22, "ARV (defaults to flip ARV)");              c = ws4.cell(row=22, column=2, value="=B5"); c.number_format = '"$"#,##0'; c.fill = INPUT_FILL; c.border = _THIN_BORDER
-    _label(23, "Closing %");                               _yellow_input(23, 2, DEFAULT_RENTAL_CLOSING_PCT, '0.00%'); _dollar_derived(23, "=B22*B23")
-    _label(24, "Holding %");                               _yellow_input(24, 2, DEFAULT_RENTAL_HOLDING_PCT, '0.00%'); _dollar_derived(24, "=B22*B24")
-    _label(25, "Target Equity % (← linked to Profit Calc C31)"); _yellow_input(25, 2, "='Profit Calculator'!C31", '0.00%'); _dollar_derived(25, "=B22*B25")
-    _label(26, "Rehab (base)");                            _yellow_input(26, 2, rehab_full_base)
-    _label(27, "Wholesale Fee");                           _yellow_input(27, 2, DEFAULT_RENTAL_WS_FEE)
-    _label(28, "→ MAO (Rental)", bold=True, color="006100"); _formula_cell(28, 2, "=B22*(1-B23-B24-B25)-B26-B27", bold_green=True)
-
-    ws4.column_dimensions["A"].width = 50
-    ws4.column_dimensions["B"].width = 18
-    ws4.column_dimensions["C"].width = 18
+    # Column widths tuned for editorial breathing room
+    ws4.column_dimensions["A"].width = 52
+    ws4.column_dimensions["B"].width = 20
+    ws4.column_dimensions["C"].width = 24
 
     # ── Tab 5: Flip Projection ────────────────────────────────────
     ws5 = wb.create_sheet("Flip Projection")
