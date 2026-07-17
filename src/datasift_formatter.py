@@ -560,8 +560,28 @@ def _build_tags(notice: NoticeData, phone_tiers: dict | None = None) -> str:
     if notice.auction_date:
         try:
             auction_dt = datetime.strptime(notice.auction_date, "%Y-%m-%d")
-            if auction_dt >= datetime.now():
+            # Date-only comparison so an auction happening TODAY still
+            # counts as "upcoming" (datetime-vs-datetime would exclude it
+            # because auction_dt is midnight and `now` is later in the day).
+            today = datetime.now().date()
+            if auction_dt.date() >= today:
                 tags.append("has_auction")
+
+                # Rolling-window bucket tags (added 2026-07-17) — support
+                # DataSift filter presets like "call everything auctioning
+                # in the next 7 days" without having to reason about
+                # specific YYYY-MM-DD tags. Buckets are exclusive across
+                # ranges — an auction 7 days out is in `auction_next_7_days`
+                # but NOT in `auction_next_14_days`. Same-day auctions
+                # (days_out = 0) land in the 7-day bucket.
+                days_out = (auction_dt.date() - today).days
+                if days_out <= 7:
+                    tags.append("auction_next_7_days")
+                elif days_out <= 14:
+                    tags.append("auction_next_14_days")
+                elif days_out <= 21:
+                    tags.append("auction_next_21_days")
+
             # Per-date tag for DataSift filter presets that target a specific
             # foreclosure window (e.g. "show me everything auctioned this week").
             # Format: foreclosure_YYYY-MM-DD for foreclosure notices, otherwise
