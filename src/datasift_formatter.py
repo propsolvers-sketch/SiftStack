@@ -1826,7 +1826,41 @@ def _build_row(
             f"{full_tag_list},{heir_tag}" if full_tag_list else heir_tag
         )
 
-    tags = "Courthouse Data"
+    # Tags column strategy (updated 2026-07-17 — operator request):
+    #
+    # Keep "Courthouse Data" as the anchor tag so the existing preset
+    # infrastructure (which filters on this) keeps working. ADD a small,
+    # curated set of high-signal subtype tags alongside it so DataSift
+    # filter presets can target them:
+    #
+    #   * foreclosure_cancelled  — sale was cancelled; owner may have
+    #     reinstated the loan, filed bankruptcy, sold pre-auction, or
+    #     died. Often re-defaults within 6-12 months. Long-term nurture.
+    #   * foreclosure_postponed  — sale rescheduled. Still active distress,
+    #     immediate outreach opportunity.
+    #   * probate_sale           — Petition for Authority to Sell Real
+    #     Property. Highest-signal probate (estate actively selling).
+    #   * probate_final_settlement — hearing on estate distribution.
+    #
+    # These are the subtypes worth their own filter preset. Other subtypes
+    # (probate_creditors, obituary_driven, apn_death_notice) are the
+    # DEFAULT for their notice type — no separate tag needed.
+    #
+    # Kept OUT of Tags column (still lives in Notes under === TAGS ===):
+    # county names, dates, tier levels, municipality, homestead flag —
+    # per prior operator feedback these clutter the DataSift property page
+    # without adding filter value.
+    _TAG_PROMOTABLE_SUBTYPES = {
+        "foreclosure_cancelled",
+        "foreclosure_postponed",
+        "probate_sale",
+        "probate_final_settlement",
+    }
+    tag_parts = ["Courthouse Data"]
+    subtype = (getattr(notice, "notice_subtype", "") or "").strip().lower()
+    if subtype in _TAG_PROMOTABLE_SUBTYPES:
+        tag_parts.append(subtype)
+    tags = ",".join(tag_parts)
     list_name = NOTICE_TYPE_TO_LIST.get(notice.notice_type, "")
     notes = notes_override if notes_override is not None else _build_notes(
         notice, phone_tiers=phone_tiers,
