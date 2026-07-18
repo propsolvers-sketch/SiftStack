@@ -1146,7 +1146,121 @@ def _build_notes(notice: NoticeData, phone_tiers: dict | None = None) -> str:
         return "\n\n".join(sections)
 
     # Living owner — simple format
-    return _build_property_section(notice)
+    # Ownership layers surface FIRST so the closer sees the "mortgagor vs
+    # legal owner" mismatch before dialing (foreclosure records for LLC-
+    # owned properties are the primary case). Falls through to just the
+    # property section when there's no discrepancy to flag.
+    sections = []
+    ownership = _build_ownership_layers(notice)
+    if ownership:
+        sections.append(ownership)
+    prop = _build_property_section(notice)
+    if prop:
+        sections.append(prop)
+    return "\n\n".join(sections) if sections else ""
+
+
+def _build_ownership_layers(notice: NoticeData) -> str:
+    """Surface a mortgagor / legal-owner mismatch when it looks material.
+
+    Compares ``notice.owner_name`` (mortgagor from the foreclosure notice
+    body — the person on the loan being called) against
+    ``notice.tax_owner_name`` (current legal owner per county tax roll,
+    populated by al_property_enricher). Fires only when the two disagree
+    beyond routine formatting differences.
+
+    Cases:
+      * Person mortgagor + LLC/entity tax-roll owner → subject-to /
+        wraparound scenario. High-signal REI opportunity: contact BOTH
+        the mortgagor (credit at risk) AND the LLC (property investment
+        at risk). Look up LLC's registered agent via Alabama SoS.
+      * Different persons → likely a transfer after mortgage origination
+        (heirship, divorce, sale). Contact both.
+      * Same-name-different-format ("SMITH JOHN A" vs "John Smith") →
+        no flag — normalized comparison catches these.
+
+    Returns "" when there's nothing to flag.
+    """
+    mortgagor = (notice.owner_name or "").strip()
+    tax_owner = (notice.tax_owner_name or "").strip()
+
+    if not mortgagor or not tax_owner:
+        return ""
+
+    def _sig_tokens(s: str) -> set[str]:
+        """Uppercase alphanumeric tokens of ≥3 chars — for fuzzy name match."""
+        parts = re.split(r"[\s,.'&]+", (s or "").upper())
+        return {p for p in parts if len(p) >= 3 and p.isalpha()}
+
+    mort_tokens = _sig_tokens(mortgagor)
+    tax_tokens = _sig_tokens(tax_owner)
+    if not mort_tokens or not tax_tokens:
+        return ""
+
+    # If the token sets substantially overlap, treat as the same party
+    # (handles "SMITH JOHN A" vs "John A. Smith" and similar reordering).
+    overlap = mort_tokens & tax_tokens
+    smaller = min(len(mort_tokens), len(tax_tokens))
+    if smaller and len(overlap) / smaller >= 0.6:
+        return ""
+
+    # Entity vs person detection
+    _ENTITY_MARKERS = (
+        " LLC", " L.L.C", " LLLC", " INC", " CORP", " TRUST", " LP ",
+        " LLP", " COMPANY", " CO.", " HOLDINGS", " PARTNERS", " GROUP",
+        " ENTERPRISES", " PROPERTIES", " ESTATES", " REALTY",
+    )
+    def _is_entity(s: str) -> bool:
+        upper = f" {s.upper()} "
+        return any(m in upper for m in _ENTITY_MARKERS)
+
+    mort_is_entity = _is_entity(mortgagor)
+    tax_is_entity = _is_entity(tax_owner)
+
+    lines = ["=== OWNERSHIP LAYERS ⚠ ==="]
+    lines.append(f"Mortgagor (on loan):        {mortgagor}")
+    lines.append(f"Current legal owner (deed): {tax_owner}")
+    lines.append("")
+
+    if (not mort_is_entity) and tax_is_entity:
+        lines.append(
+            "→ Person's mortgage on LLC-owned property. Likely subject-to "
+            "or wraparound deal — the mortgagor sold the house but left the "
+            "loan in their name. BOTH parties have skin in the game:"
+        )
+        lines.append(
+            "  · Mortgagor: credit being destroyed by foreclosure — "
+            "highest emotional stakes"
+        )
+        lines.append(
+            "  · LLC owner: losing the property at auction — cash-motivated"
+        )
+        lines.append(
+            "  Find the LLC's registered agent via the Alabama Secretary of "
+            "State business search (arc-sos.state.al.us/CGI/CORPNAME.MBR/INPUT) "
+            "and skip-trace that person separately."
+        )
+    elif mort_is_entity and (not tax_is_entity):
+        lines.append(
+            "→ LLC-mortgagor on person-owned property. Unusual — verify the "
+            "deed history. May indicate a business note secured by a "
+            "personal residence or a reverse subject-to."
+        )
+    elif mort_is_entity and tax_is_entity:
+        lines.append(
+            "→ Two different entities. Ownership likely transferred between "
+            "LLCs after the mortgage was recorded. Contact the current legal "
+            "owner (deed) — they control the property."
+        )
+    else:
+        lines.append(
+            "→ Two different persons on record. Possible causes: heirship "
+            "after death of original borrower, post-divorce transfer, "
+            "quitclaim sale that didn't refinance. Contact BOTH parties — "
+            "the mortgagor is on the loan, the deed owner controls the sale."
+        )
+
+    return "\n".join(lines)
 
 
 # ── New sections (2026-07-14 — Deep Prospecting v4 skill Phase A) ─────

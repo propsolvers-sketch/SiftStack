@@ -114,6 +114,17 @@ def _enrich_jefferson(notice: NoticeData) -> bool:
             notice.tax_delinquent_amount = f"{unpaid:.2f}"
             notice.tax_delinquent_years = str(record.tax_lien_count) if record.tax_lien_count else "1"
             filled = True
+    # Ownership-layer detection (added 2026-07-18) — populate tax_owner_name
+    # from Jefferson E-Ring's `owner_name` (the CURRENT LEGAL OWNER on the
+    # tax roll). For foreclosure notices, `notice.owner_name` already holds
+    # the MORTGAGOR from the notice text; downstream _build_ownership_layers()
+    # compares the two and flags subject-to / wraparound situations where a
+    # person's mortgage sits on an LLC-owned property. Only overwrite when
+    # the field is empty so trustee adapters (which set tax_owner_name at
+    # their own enrichment step) aren't clobbered.
+    if not notice.tax_owner_name and record.owner_name:
+        notice.tax_owner_name = record.owner_name
+        filled = True
     return filled
 
 
@@ -206,6 +217,13 @@ def _enrich_madison(notice: NoticeData) -> bool:
     if not notice.tax_delinquent_amount and record.is_delinquent and record.balance_due > 0:
         notice.tax_delinquent_amount = f"{record.balance_due:.2f}"
         notice.tax_delinquent_years = "1"  # Madison's search response doesn't expose lien count
+        filled = True
+    # Ownership-layer detection (added 2026-07-18) — see the parallel
+    # comment in _enrich_jefferson above. Populates the tax-roll legal
+    # owner so _build_ownership_layers() can flag mortgagor/legal-owner
+    # mismatches in the Notes column.
+    if not notice.tax_owner_name and getattr(record, "owner_name", ""):
+        notice.tax_owner_name = record.owner_name
         filled = True
     return filled
 
