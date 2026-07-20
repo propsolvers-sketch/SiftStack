@@ -1561,6 +1561,93 @@ python src/extract_market_finder.py --state "Tennessee" --county "Knox,Blount" -
 # Output: JSON file in output/market_finder_{state}_{county}_{timestamp}.json
 ```
 
+## DataSift Export Enrichment (inbox → outbox, added 2026-07-18)
+
+**Bridge tool until DataSift ships REST API keys** (estimated ~90 days from 2026-07-18, may slip to 6mo). Lets the operator run our Tracerfy + Enformion + Trestle enrichment pipeline over DataSift-native lists (Notice of Default, courthouse round-trips, any manually-curated slice) by file exchange instead of API calls. Adapter code stays; only the file plumbing gets swapped when the REST API lands.
+
+### Weekly rhythm
+
+| Day | Action | Where |
+|---|---|---|
+| **Friday** | Export target list(s) from DataSift → drop CSVs in [inbox/](inbox/) → `git add inbox/*.csv && git commit && git push` | Local |
+| **Overnight (2:30 AM CT via cron-job.org → daily-sweep.yml)** | `scripts/enrich_datasift_export.py` reads inbox/*.csv, enriches, writes `<stem>_ENRICHED.csv` to `outbox/`, moves inputs to `inbox/processed/`, commits both back | GHA |
+| **Monday** | `git pull` → open each `outbox/*.csv` in DataSift's upload wizard in **Update Existing** mode (not Add Data) | Local |
+
+### Per-record decision matrix
+
+Runs on every row of every CSV in `inbox/`:
+
+| Row state | Action | Vendor calls |
+|---|---|---|
+| Owner name missing | **owner_recovery_full** — Enformion AddressID on the chosen skip-trace address, then Full enrichment | AddressID → Tracerfy → Enformion household → Trestle |
+| Owner present, NO Phone Tags on any phone slot | **full_enrichment** — treat as first-time enrichment even if DataSift already put phones in Phone 1-9 (round-trip on those DataSift-native phones so they end up Trestle-tagged) | Tracerfy → Enformion household → Trestle over combined pool |
+| Owner present, at least one Phone Tag populated | **trestle_only** — score any untagged phones on the row; leave tagged ones untouched | Trestle on new phones only |
+| Owner missing AND address missing | **skipped** — logged, no cost | none |
+
+### Address selection (mailing-first per operator spec 2026-07-18)
+
+`choose_skip_trace_target()` picks ONE address for all downstream vendor queries. In order:
+
+1. **Mailing = property** (owner-occupied) → property (same result either way)
+2. **Mailing is PO Box** → property (PO Boxes can't be reverse-looked-up)
+3. **Mailing missing entirely** → property
+4. **Otherwise** → mailing (absentee-owner pattern — mailing address is where the DM actually lives)
+
+Every record's chosen address + reason gets logged. When AddressID recovers an owner from a mailing address, a note is appended to the row: `⚠ Owner recovered via Enformion AddressID on mailing address (…) — verify identity before high-cost outreach; may be tenant on absentee-owned property.` PO-Box fallback and no-mailing fallback both use the property address instead.
+
+### Update-mode CSV output — what changes vs what's protected
+
+The output CSV only contains columns the enrichment tool is ALLOWED to modify. When re-uploaded in **Update Existing** mode, DataSift merges only these fields — Owner Name, Mailing Address, Property Address, Tags, and Lists stay exactly as they were on the source record (protecting our mortgagor/heir/decedent extractions from being clobbered):
+
+- Writable: `Phone 1-9`, `Phone Type 1-9`, `Phone Status 1-9`, `Phone Tags 1-9`, `Notes` (appended, never replaced)
+- Identity (passthrough so DataSift can match): `Property Street/City/State/ZIP`, `Owner First/Last Name`
+
+### CLI
+
+```bash
+# Overnight cron (default — processes anything in inbox/)
+python scripts/enrich_datasift_export.py
+
+# Explicit single-file mode (skips inbox scan, doesn't move input to processed/)
+python scripts/enrich_datasift_export.py --input path/to/file.csv
+
+# Dry-run — log the decision matrix without spending API calls
+python scripts/enrich_datasift_export.py --dry-run
+
+# Verbose
+python scripts/enrich_datasift_export.py -v
+```
+
+### Files + wiring
+
+- [scripts/enrich_datasift_export.py](scripts/enrich_datasift_export.py) — orchestrator (~530 LOC)
+- Adds `enformion_client.address_id()` + `address_id_person()` for reverse address lookup (`POST devapi.enformion.com/AddressID`)
+- `inbox/` + `outbox/` directories (`.gitkeep` committed to keep them tracked)
+- GHA step `Enrich DataSift exports (inbox → outbox)` runs after the DataSift skip-trace step in [.github/workflows/daily-sweep.yml](.github/workflows/daily-sweep.yml); `continue-on-error: true` so a partial failure never blocks the sweep
+- Post-run `commit cross-run state back to repo` step now also commits `outbox/` + `inbox/` so operator gets enriched CSVs on Monday `git pull`
+
+### Realistic yield reasoning
+
+- **Owner recovery via AddressID on mailing address** should hit ~70-80% (Enformion has strong US mailing coverage; the miss set is properties with recently-changed mailing addresses or truly obscure PO Box owners)
+- **Enformion household search** (from the address-anchored resolver work earlier this session) hits target-member cleanly ~5/5 in the tests we ran; expect ~80-90% on realistic populations
+- **Tracerfy** adds ~1-3 new phones per resolved DM at ~$0.02/contact
+- **Trestle** scores every unique phone on the row and writes tier tags (`Dial First` / `Dial Second` / etc.)
+
+### Source attribution + audit output
+
+Every enriched row's `phone_sources` accounting rolls up into the per-file summary + `logs/enrich_datasift_<ts>.log`:
+
+- `Address selection` breakdown: mailing / property / mailing_equals_property counts
+- `Tier distribution`: Dial First / Second / Third / Fourth / Drop
+- `Source contribution`: how many new phones came from Tracerfy vs Enformion vs pre-existing DataSift phones
+
+Use this to sanity-check that Enformion is actually firing (the 2026-07-18 root cause of the missing GHA activation) and to compare vendor efficacy over time.
+
+### Deferred (when DataSift REST API lands)
+
+- Swap file-based inbox/outbox for API pull → enrich → API update
+- Adapter code (Tracerfy + Enformion + Trestle plumbing in `_run_full_enrichment` / `_run_trestle_only`) stays; only `process_csv()` needs rewriting to `process_list_via_api()`
+
 ## REI Skill Library (13 Skills)
 
 Distribution-ready Claude Co-Work skill files at `Skills for REI/improved/`. Each `.skill` is a ZIP containing `SKILL.md` + `references/` folder. Plugins (`.plugin`) also include `commands/` and `.claude-plugin/plugin.json`.

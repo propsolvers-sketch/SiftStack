@@ -487,6 +487,31 @@ jobs:
           python src/datasift_skip_trace.py --headless -v \
             2>&1 | tee logs/daily_datasift_st_${{ steps.run_start.outputs.ts }}.log
 
+      # ── DataSift export enrichment (inbox → outbox) ─────────────────────
+      # Bridge tool for the ~90-day window until DataSift ships REST API keys.
+      # Operator drops weekly-export CSVs (Notice of Default, courthouse
+      # round-trip, etc.) into ~/Desktop/SiftStack/inbox/ before pushing;
+      # this step processes them overnight and writes update-mode CSVs to
+      # outbox/ for Monday re-upload in DataSift Update Existing mode.
+      #
+      # Per-record decision matrix (docs at scripts/enrich_datasift_export.py):
+      #   - No owner name         → Enformion AddressID recovery on mailing/property
+      #   - No Trestle tags       → Full enrichment (Tracerfy + Enformion household + Trestle)
+      #   - Already tagged        → Trestle-only score on new untagged phones
+      # Address selection is mailing-first with PO-Box detection + property fallback.
+      # No-ops cleanly when inbox/ is empty (typical daily-sweep case).
+      - name: Enrich DataSift exports (inbox → outbox)
+        continue-on-error: true
+        env:
+          TRESTLE_API_KEY: ${{ secrets.TRESTLE_API_KEY }}
+          TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
+          ENFORMION_AP_NAME: ${{ secrets.ENFORMION_AP_NAME }}
+          ENFORMION_AP_PASSWORD: ${{ secrets.ENFORMION_AP_PASSWORD }}
+        run: |
+          mkdir -p inbox outbox
+          python scripts/enrich_datasift_export.py -v \
+            2>&1 | tee logs/enrich_datasift_${{ steps.run_start.outputs.ts }}.log
+
       # ── Persistence + observability ──
 
       - name: Archive output CSVs + logs + state + DataSift screenshots
@@ -500,6 +525,8 @@ jobs:
             output/raw/al_notices*.csv
             output/deals/*.xlsx
             output/observability/service_rates.json
+            outbox/*.csv
+            inbox/processed/*.csv
             logs/*.log
             seen_ids.json
             last_run.json
@@ -530,6 +557,8 @@ jobs:
             output/observability/service_rates.json \
             output/observability/foreclosure_owner_cache.json \
             output/observability/skip_trace_source_stats.json \
+            outbox/ \
+            inbox/ \
             2>/dev/null || true
           if ! git diff --cached --quiet; then
             git commit -m "chore(bot): update seen_ids + last_run + rolling rates + code-violation dedup after daily sweep"

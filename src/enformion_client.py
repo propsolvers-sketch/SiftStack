@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 PERSON_SEARCH_URL = "https://devapi.enformion.com/PersonSearch"
+ADDRESS_ID_URL = "https://devapi.enformion.com/AddressID"
 CLOSEST_KIN_LEVEL = "ab"    # relativeLevel code for closest kin (spouse, siblings, parents, children)
 
 _TIMEOUT = 45
@@ -182,11 +183,121 @@ def household_search(
 
         logger.warning(
             "Enformion household HTTP %d for %s @ %s: %s",
-            resp.status_code, last_name, street, (resp.text or "")[:160],
+            resp.status_code, last_name, street, (resp.text or "")[:800],
         )
         return {}
 
     return {}
+
+
+def address_id(
+    *,
+    street: str, city: str, state: str, zip_code: str,
+) -> dict[str, Any]:
+    """Reverse address lookup — returns person(s) associated with an address.
+
+    Uses Enformion's AddressID endpoint. Given an address, returns names,
+    ages, phones, and emails of person(s) that Enformion links to that
+    address. Primary use: recovering an owner name when our source data
+    (foreclosure notice, Notice of Default list, etc.) has an address
+    but no owner name.
+
+    IMPORTANT CAVEAT: AddressID doesn't distinguish "owner" from "tenant."
+    For rental properties, this may return the current tenant instead of
+    the owner. Callers should:
+      · Prefer MAILING address over PROPERTY address (mailing is where
+        the owner receives their mail — much more likely to be the owner)
+      · Flag recovered owners in the output for manual verification
+        before high-cost outreach
+
+    Returns parsed JSON on 200, {} on any failure. Same auth + budget +
+    retry contract as person_search / household_search.
+    """
+    global _budget_used, _disabled_reason
+
+    if not is_configured():
+        return {}
+
+    with _lock:
+        if _disabled_reason:
+            return {}
+        if _budget_used >= _budget_total:
+            logger.warning(
+                "Enformion budget exhausted (%d/%d) — skipping AddressID",
+                _budget_used, _budget_total,
+            )
+            _disabled_reason = "budget_exhausted"
+            return {}
+        _budget_used += 1
+
+    body: dict[str, Any] = {
+        "Address": {
+            "AddressLine1": street,
+            "AddressLine2": f"{city}, {state} {zip_code}",
+        },
+    }
+
+    # AddressID uses a different galaxy-search-type header per Enformion docs
+    hdrs = _headers()
+    hdrs["galaxy-search-type"] = "DevAPIAddressID"
+
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = requests.post(
+                ADDRESS_ID_URL, headers=hdrs,
+                json=body, timeout=_TIMEOUT,
+            )
+        except requests.RequestException as e:
+            if attempt + 1 < _MAX_RETRIES:
+                logger.info(
+                    "Enformion AddressID request error (attempt %d/%d): %s",
+                    attempt + 1, _MAX_RETRIES, e,
+                )
+                time.sleep(5)
+                continue
+            logger.warning("Enformion AddressID failed for %s: %s", street, e)
+            return {}
+
+        if resp.status_code == 200:
+            try:
+                return resp.json()
+            except ValueError:
+                logger.warning("Enformion AddressID returned non-JSON body")
+                return {}
+
+        if resp.status_code in (429, 500, 502, 503, 504) and attempt + 1 < _MAX_RETRIES:
+            logger.info("Enformion AddressID HTTP %d — retrying in 5s", resp.status_code)
+            time.sleep(5)
+            continue
+
+        if resp.status_code in (401, 403):
+            with _lock:
+                _disabled_reason = f"http_{resp.status_code}"
+            logger.error(
+                "Enformion AddressID HTTP %d — credentials invalid. Disabling.",
+                resp.status_code,
+            )
+            return {}
+
+        logger.warning(
+            "Enformion AddressID HTTP %d for %s: %s",
+            resp.status_code, street, (resp.text or "")[:800],
+        )
+        return {}
+
+    return {}
+
+
+def address_id_person(response: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the top person from an AddressID response, or None.
+
+    AddressID responses use the same 'persons' array shape as Person Search.
+    """
+    if not response:
+        return None
+    persons = (response.get("persons") or response.get("people")
+               or response.get("results") or [])
+    return persons[0] if persons else None
 
 
 def person_search(
@@ -285,13 +396,13 @@ def person_search(
             logger.error(
                 "Enformion HTTP %d — credentials invalid or access-profile "
                 "revoked. Disabling Enformion for this run. Body: %s",
-                resp.status_code, (resp.text or "")[:200],
+                resp.status_code, (resp.text or "")[:800],
             )
             return {}
 
         logger.warning(
             "Enformion HTTP %d for %s %s: %s",
-            resp.status_code, first, last, (resp.text or "")[:160],
+            resp.status_code, first, last, (resp.text or "")[:800],
         )
         return {}
 
