@@ -141,6 +141,81 @@ async def _click_next_step(page: Page, timeout: int = 20000) -> bool:
     return False
 
 
+async def _add_custom_tag(page: Page, tag_name: str) -> bool:
+    """Type a tag into the wizard-Step-3 Custom Tags input + confirm.
+
+    Returns True if the input was found and a submit path fired; False if
+    the input wasn't found. Same defensive selectors + fallbacks as the
+    original inline implementation — DataSift rotates placeholder wording
+    across builds and the autocomplete-vs-add-button behavior varies.
+
+    NB: the caller advances to Step 4 after all custom tags are added;
+    this helper does NOT click Next Step.
+    """
+    try:
+        tag_input = page.locator(
+            'input[placeholder*="Search or add a new tag"], '
+            'input[placeholder*="Search or add"], '
+            'input[placeholder*="add a new tag"], '
+            'input[placeholder*="add tag" i], '
+            'input[placeholder*="tag" i]:visible'
+        )
+        if await tag_input.count() == 0:
+            tag_input = page.locator('input[type="text"]:visible')
+        if await tag_input.count() == 0:
+            logger.warning("Tag input not found — %r NOT added", tag_name)
+            return False
+
+        await tag_input.first.click()
+        await page.wait_for_timeout(500)
+        await tag_input.first.fill("")
+        await page.wait_for_timeout(300)
+        await tag_input.first.type(tag_name, delay=50)
+        await page.wait_for_timeout(1500)
+
+        tag_option = page.locator(f'text="{tag_name}"')
+        tag_count = await tag_option.count()
+        if tag_count > 1:
+            await tag_option.nth(1).click()
+            await page.wait_for_timeout(1000)
+            logger.info("Selected %r from dropdown", tag_name)
+        elif tag_count == 1:
+            tag_box = await tag_option.first.bounding_box()
+            if tag_box and tag_box["y"] > 350:
+                await tag_option.first.click()
+                await page.wait_for_timeout(1000)
+                logger.info("Selected %r from dropdown", tag_name)
+            else:
+                await tag_input.first.press("Enter")
+                await page.wait_for_timeout(1000)
+                logger.info("Added %r tag (via Enter)", tag_name)
+        else:
+            added = await page.evaluate('''() => {
+                const els = document.querySelectorAll('span, div, a, button, p');
+                for (const el of els) {
+                    const text = el.textContent.trim();
+                    const rect = el.getBoundingClientRect();
+                    if (text === "Add" && rect.width > 0 && rect.width < 60
+                        && rect.x > 700 && rect.y > 250 && rect.y < 400) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }''')
+            if added:
+                await page.wait_for_timeout(1000)
+                logger.info("Created %r tag via Add button", tag_name)
+            else:
+                await tag_input.first.press("Enter")
+                await page.wait_for_timeout(1000)
+                logger.info("Added %r tag (via Enter fallback)", tag_name)
+        return True
+    except Exception as e:
+        logger.warning("Failed to add %r tag: %s", tag_name, e)
+        return False
+
+
 async def upload_csv(
     page: Page,
     csv_path: Path,
@@ -149,6 +224,7 @@ async def upload_csv(
     list_name: str | None = None,
     existing_list: bool = False,
     swap_owners: bool = False,
+    extra_custom_tags: list[str] | None = None,
 ) -> dict:
     """Upload a CSV file to DataSift via the 6-step upload wizard.
 
@@ -686,82 +762,29 @@ async def upload_csv(
     await page.wait_for_timeout(1000)
     await _screenshot(page, "step3_tags")
 
-    # Add "Courthouse Data" tag via the Custom Tags input on the right side.
-    # Try multiple placeholder variants because DataSift has rotated the
-    # exact wording across builds. Falls back to "first visible text input
-    # on the page" which is usually the tag autocomplete on the Add tags
-    # step.
-    try:
-        tag_input = page.locator(
-            'input[placeholder*="Search or add a new tag"], '
-            'input[placeholder*="Search or add"], '
-            'input[placeholder*="add a new tag"], '
-            'input[placeholder*="add tag" i], '
-            'input[placeholder*="tag" i]:visible'
-        )
-        if await tag_input.count() == 0:
-            # Last-resort fallback — any visible text input on the wizard
-            # page. Add Tags has exactly one prominent input; should be it.
-            tag_input = page.locator('input[type="text"]:visible')
-        if await tag_input.count() > 0:
-            # Click input first, then type to trigger autocomplete dropdown
-            await tag_input.first.click()
-            await page.wait_for_timeout(500)
-            await tag_input.first.fill("")
-            await page.wait_for_timeout(300)
-            await tag_input.first.type("Courthouse Data", delay=50)
-            await page.wait_for_timeout(1500)
-            await _screenshot(page, "step3_tag_typed")
+    # Add tags via the Custom Tags input on the right side. Adds
+    # "Courthouse Data" (baseline signal for every SiftStack upload)
+    # PLUS any per-CSV subtype tag the caller supplied (e.g.
+    # "foreclosure_cancelled" on the T&B cancelled CSV).
+    #
+    # Why wizard tags instead of CSV Tags column: verified 2026-07-20
+    # via headed diagnostic that DataSift's upload wizard auto-completes
+    # Step 5 (Map the columns) without ever rendering draggable source
+    # cards for our CSV shape. The CSV's Tags column NEVER auto-maps
+    # to the Tags target, and our drag code fails silently. But the
+    # wizard's Step-3 Custom Tags input DOES apply to every record in
+    # the session. Since per-distressor CSVs are homogeneous (all
+    # cancelled, all postponed, all creditors, etc.), adding the
+    # subtype here gives every record in the session the same tag.
+    tags_to_add = ["Courthouse Data"]
+    if extra_custom_tags:
+        for t in extra_custom_tags:
+            t = (t or "").strip()
+            if t and t not in tags_to_add:
+                tags_to_add.append(t)
 
-            # Check if "Courthouse Data" appears in autocomplete dropdown — click it
-            tag_option = page.locator('text="Courthouse Data"')
-            tag_count = await tag_option.count()
-            if tag_count > 1:
-                # Multiple matches — click the one in the dropdown (not the input)
-                await tag_option.nth(1).click()
-                await page.wait_for_timeout(1000)
-                logger.info("Selected 'Courthouse Data' from dropdown")
-            elif tag_count == 1:
-                # Check if it's the input value or a dropdown option
-                tag_box = await tag_option.first.bounding_box()
-                if tag_box and tag_box["y"] > 350:
-                    # It's below the input — it's a dropdown option
-                    await tag_option.first.click()
-                    await page.wait_for_timeout(1000)
-                    logger.info("Selected 'Courthouse Data' from dropdown")
-                else:
-                    # It's the input itself — use JS to click "Add" or press Enter
-                    await tag_input.first.press("Enter")
-                    await page.wait_for_timeout(1000)
-                    logger.info("Added 'Courthouse Data' tag (via Enter)")
-            else:
-                # No dropdown match — click "Add" via JS to create new tag
-                added = await page.evaluate('''() => {
-                    const els = document.querySelectorAll('span, div, a, button, p');
-                    for (const el of els) {
-                        const text = el.textContent.trim();
-                        const rect = el.getBoundingClientRect();
-                        if (text === "Add" && rect.width > 0 && rect.width < 60
-                            && rect.x > 700 && rect.y > 250 && rect.y < 400) {
-                            el.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                }''')
-                if added:
-                    await page.wait_for_timeout(1000)
-                    logger.info("Created 'Courthouse Data' tag via Add button")
-                else:
-                    await tag_input.first.press("Enter")
-                    await page.wait_for_timeout(1000)
-                    logger.info("Added 'Courthouse Data' tag (via Enter fallback)")
-
-            await _screenshot(page, "step3_tag_added")
-        else:
-            logger.warning("Tag input not found — 'Courthouse Data' tag NOT added")
-    except Exception as e:
-        logger.warning("Tag addition failed: %s", e)
+    for tag_name in tags_to_add:
+        await _add_custom_tag(page, tag_name)
 
     await _click_next_step(page)
 
@@ -1026,6 +1049,7 @@ async def upload_csv_swap_owner(
     csv_path: Path,
     *,
     tag: str = "Courthouse Data",
+    extra_custom_tags: list[str] | None = None,
 ) -> dict:
     """Upload a CSV via the 'Swap owner of existing property' wizard mode.
 
@@ -1191,25 +1215,16 @@ async def upload_csv_swap_owner(
         pass
 
     if not already_on_step3:
-        logger.info("Swap Step 2: Add tags — adding %r", tag)
-        try:
-            tag_input = page.locator(
-                'input[placeholder*="Search or add a new tag"], '
-                'input[placeholder*="tag"]'
-            )
-            if await tag_input.count() > 0:
-                await tag_input.first.fill(tag)
-                await page.wait_for_timeout(800)
-                await tag_input.first.press("Enter")
-                await page.wait_for_timeout(1000)
-                logger.info("Added tag %r", tag)
-            else:
-                logger.info(
-                    "Tag input not present on Step 2 — relying on CSV's "
-                    "Tags column to carry the tag via swap-mode auto-map"
-                )
-        except Exception as e:
-            logger.warning("Swap-mode tag add failed: %s", e)
+        # Add the baseline tag PLUS any per-CSV extra tags (subtype).
+        tags_to_add = [tag]
+        if extra_custom_tags:
+            for t in extra_custom_tags:
+                t = (t or "").strip()
+                if t and t not in tags_to_add:
+                    tags_to_add.append(t)
+        logger.info("Swap Step 2: Add tags — adding %r", tags_to_add)
+        for tag_name in tags_to_add:
+            await _add_custom_tag(page, tag_name)
 
         await _screenshot(page, "swap_step2_tag_added")
         # Advance to Step 3 only if we're not already there.
@@ -2384,22 +2399,45 @@ async def upload_to_datasift_per_distressor(
             else:
                 effective_mode = mode
 
+            # Extract the CSV's high-signal subtype tag (if any) so we can
+            # add it as an extra wizard-Step-3 Custom Tag alongside
+            # "Courthouse Data". Rationale: verified 2026-07-20 that
+            # DataSift's upload wizard auto-completes Step 5 without
+            # rendering draggable column-mapping cards for our CSV shape;
+            # the CSV's Tags column NEVER auto-maps + our drag code
+            # fails silently. So per-record tags (foreclosure_cancelled,
+            # foreclosure_postponed, probate_sale, probate_final_settlement)
+            # are lost. Since per-distressor CSVs are homogeneous (all
+            # rows share the same subtype), reading row 1's subtype and
+            # adding it as a wizard tag gives every uploaded record the
+            # right subtype tag. Only whitelisted high-signal subtypes
+            # are promoted — see _TAG_PROMOTABLE_SUBTYPES in datasift_formatter.
+            _PROMOTABLE = {
+                "foreclosure_cancelled",
+                "foreclosure_postponed",
+                "probate_sale",
+                "probate_final_settlement",
+            }
+            row1_subtype = (rows[0].get("Probate Subtype") or "").strip().lower()
+            extra_tags = [row1_subtype] if row1_subtype in _PROMOTABLE else None
+
             if effective_mode == "swap":
                 logger.info(
-                    "Pass-2 swap-owner mode (notice_type=%s, list=%s) — "
-                    "updating owner/contact on existing records",
-                    notice_type, list_name,
+                    "Pass-2 swap-owner mode (notice_type=%s, list=%s, "
+                    "extra_tags=%s) — updating owner/contact on existing records",
+                    notice_type, list_name, extra_tags,
                 )
                 r = await upload_csv_swap_owner(
                     page,
                     csv_path,
                     tag="Courthouse Data",
+                    extra_custom_tags=extra_tags,
                 )
             else:  # "add"
                 logger.info(
-                    "Pass-1 Add-Data mode (notice_type=%s, list=%s) — "
-                    "creating records + auto-mapping core fields",
-                    notice_type, list_name,
+                    "Pass-1 Add-Data mode (notice_type=%s, list=%s, "
+                    "extra_tags=%s) — creating records + auto-mapping core fields",
+                    notice_type, list_name, extra_tags,
                 )
                 r = await upload_csv(
                     page,
@@ -2411,6 +2449,7 @@ async def upload_to_datasift_per_distressor(
                     # swap-owner wizard mode. Mixing Step-2 toggle here
                     # would re-create the 2026-06-25 silent-no-op bug.
                     swap_owners=False,
+                    extra_custom_tags=extra_tags,
                 )
             r["notice_type"] = notice_type
             r["list_name"] = list_name
