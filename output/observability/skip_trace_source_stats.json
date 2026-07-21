@@ -1,0 +1,18 @@
+[
+  {
+    "run_date": "2026-07-21",
+    "run_time": "08:27:56",
+    "pipeline": "pre_probate",
+    "notices_analyzed": 20,
+    "sources": {
+      "enformion": {
+        "records_contributed_to": 17,
+        "total_phones": 404,
+        "tier_distribution": {
+          "(unscored)": 404
+        },
+        "corroborated_phones": 0
+      }
+    }
+  }
+]
