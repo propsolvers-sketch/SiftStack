@@ -274,19 +274,25 @@ async def upload_csv(
         await page.goto(DATASIFT_UPLOAD_URL, wait_until="domcontentloaded")
 
     # SPA sidebar renders progressively — actively wait for the "Upload File"
-    # link instead of a fixed sleep. Cold-start runs on GHA can take 15-25s
-    # for the sidebar to fully render even after domcontentloaded fires;
-    # 2026-07-22 first-upload-of-day failed the fixed 8s sleep with
-    # "Could not find Upload File button" while all subsequent uploads
-    # (once the SPA was warm) succeeded within 1s. Waiting for the actual
-    # target element up to 45s eliminates the cold-start race without
-    # slowing warm runs (they resolve immediately).
+    # link instead of a fixed sleep. 2026-07-23 headed diagnostic confirmed:
+    #   * button IS a <div class="AdminSideBar__StyledUploadButton-..."> at
+    #     x=18, y=738, w=208, h=38 (bottom of sidebar, below MONTHLY LIMIT
+    #     usage bar) — was never an <a> or <button> element
+    #   * with our previous viewport=1280x720, y=738 is BELOW the fold, so
+    #     Playwright never scrolls it into view for click. That's why every
+    #     Add-Data upload on 2026-07-22/23 failed with "Could not find
+    #     Upload File button" — the element existed in DOM but was off-
+    #     screen and generic text-based locators either missed it or
+    #     landed on a huge wrapper div containing the text.
+    # Fix: class-based selector as primary (styled-component name uniquely
+    # identifies THE upload button), plus viewport bumped to 900 in the
+    # per_distressor entry point so the button is on-screen for click().
     _UPLOAD_BTN_SELECTOR = (
-        'a:has-text("Upload File"), '
-        'div:has-text("Upload File") >> visible=true, '
+        '[class*="StyledUploadButton"], '
+        'div[class*="AdminSideBar"][class*="Upload"], '
         'button:has-text("Upload File"), '
-        '[data-testid="upload-file"], '
-        'text="Upload File"'
+        'a:has-text("Upload File"), '
+        '[data-testid="upload-file"]'
     )
     upload_btn_found = False
     for attempt in (1, 2):
@@ -2070,7 +2076,7 @@ async def upload_to_datasift(
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
         context = await browser.new_context(
-            viewport={"width": 1280, "height": 720},
+            viewport={"width": 1280, "height": 900},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -2156,7 +2162,7 @@ async def upload_datasift_split(
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
         context = await browser.new_context(
-            viewport={"width": 1280, "height": 720},
+            viewport={"width": 1280, "height": 900},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -2378,7 +2384,7 @@ async def upload_to_datasift_per_distressor(
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
         context = await browser.new_context(
-            viewport={"width": 1280, "height": 720},
+            viewport={"width": 1280, "height": 900},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -3170,7 +3176,7 @@ async def run_phone_validation_workflow(
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=headless)
             context = await browser.new_context(
-                viewport={"width": 1280, "height": 720},
+                viewport={"width": 1280, "height": 900},
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -3229,7 +3235,7 @@ async def run_phone_validation_workflow(
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=headless)
                 context = await browser.new_context(
-                    viewport={"width": 1280, "height": 720},
+                    viewport={"width": 1280, "height": 900},
                     user_agent=(
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "

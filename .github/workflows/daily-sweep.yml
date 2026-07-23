@@ -222,7 +222,16 @@ jobs:
         env:
           ENFORMION_AP_NAME: ${{ secrets.ENFORMION_AP_NAME }}
           ENFORMION_AP_PASSWORD: ${{ secrets.ENFORMION_AP_PASSWORD }}
-          ENFORMION_BUDGET: "300"
+          # Enformion DevAPI plan caps at 100 searches/month. Confirmed
+          # via 2026-07-23 cron log: "Current usage per month is: 113,
+          # max allowed per month is: 100". 300/run × 30 days would blow
+          # the monthly cap on the FIRST day. Capping per-run at 5
+          # keeps monthly usage under 150 even in a worst-case
+          # 30-day-of-running scenario (well under the 100 cap when
+          # some days no-op). If the plan is upgraded, bump this back
+          # up proportionally — a $30-50/mo tier gives ~1000/month
+          # (safe to use 30/run then).
+          ENFORMION_BUDGET: "5"
         run: |
           python src/pre_probate_pipeline_al.py \
             --markets Birmingham,Huntsville,Marshall \
