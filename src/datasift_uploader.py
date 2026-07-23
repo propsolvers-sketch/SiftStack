@@ -272,39 +272,71 @@ async def upload_csv(
     # Navigate to records page (skip if already there from login)
     if "/records" not in page.url:
         await page.goto(DATASIFT_UPLOAD_URL, wait_until="domcontentloaded")
-    # Wait for SPA to fully render (longer for headless/cloud environments)
-    await page.wait_for_timeout(8000)
 
-    # Dismiss notifications popup if present
-    try:
-        no_thanks = page.locator('button:has-text("NO, THANKS"), button:has-text("No, thanks")')
-        if await no_thanks.count() > 0:
-            await no_thanks.first.click()
-            await page.wait_for_timeout(500)
-            logger.debug("Dismissed notifications popup")
-    except Exception as e:
-        logger.debug("Popup dismissal failed: %s", e)
-
-    try:
-        # The Upload File button is in the sidebar — it's a styled element, not a <button>
-        upload_btn = page.locator('text="Upload File"')
-        if await upload_btn.count() == 0:
-            upload_btn = page.locator(
-                'a:has-text("Upload File"), '
-                'div:has-text("Upload File") >> visible=true, '
-                'button:has-text("Upload File"), '
-                '[data-testid="upload-file"]'
+    # SPA sidebar renders progressively — actively wait for the "Upload File"
+    # link instead of a fixed sleep. Cold-start runs on GHA can take 15-25s
+    # for the sidebar to fully render even after domcontentloaded fires;
+    # 2026-07-22 first-upload-of-day failed the fixed 8s sleep with
+    # "Could not find Upload File button" while all subsequent uploads
+    # (once the SPA was warm) succeeded within 1s. Waiting for the actual
+    # target element up to 45s eliminates the cold-start race without
+    # slowing warm runs (they resolve immediately).
+    _UPLOAD_BTN_SELECTOR = (
+        'a:has-text("Upload File"), '
+        'div:has-text("Upload File") >> visible=true, '
+        'button:has-text("Upload File"), '
+        '[data-testid="upload-file"], '
+        'text="Upload File"'
+    )
+    upload_btn_found = False
+    for attempt in (1, 2):
+        # Dismiss notifications popup if it's stealing pointer events
+        try:
+            no_thanks = page.locator(
+                'button:has-text("NO, THANKS"), button:has-text("No, thanks")'
             )
-        if await upload_btn.count() > 0:
-            await upload_btn.first.click()
-            await page.wait_for_timeout(3000)
-        else:
-            await _screenshot(page, "step1_no_upload_btn")
-            result["message"] = "Could not find Upload File button"
-            logger.error(result["message"])
-            return result
+            if await no_thanks.count() > 0:
+                await no_thanks.first.click()
+                await page.wait_for_timeout(500)
+                logger.debug("Dismissed notifications popup")
+        except Exception as e:
+            logger.debug("Popup dismissal failed: %s", e)
+
+        # Wait UP TO 45s for the Upload File link to become visible.
+        # First attempt uses the full 45s; second attempt uses 20s
+        # since the page has already been reloaded and should render faster.
+        wait_ms = 45_000 if attempt == 1 else 20_000
+        try:
+            await page.locator(_UPLOAD_BTN_SELECTOR).first.wait_for(
+                state="visible", timeout=wait_ms,
+            )
+            upload_btn_found = True
+            break
+        except PwTimeout:
+            logger.warning(
+                "Upload File button not visible after %ds on attempt %d — "
+                "reloading page and retrying",
+                wait_ms // 1000, attempt,
+            )
+            await _screenshot(page, f"step1_no_upload_btn_attempt{attempt}")
+            if attempt == 1:
+                # Hard reload — clears any transient SPA render state
+                await page.reload(wait_until="domcontentloaded")
+
+    if not upload_btn_found:
+        result["message"] = (
+            "Could not find Upload File button after 2 attempts + page reload "
+            "(waited 45s + 20s). DataSift SPA may be down or login is stale."
+        )
+        logger.error(result["message"])
+        return result
+
+    try:
+        upload_btn = page.locator(_UPLOAD_BTN_SELECTOR)
+        await upload_btn.first.click()
+        await page.wait_for_timeout(3000)
     except Exception as e:
-        result["message"] = f"Step 1 failed: {e}"
+        result["message"] = f"Step 1 click failed after button became visible: {e}"
         logger.error(result["message"])
         return result
 
