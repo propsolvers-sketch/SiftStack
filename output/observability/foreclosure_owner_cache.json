@@ -1,7 +1,7 @@
 {
   "100 SUFFOLK DR|MADISON|35757": {
     "first_seen": "2026-07-16",
-    "last_seen": "2026-07-16",
+    "last_seen": "2026-07-23",
     "owner_name": "MIQUEL, BECCERRA SANCHEZ",
     "source": "apn"
   },
@@ -23,6 +23,12 @@
     "owner_name": "DWIGHT, CHRISTOLEAR",
     "source": "apn"
   },
+  "112 MCMEANS LN|HUNTSVILLE|35811": {
+    "first_seen": "2026-07-23",
+    "last_seen": "2026-07-23",
+    "owner_name": "CARRIE, HIPKINS SOLE OWNERSHIP",
+    "source": "apn"
+  },
   "1152 LAY DR|BIRMINGHAM|35215": {
     "first_seen": "2026-07-15",
     "last_seen": "2026-07-15",
@@ -31,8 +37,20 @@
   },
   "116 PEARLE COVE DR|HUNTSVILLE|35806": {
     "first_seen": "2026-07-16",
-    "last_seen": "2026-07-16",
+    "last_seen": "2026-07-23",
     "owner_name": "ANDRE, DUVAR JACOBS",
+    "source": "apn"
+  },
+  "128 CASPIAN LN|MERIDIANVILLE|35759": {
+    "first_seen": "2026-07-23",
+    "last_seen": "2026-07-23",
+    "owner_name": "ALYX, SKYWALKER",
+    "source": "apn"
+  },
+  "1316 STONEHURST DR|BIRMINGHAM|35235": {
+    "first_seen": "2026-07-23",
+    "last_seen": "2026-07-23",
+    "owner_name": "Patrick, Robinson Sr",
     "source": "apn"
   },
   "1338 DEER TRL RD|HOOVER|35226": {
@@ -59,6 +77,12 @@
     "owner_name": "Amanda, Turner",
     "source": "apn"
   },
+  "1538 HIDDEN LAKE DR|BIRMINGHAM|35235": {
+    "first_seen": "2026-07-23",
+    "last_seen": "2026-07-23",
+    "owner_name": "MICHAEL, JOE BYERS",
+    "source": "apn"
+  },
   "1577 BREWSTER CIR|BIRMINGHAM|35235": {
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-16",
@@ -71,6 +95,12 @@
     "owner_name": "SHARON, WRIGHT AKA SHARON WRIGHT",
     "source": "apn"
   },
+  "1616 MARALYN DR|BIRMINGHAM|35235": {
+    "first_seen": "2026-07-23",
+    "last_seen": "2026-07-23",
+    "owner_name": "TIFFANY, FLOYD-ELLIOTT",
+    "source": "apn"
+  },
   "181 ROYAL COACH CIR|BESSEMER|35022": {
     "first_seen": "2026-07-15",
     "last_seen": "2026-07-22",
@@ -79,7 +109,7 @@
   },
   "208 OAKVIEW RD|HAZEL GREEN|35750": {
     "first_seen": "2026-07-16",
-    "last_seen": "2026-07-16",
+    "last_seen": "2026-07-23",
     "owner_name": "THOMAS, WATSON",
     "source": "apn"
   },
@@ -91,7 +121,7 @@
   },
   "2616 OAKDALE TER NW|HUNTSVILLE|35810": {
     "first_seen": "2026-07-16",
-    "last_seen": "2026-07-16",
+    "last_seen": "2026-07-23",
     "owner_name": "Willie, Lafleur Jr",
     "source": "apn"
   },
@@ -103,7 +133,7 @@
   },
   "284 MCDONALD LN|GUNTERSVILLE|35976": {
     "first_seen": "2026-07-16",
-    "last_seen": "2026-07-16",
+    "last_seen": "2026-07-23",
     "owner_name": "William, Chase Swearengin",
     "source": "apn"
   },
@@ -111,6 +141,12 @@
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-22",
     "owner_name": "William, Lewis Denton Aka William Denton Geraldine Denton",
+    "source": "apn"
+  },
+  "308 MCALPINE DR SE|HUNTSVILLE|35803": {
+    "first_seen": "2026-07-23",
+    "last_seen": "2026-07-23",
+    "owner_name": "John, Crosier Jr",
     "source": "apn"
   },
   "3150 PINECREEK LOOP|BESSEMER|35022": {
@@ -129,6 +165,12 @@
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-16",
     "owner_name": "DOUGLAS, KEEL",
+    "source": "apn"
+  },
+  "4030 MCCLANAHAN RD|BESSEMER|35022": {
+    "first_seen": "2026-07-23",
+    "last_seen": "2026-07-23",
+    "owner_name": "Charles, Smith",
     "source": "apn"
   },
   "4554 BROOKSHIRE LOOP|BESSEMER|35022": {
@@ -167,6 +209,18 @@
     "owner_name": "ANGELA, MORGAN ADAMS",
     "source": "apn"
   },
+  "6263 CLAY PALMERDALE RD|PINSON|35126": {
+    "first_seen": "2026-07-23",
+    "last_seen": "2026-07-23",
+    "owner_name": "LACEY, NICHOLE WILLIAMS",
+    "source": "apn"
+  },
+  "668 COALFIRE AVE|HUEYTOWN|35023": {
+    "first_seen": "2026-07-23",
+    "last_seen": "2026-07-23",
+    "owner_name": "Barbara, Thomas Aka Barbara Pippens Thomas",
+    "source": "apn"
+  },
   "6832 BRITTANY PL|PINSON|35126": {
     "first_seen": "2026-07-15",
     "last_seen": "2026-07-15",
@@ -175,13 +229,13 @@
   },
   "686 MEADOW WOOD CIR NW|ARAB|35016": {
     "first_seen": "2026-07-16",
-    "last_seen": "2026-07-16",
+    "last_seen": "2026-07-23",
     "owner_name": "WALTER, MULLINIX III",
     "source": "apn"
   },
   "7 KEYSTONE TRL|GRANT|35747": {
     "first_seen": "2026-07-16",
-    "last_seen": "2026-07-16",
+    "last_seen": "2026-07-23",
     "owner_name": "Misty, Hall",
     "source": "apn"
   },
@@ -213,6 +267,12 @@
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-22",
     "owner_name": "Mattie, Jones",
+    "source": "apn"
+  },
+  "900 SHARP DR|BIRMINGHAM|35235": {
+    "first_seen": "2026-07-23",
+    "last_seen": "2026-07-23",
+    "owner_name": "JOEL, POOLE",
     "source": "apn"
   },
   "909 19TH CT NW|BIRMINGHAM|35215": {
