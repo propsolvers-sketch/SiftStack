@@ -59,6 +59,12 @@
     "owner_name": "Patrice, Struggs",
     "source": "apn"
   },
+  "145 BAKER AVE|HUEYTOWN|35023": {
+    "first_seen": "2026-07-25",
+    "last_seen": "2026-07-25",
+    "owner_name": "Angela, Pylant",
+    "source": "apn"
+  },
   "1464 ARROW POINT DR|BIRMINGHAM|35214": {
     "first_seen": "2026-07-15",
     "last_seen": "2026-07-15",
@@ -95,6 +101,12 @@
     "owner_name": "SHARON, WRIGHT AKA SHARON WRIGHT",
     "source": "apn"
   },
+  "1616 FARMINGTON RD|BIRMINGHAM|35235": {
+    "first_seen": "2026-07-25",
+    "last_seen": "2026-07-25",
+    "owner_name": "LANIA, KEYON COLE",
+    "source": "apn"
+  },
   "1616 MARALYN DR|BIRMINGHAM|35235": {
     "first_seen": "2026-07-23",
     "last_seen": "2026-07-23",
@@ -113,16 +125,34 @@
     "owner_name": "THOMAS, WATSON",
     "source": "apn"
   },
+  "2356 7TH ST NW|CENTER POINT|35215": {
+    "first_seen": "2026-07-25",
+    "last_seen": "2026-07-25",
+    "owner_name": "Richardson, Richardson",
+    "source": "apn"
+  },
   "2508 ARCADIA PL|BIRMINGHAM|35214": {
     "first_seen": "2026-07-15",
     "last_seen": "2026-07-15",
     "owner_name": "Timothy, Lee",
     "source": "apn"
   },
+  "2605 IVY CIR|BIRMINGHAM|35226": {
+    "first_seen": "2026-07-25",
+    "last_seen": "2026-07-25",
+    "owner_name": "Linda, Martin",
+    "source": "apn"
+  },
   "2616 OAKDALE TER NW|HUNTSVILLE|35810": {
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-23",
     "owner_name": "Willie, Lafleur Jr",
+    "source": "apn"
+  },
+  "27 HOUSTON RD NW|BIRMINGHAM|35215": {
+    "first_seen": "2026-07-25",
+    "last_seen": "2026-07-25",
+    "owner_name": "Tavaris, Brad Daniel",
     "source": "apn"
   },
   "2728 6TH ST NE|CENTER POINT|35215": {
@@ -179,6 +209,12 @@
     "owner_name": "Luis, Brewton",
     "source": "apn"
   },
+  "4611 ROSSER LOOP DR|BESSEMER|35022": {
+    "first_seen": "2026-07-25",
+    "last_seen": "2026-07-25",
+    "owner_name": "DERRICK, FIELDS",
+    "source": "apn"
+  },
   "4857 WOOD SPRINGS LN|HOOVER|35226": {
     "first_seen": "2026-07-15",
     "last_seen": "2026-07-15",
@@ -201,6 +237,12 @@
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-22",
     "owner_name": "GERMAN, BRAVO HERNANDEZ",
+    "source": "apn"
+  },
+  "536 27TH AVE NW|CENTER POINT|35215": {
+    "first_seen": "2026-07-25",
+    "last_seen": "2026-07-25",
+    "owner_name": "Juan, Carlos Perdomo",
     "source": "apn"
   },
   "5643 DESOTO DR|PINSON|35126": {
@@ -267,6 +309,12 @@
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-22",
     "owner_name": "Mattie, Jones",
+    "source": "apn"
+  },
+  "900 COUNTRY VIEW CT|BIRMINGHAM|35215": {
+    "first_seen": "2026-07-25",
+    "last_seen": "2026-07-25",
+    "owner_name": "Angela, Thomas",
     "source": "apn"
   },
   "900 SHARP DR|BIRMINGHAM|35235": {
