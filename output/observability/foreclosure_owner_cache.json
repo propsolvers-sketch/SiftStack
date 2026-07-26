@@ -299,6 +299,12 @@
     "owner_name": "BEATRICE, MULLIN",
     "source": "apn"
   },
+  "8317 AL HWY|AL|35980": {
+    "first_seen": "2026-07-26",
+    "last_seen": "2026-07-26",
+    "owner_name": "Kelsey, Tucker",
+    "source": "apn"
+  },
   "8384 COUNTRY CIR|PINSON|35126": {
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-22",
@@ -339,6 +345,12 @@
     "first_seen": "2026-07-15",
     "last_seen": "2026-07-15",
     "owner_name": "JULIETT, MARLEAN BROOKS",
+    "source": "apn"
+  },
+  "983 LOOKOUT DR|ARAB|35016": {
+    "first_seen": "2026-07-26",
+    "last_seen": "2026-07-26",
+    "owner_name": "MICHAEL, CLARK",
     "source": "apn"
   }
 }
