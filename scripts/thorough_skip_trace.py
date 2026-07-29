@@ -320,7 +320,15 @@ def _process_record(
     # Enformion's household_search returns EVERY person at the address
     # (spouse, adult children living there, other relatives) — additive
     # to Tracerfy/DataSift which typically only find the primary owner.
-    # Skip if owner name isn't resolved (Enformion needs LastName + address).
+    #
+    # Preconditions:
+    #   * Owner last-name resolved (Enformion needs LastName)
+    #   * Full address (street + state + zip) present
+    #   * Record is NOT on the Code Violation list (operator decision
+    #     2026-07-28: skip Enformion on CV records since they're primarily
+    #     door-knock / postcard outreach and heir-graph enrichment doesn't
+    #     move the needle enough to justify $0.10/skip). DataSift native
+    #     skip-trace + Trestle tiering still runs on CV records.
     owner = refreshed.get("owner") or {}
     owner_last = (owner.get("last_name") or "").strip()
     owner_addr = owner.get("address") or refreshed.get("address") or {}
@@ -329,8 +337,15 @@ def _process_record(
     addr_state = (owner_addr.get("state") or "").strip()
     addr_zip = (owner_addr.get("postal_code") or "").strip()
 
+    # Code Violation list UUID (probed 2026-07-28 via /list/)
+    _CODE_VIOLATION_LIST_UUID = "c4d2bdeb-eb28-4276-a0e9-7b3c91b735e2"
+    record_lists = refreshed.get("lists") or []
+    is_code_violation = _CODE_VIOLATION_LIST_UUID in record_lists
+
     enformion_phones: set[str] = set()
-    if (enf.is_configured() and owner_last and addr_street
+    if is_code_violation:
+        logger.debug("  Skipping Enformion (record is on Code Violation list)")
+    elif (enf.is_configured() and owner_last and addr_street
             and addr_state and addr_zip):
         result.enformion_ran = True
         try:
@@ -406,11 +421,12 @@ def _process_record(
                              sorted(tier_counts.items(),
                                     key=lambda kv: pv.DEFAULT_TIERS.get(kv[0], (0,0))[1],
                                     reverse=True))
-    enf_line = (
-        f"Enformion household new phones: {result.new_phones_enformion}"
-        if result.enformion_ran
-        else "Enformion: skipped (no owner name + address on record)"
-    )
+    if result.enformion_ran:
+        enf_line = f"Enformion household new phones: {result.new_phones_enformion}"
+    elif is_code_violation:
+        enf_line = "Enformion: skipped (Code Violation record; heir enrichment disabled per operator policy)"
+    else:
+        enf_line = "Enformion: skipped (no owner name + address on record)"
     notes = (
         "\n=== SKIP-TRACE (3-vendor cascade) ===\n"
         f"Pre-cascade phones: {result.phones_before} (Tracerfy upstream)\n"

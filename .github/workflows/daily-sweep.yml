@@ -525,11 +525,14 @@ jobs:
           ENFORMION_AP_NAME: ${{ secrets.ENFORMION_AP_NAME }}
           ENFORMION_AP_PASSWORD: ${{ secrets.ENFORMION_AP_PASSWORD }}
           # Cascade-step Enformion cap. Fires for records with an owner
-          # last-name + address. At $0.10/skip, 50/run = ~$5/day max
-          # here; combined with scraper-stage cap above (also 50), whole-
-          # day worst-case is ~$10 on a high-volume day. Independent
-          # process → independent budget counter.
-          ENFORMION_BUDGET: "50"
+          # last-name + address (Code Violation records are excluded per
+          # operator policy 2026-07-28). At $0.10/skip, 100/run comfortably
+          # handles the observed peak day (Sun 2026-07-19 = 107 records
+          # with Code Violation excluded → ~64 Enformion calls needed) with
+          # 36-call headroom. Median week (~254 records) runs ~$15 in
+          # cascade Enformion spend. Independent process → independent
+          # budget counter from the scraper-stage cap above.
+          ENFORMION_BUDGET: "100"
         run: |
           python scripts/thorough_skip_trace.py --since-hours 24 --max-records 200 -v \
             2>&1 | tee logs/thorough_skip_trace_${{ steps.run_start.outputs.ts }}.log
