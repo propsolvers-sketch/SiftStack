@@ -496,6 +496,39 @@ jobs:
           python src/datasift_skip_trace.py --headless -v \
             2>&1 | tee logs/daily_datasift_st_${{ steps.run_start.outputs.ts }}.log
 
+      # ── Thorough skip-trace cascade (3-vendor + Trestle tiering) ─────────
+      # The DataSift Open API dropped 2026-07-25. This step runs AFTER all
+      # uploads complete and per-record cascades:
+      #
+      #   1. Tracerfy   — populated upstream (batch API on the pipeline path)
+      #   2. DataSift   — POST /property/skip-trace/ to trigger DataSift's own
+      #                    vendor (Business plan + unlimited skip-trace add-on)
+      #   3. Enformion  — populated upstream when quota allows (100/mo cap;
+      #                    auto-resumes 2026-08-01 after this month's reset)
+      #
+      # Then Trestle-scores every unique phone → assigns Dial First / Second /
+      # Third / Fourth / Drop tier → POSTs /property/{uuid}/add-phone-tag/ so
+      # DataSift filter presets on phone_tags:Dial First actually return
+      # records (they haven't been, because the CSV upload wizard silently
+      # dropped the Phone Tags column — that's the mid-2026 bug this whole
+      # API migration is fixing).
+      #
+      # Also appends a "=== SKIP-TRACE ===" summary block to the record's
+      # Notes so the operator sees per-record vendor contribution + tier
+      # counts inline during outreach (Notes are load-bearing UX per
+      # feedback_datasift_notes_are_load_bearing memory).
+      #
+      # continue-on-error: true — a single stuck record shouldn't fail the
+      # cron. --max-records 200 is a safety cap (~50-70 real records/day).
+      - name: Thorough skip-trace cascade (DataSift native + Trestle tier)
+        continue-on-error: true
+        env:
+          DATASIFT_API_KEY: ${{ secrets.DATASIFT_API_KEY }}
+          TRESTLE_API_KEY: ${{ secrets.TRESTLE_API_KEY }}
+        run: |
+          python scripts/thorough_skip_trace.py --since-hours 24 --max-records 200 -v \
+            2>&1 | tee logs/thorough_skip_trace_${{ steps.run_start.outputs.ts }}.log
+
       # ── DataSift export enrichment (inbox → outbox) ─────────────────────
       # Bridge tool for the ~90-day window until DataSift ships REST API keys.
       # Operator drops weekly-export CSVs (Notice of Default, courthouse
