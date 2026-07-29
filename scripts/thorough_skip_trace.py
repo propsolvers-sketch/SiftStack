@@ -55,6 +55,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 import datasift_api as ds
 import phone_validator as pv
 import config as cfg
+import enformion_client as enf
 
 logger = logging.getLogger(__name__)
 
@@ -80,10 +81,17 @@ class RecordResult:
     action: str = "processed"       # 'processed' / 'noop' / 'skipped' / 'error'
     phones_before: int = 0
     phones_after: int = 0
-    new_phones: int = 0
+    new_phones_datasift: int = 0    # phones DataSift native skip-trace added
+    new_phones_enformion: int = 0   # phones Enformion household_search added
+    enformion_ran: bool = False     # whether we called Enformion (had owner + address)
     phones_tiered: int = 0
     tier_distribution: dict[str, int] = field(default_factory=dict)
     error: str = ""
+
+    @property
+    def new_phones(self) -> int:
+        """Total new phones added by all vendors this run."""
+        return self.new_phones_datasift + self.new_phones_enformion
 
 
 def _norm_phone(p: str) -> str:
@@ -304,10 +312,66 @@ def _process_record(
         result.error = f"re-fetch: {e}"
         return result
 
-    phones_after = _existing_phone_set(refreshed)
-    new_phones = phones_after - phones_before
+    phones_after_datasift = _existing_phone_set(refreshed)
+    result.new_phones_datasift = len(phones_after_datasift - phones_before)
+
+    # ── Step 3.5: Enformion household search (paid tier, $0.10/skip) ──
+    # Fires when we have an owner last-name + address on the record.
+    # Enformion's household_search returns EVERY person at the address
+    # (spouse, adult children living there, other relatives) — additive
+    # to Tracerfy/DataSift which typically only find the primary owner.
+    # Skip if owner name isn't resolved (Enformion needs LastName + address).
+    owner = refreshed.get("owner") or {}
+    owner_last = (owner.get("last_name") or "").strip()
+    owner_addr = owner.get("address") or refreshed.get("address") or {}
+    addr_street = (owner_addr.get("street") or "").strip()
+    addr_city = (owner_addr.get("city") or "").strip()
+    addr_state = (owner_addr.get("state") or "").strip()
+    addr_zip = (owner_addr.get("postal_code") or "").strip()
+
+    enformion_phones: set[str] = set()
+    if (enf.is_configured() and owner_last and addr_street
+            and addr_state and addr_zip):
+        result.enformion_ran = True
+        try:
+            resp = enf.household_search(
+                last_name=owner_last,
+                street=addr_street, city=addr_city,
+                state=addr_state, zip_code=addr_zip,
+            )
+        except Exception as e:
+            logger.debug("Enformion call failed for %s: %s", puuid[:8], e)
+            resp = {}
+
+        # Extract phones from every returned person at the household
+        for person in (resp.get("persons") or []):
+            for phone_dict in enf.phones(person):
+                num = _norm_phone(phone_dict.get("number") or "")
+                if num and num not in phones_after_datasift and num not in phones_before:
+                    enformion_phones.add(num)
+
+        # If Enformion found new phones, attach them to the owner via
+        # upsert-phones so they land on the record and get Trestle-scored
+        if enformion_phones:
+            try:
+                owner_uuid = owner.get("uuid")
+                if owner_uuid:
+                    ds._post(
+                        f"/owner/{owner_uuid}/upsert-phones/",
+                        {"phones": [
+                            {"number": n, "type": "MOBILE",
+                             "status": "UNKNOWN", "tags": []}
+                            for n in enformion_phones
+                        ]},
+                    )
+                    logger.info("  Enformion added %d heir-household phones",
+                                len(enformion_phones))
+            except Exception as e:
+                logger.warning("Failed to attach Enformion phones to owner: %s", e)
+
+    phones_after = phones_after_datasift | enformion_phones
     result.phones_after = len(phones_after)
-    result.new_phones = len(new_phones)
+    result.new_phones_enformion = len(enformion_phones)
 
     if not phones_after:
         result.action = "noop"
@@ -342,10 +406,16 @@ def _process_record(
                              sorted(tier_counts.items(),
                                     key=lambda kv: pv.DEFAULT_TIERS.get(kv[0], (0,0))[1],
                                     reverse=True))
+    enf_line = (
+        f"Enformion household new phones: {result.new_phones_enformion}"
+        if result.enformion_ran
+        else "Enformion: skipped (no owner name + address on record)"
+    )
     notes = (
         "\n=== SKIP-TRACE (3-vendor cascade) ===\n"
         f"Pre-cascade phones: {result.phones_before} (Tracerfy upstream)\n"
-        f"DataSift new phones: {result.new_phones}\n"
+        f"DataSift new phones: {result.new_phones_datasift}\n"
+        f"{enf_line}\n"
         f"Trestle scored {tagged} of {result.phones_after}: {tier_summary or 'none tiered'}\n"
     )
     try:
@@ -426,7 +496,9 @@ def _main(argv: list[str] | None = None) -> int:
     logger.info("═" * 72)
     logger.info("CASCADE SUMMARY")
     logger.info("═" * 72)
-    total_new = sum(r.new_phones for r in all_results)
+    total_new_ds = sum(r.new_phones_datasift for r in all_results)
+    total_new_enf = sum(r.new_phones_enformion for r in all_results)
+    enformion_calls = sum(1 for r in all_results if r.enformion_ran)
     total_tiered = sum(r.phones_tiered for r in all_results)
     tier_totals: dict[str, int] = {}
     for r in all_results:
@@ -439,7 +511,9 @@ def _main(argv: list[str] | None = None) -> int:
     logger.info("Records:          %d", len(all_results))
     for act, ct in sorted(actions.items(), key=lambda kv: -kv[1]):
         logger.info("  · %-10s %d", act, ct)
-    logger.info("New phones via DataSift native skip-trace: %d", total_new)
+    logger.info("New phones via DataSift native skip-trace: %d", total_new_ds)
+    logger.info("New phones via Enformion household search: %d  (%d records called Enformion, ~$%.2f Enformion spend)",
+                total_new_enf, enformion_calls, enformion_calls * 0.10)
     logger.info("Phones tiered via Trestle:                  %d", total_tiered)
     if tier_totals:
         logger.info("Tier distribution:")

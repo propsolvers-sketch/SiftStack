@@ -222,16 +222,13 @@ jobs:
         env:
           ENFORMION_AP_NAME: ${{ secrets.ENFORMION_AP_NAME }}
           ENFORMION_AP_PASSWORD: ${{ secrets.ENFORMION_AP_PASSWORD }}
-          # Enformion DevAPI plan caps at 100 searches/month. Confirmed
-          # via 2026-07-23 cron log: "Current usage per month is: 113,
-          # max allowed per month is: 100". 300/run × 30 days would blow
-          # the monthly cap on the FIRST day. Capping per-run at 5
-          # keeps monthly usage under 150 even in a worst-case
-          # 30-day-of-running scenario (well under the 100 cap when
-          # some days no-op). If the plan is upgraded, bump this back
-          # up proportionally — a $30-50/mo tier gives ~1000/month
-          # (safe to use 30/run then).
-          ENFORMION_BUDGET: "5"
+          # 2026-07-28: Enformion plan upgraded to paid tier at $0.10/skip
+          # (no monthly quota). Operator approved a 50/run cap: worst-case
+          # ~$5/day at the scraper stage, ~$150/month. The cascade step
+          # below (thorough_skip_trace.py) has a SEPARATE per-run budget
+          # cap — combined daily exposure across BOTH stages is bounded
+          # by both caps + real record volume.
+          ENFORMION_BUDGET: "50"
         run: |
           python src/pre_probate_pipeline_al.py \
             --markets Birmingham,Huntsville,Marshall \
@@ -520,11 +517,19 @@ jobs:
       #
       # continue-on-error: true — a single stuck record shouldn't fail the
       # cron. --max-records 200 is a safety cap (~50-70 real records/day).
-      - name: Thorough skip-trace cascade (DataSift native + Trestle tier)
+      - name: Thorough skip-trace cascade (DataSift native + Enformion + Trestle tier)
         continue-on-error: true
         env:
           DATASIFT_API_KEY: ${{ secrets.DATASIFT_API_KEY }}
           TRESTLE_API_KEY: ${{ secrets.TRESTLE_API_KEY }}
+          ENFORMION_AP_NAME: ${{ secrets.ENFORMION_AP_NAME }}
+          ENFORMION_AP_PASSWORD: ${{ secrets.ENFORMION_AP_PASSWORD }}
+          # Cascade-step Enformion cap. Fires for records with an owner
+          # last-name + address. At $0.10/skip, 50/run = ~$5/day max
+          # here; combined with scraper-stage cap above (also 50), whole-
+          # day worst-case is ~$10 on a high-volume day. Independent
+          # process → independent budget counter.
+          ENFORMION_BUDGET: "50"
         run: |
           python scripts/thorough_skip_trace.py --since-hours 24 --max-records 200 -v \
             2>&1 | tee logs/thorough_skip_trace_${{ steps.run_start.outputs.ts }}.log
