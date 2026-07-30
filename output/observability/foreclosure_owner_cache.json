@@ -1,7 +1,7 @@
 {
   "100 SUFFOLK DR|MADISON|35757": {
     "first_seen": "2026-07-16",
-    "last_seen": "2026-07-23",
+    "last_seen": "2026-07-30",
     "owner_name": "MIQUEL, BECCERRA SANCHEZ",
     "source": "apn"
   },
@@ -25,7 +25,7 @@
   },
   "112 MCMEANS LN|HUNTSVILLE|35811": {
     "first_seen": "2026-07-23",
-    "last_seen": "2026-07-23",
+    "last_seen": "2026-07-30",
     "owner_name": "CARRIE, HIPKINS SOLE OWNERSHIP",
     "source": "apn"
   },
@@ -43,7 +43,7 @@
   },
   "128 CASPIAN LN|MERIDIANVILLE|35759": {
     "first_seen": "2026-07-23",
-    "last_seen": "2026-07-23",
+    "last_seen": "2026-07-30",
     "owner_name": "ALYX, SKYWALKER",
     "source": "apn"
   },
@@ -121,7 +121,7 @@
   },
   "208 OAKVIEW RD|HAZEL GREEN|35750": {
     "first_seen": "2026-07-16",
-    "last_seen": "2026-07-23",
+    "last_seen": "2026-07-30",
     "owner_name": "THOMAS, WATSON",
     "source": "apn"
   },
@@ -191,6 +191,12 @@
     "owner_name": "Dorothy, Rice",
     "source": "apn"
   },
+  "3702 JAMES HILL TER|HOOVER|35226": {
+    "first_seen": "2026-07-30",
+    "last_seen": "2026-07-30",
+    "owner_name": "Katherine, Rocha Aka Katherine Renee Rocha",
+    "source": "apn"
+  },
   "3904 HARWOOD AVE SW|HUNTSVILLE|35805": {
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-16",
@@ -201,6 +207,24 @@
     "first_seen": "2026-07-23",
     "last_seen": "2026-07-23",
     "owner_name": "Charles, Smith",
+    "source": "apn"
+  },
+  "433 15TH TER NW|CENTER POINT|35215": {
+    "first_seen": "2026-07-30",
+    "last_seen": "2026-07-30",
+    "owner_name": "Teresa, Dickerson",
+    "source": "apn"
+  },
+  "4507 ROSSER LOOP DR|BESSEMER|35022": {
+    "first_seen": "2026-07-30",
+    "last_seen": "2026-07-30",
+    "owner_name": "Joyce, Denise Smith",
+    "source": "apn"
+  },
+  "453 WEDGEWORTH RD|BIRMINGHAM|35215": {
+    "first_seen": "2026-07-30",
+    "last_seen": "2026-07-30",
+    "owner_name": "Mckinley, Black Jr.",
     "source": "apn"
   },
   "4554 BROOKSHIRE LOOP|BESSEMER|35022": {
@@ -251,6 +275,18 @@
     "owner_name": "ANGELA, MORGAN ADAMS",
     "source": "apn"
   },
+  "582 BRISTOL LN|BIRMINGHAM|35226": {
+    "first_seen": "2026-07-30",
+    "last_seen": "2026-07-30",
+    "owner_name": "Alva, Caine Hill Jr",
+    "source": "apn"
+  },
+  "5863 SHANE CIR|PINSON|35126": {
+    "first_seen": "2026-07-30",
+    "last_seen": "2026-07-30",
+    "owner_name": "JONATHAN, COSHATT",
+    "source": "apn"
+  },
   "6263 CLAY PALMERDALE RD|PINSON|35126": {
     "first_seen": "2026-07-23",
     "last_seen": "2026-07-29",
@@ -271,13 +307,13 @@
   },
   "686 MEADOW WOOD CIR NW|ARAB|35016": {
     "first_seen": "2026-07-16",
-    "last_seen": "2026-07-23",
+    "last_seen": "2026-07-30",
     "owner_name": "WALTER, MULLINIX III",
     "source": "apn"
   },
   "7 KEYSTONE TRL|GRANT|35747": {
     "first_seen": "2026-07-16",
-    "last_seen": "2026-07-23",
+    "last_seen": "2026-07-30",
     "owner_name": "Misty, Hall",
     "source": "apn"
   },
@@ -339,6 +375,24 @@
     "first_seen": "2026-07-15",
     "last_seen": "2026-07-15",
     "owner_name": "James, Brown",
+    "source": "apn"
+  },
+  "929 DUNRIDGE DR|BIRMINGHAM|35215": {
+    "first_seen": "2026-07-30",
+    "last_seen": "2026-07-30",
+    "owner_name": "Jermeria, Johnson",
+    "source": "apn"
+  },
+  "9712 15TH ST RD|BESSEMER|35023": {
+    "first_seen": "2026-07-30",
+    "last_seen": "2026-07-30",
+    "owner_name": "Timothy, Dennis",
+    "source": "apn"
+  },
+  "978 MANCHESTER DR|GUNTERSVILLE|35976": {
+    "first_seen": "2026-07-30",
+    "last_seen": "2026-07-30",
+    "owner_name": "Eric, Sherwood",
     "source": "apn"
   },
   "9805 VIRGINIANNA DR|BIRMINGHAM|35215": {
