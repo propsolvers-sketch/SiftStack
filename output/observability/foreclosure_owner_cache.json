@@ -61,7 +61,7 @@
   },
   "145 BAKER AVE|HUEYTOWN|35023": {
     "first_seen": "2026-07-25",
-    "last_seen": "2026-07-25",
+    "last_seen": "2026-08-01",
     "owner_name": "Angela, Pylant",
     "source": "apn"
   },
@@ -113,6 +113,12 @@
     "owner_name": "TIFFANY, FLOYD-ELLIOTT",
     "source": "apn"
   },
+  "1732 SAM DR|BIRMINGHAM|35235": {
+    "first_seen": "2026-08-01",
+    "last_seen": "2026-08-01",
+    "owner_name": "RUBY, MCKINZY",
+    "source": "apn"
+  },
   "181 ROYAL COACH CIR|BESSEMER|35022": {
     "first_seen": "2026-07-15",
     "last_seen": "2026-07-22",
@@ -125,9 +131,15 @@
     "owner_name": "THOMAS, WATSON",
     "source": "apn"
   },
+  "2136 PINE LN|HOOVER|35226": {
+    "first_seen": "2026-08-01",
+    "last_seen": "2026-08-01",
+    "owner_name": "Anne, Lateulere Hillier",
+    "source": "apn"
+  },
   "2356 7TH ST NW|CENTER POINT|35215": {
     "first_seen": "2026-07-25",
-    "last_seen": "2026-07-25",
+    "last_seen": "2026-08-01",
     "owner_name": "Richardson, Richardson",
     "source": "apn"
   },
@@ -235,7 +247,7 @@
   },
   "4611 ROSSER LOOP DR|BESSEMER|35022": {
     "first_seen": "2026-07-25",
-    "last_seen": "2026-07-25",
+    "last_seen": "2026-08-01",
     "owner_name": "DERRICK, FIELDS",
     "source": "apn"
   },
