@@ -1,8 +1,20 @@
 {
+  "100 BLACKWELL CT|OWENS CROSS ROADS|35763": {
+    "first_seen": "2026-08-06",
+    "last_seen": "2026-08-06",
+    "owner_name": "Ashley, Vann",
+    "source": "apn"
+  },
   "100 SUFFOLK DR|MADISON|35757": {
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-30",
     "owner_name": "MIQUEL, BECCERRA SANCHEZ",
+    "source": "apn"
+  },
+  "1021 QUAIL RUN|TRUSSVILLE|35173": {
+    "first_seen": "2026-08-06",
+    "last_seen": "2026-08-06",
+    "owner_name": "Dustin, Clay Parker",
     "source": "apn"
   },
   "105 HUDGINS DR|ALBERTVILLE|35951": {
@@ -25,8 +37,14 @@
   },
   "112 MCMEANS LN|HUNTSVILLE|35811": {
     "first_seen": "2026-07-23",
-    "last_seen": "2026-07-30",
+    "last_seen": "2026-08-06",
     "owner_name": "CARRIE, HIPKINS SOLE OWNERSHIP",
+    "source": "apn"
+  },
+  "113 SHOALFORD DR|HUNTSVILLE|35806": {
+    "first_seen": "2026-08-06",
+    "last_seen": "2026-08-06",
+    "owner_name": "Clarence, Andrew Anderson Jr",
     "source": "apn"
   },
   "1152 LAY DR|BIRMINGHAM|35215": {
@@ -35,15 +53,27 @@
     "owner_name": "TERENCE, SULLENS",
     "source": "apn"
   },
+  "116 CANOEBROOK LN|HUNTSVILLE|35806": {
+    "first_seen": "2026-08-06",
+    "last_seen": "2026-08-06",
+    "owner_name": "TRACI, CONLEY AKA TRACI LYNN CONLEY",
+    "source": "apn"
+  },
   "116 PEARLE COVE DR|HUNTSVILLE|35806": {
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-23",
     "owner_name": "ANDRE, DUVAR JACOBS",
     "source": "apn"
   },
+  "121 ANDOVER LN|HUNTSVILLE|35811": {
+    "first_seen": "2026-08-06",
+    "last_seen": "2026-08-06",
+    "owner_name": "Joshua, Kuykendall",
+    "source": "apn"
+  },
   "128 CASPIAN LN|MERIDIANVILLE|35759": {
     "first_seen": "2026-07-23",
-    "last_seen": "2026-07-30",
+    "last_seen": "2026-08-06",
     "owner_name": "ALYX, SKYWALKER",
     "source": "apn"
   },
@@ -121,7 +151,7 @@
   },
   "181 ROYAL COACH CIR|BESSEMER|35022": {
     "first_seen": "2026-07-15",
-    "last_seen": "2026-07-22",
+    "last_seen": "2026-08-06",
     "owner_name": "ROBERT, LEE EVERSON JR",
     "source": "apn"
   },
@@ -135,6 +165,12 @@
     "first_seen": "2026-08-01",
     "last_seen": "2026-08-01",
     "owner_name": "Anne, Lateulere Hillier",
+    "source": "apn"
+  },
+  "2302 COVEMONT DR SE|HUNTSVILLE|35801": {
+    "first_seen": "2026-08-06",
+    "last_seen": "2026-08-06",
+    "owner_name": "JENNIFER, BUSH DAVIS",
     "source": "apn"
   },
   "2356 7TH ST NW|CENTER POINT|35215": {
@@ -159,6 +195,12 @@
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-23",
     "owner_name": "Willie, Lafleur Jr",
+    "source": "apn"
+  },
+  "2619 LINGER LN|HOOVER|35226": {
+    "first_seen": "2026-08-06",
+    "last_seen": "2026-08-06",
+    "owner_name": "Justin, Diliberto",
     "source": "apn"
   },
   "27 HOUSTON RD NW|BIRMINGHAM|35215": {
@@ -207,6 +249,24 @@
     "first_seen": "2026-07-30",
     "last_seen": "2026-08-05",
     "owner_name": "Katherine, Rocha Aka Katherine Renee Rocha",
+    "source": "apn"
+  },
+  "3788 JAMES HILL CIR|HOOVER|35226": {
+    "first_seen": "2026-08-06",
+    "last_seen": "2026-08-06",
+    "owner_name": "SCOTT, NAUGHER",
+    "source": "apn"
+  },
+  "3813 SWEARENGIN RD|GRANT|35747": {
+    "first_seen": "2026-08-06",
+    "last_seen": "2026-08-06",
+    "owner_name": "Ellen, Springer",
+    "source": "apn"
+  },
+  "3817 VENUS AVE|BIRMINGHAM|35215": {
+    "first_seen": "2026-08-06",
+    "last_seen": "2026-08-06",
+    "owner_name": "Trishan, Little",
     "source": "apn"
   },
   "3904 HARWOOD AVE SW|HUNTSVILLE|35805": {
@@ -269,6 +329,12 @@
     "owner_name": "Helen, Rogers",
     "source": "apn"
   },
+  "513 SHERIDAN RD|BIRMINGHAM|35214": {
+    "first_seen": "2026-08-06",
+    "last_seen": "2026-08-06",
+    "owner_name": "MICHAEL, MADISON",
+    "source": "apn"
+  },
   "5258 DUG HOLLOW RD|PINSON|35126": {
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-29",
@@ -309,6 +375,12 @@
     "first_seen": "2026-07-23",
     "last_seen": "2026-08-05",
     "owner_name": "Barbara, Thomas Aka Barbara Pippens Thomas",
+    "source": "apn"
+  },
+  "6705 MOSSY OAK CV|TRUSSVILLE|35173": {
+    "first_seen": "2026-08-06",
+    "last_seen": "2026-08-06",
+    "owner_name": "Leigh, Renda",
     "source": "apn"
   },
   "6832 BRITTANY PL|PINSON|35126": {
