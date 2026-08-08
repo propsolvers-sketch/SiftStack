@@ -145,7 +145,7 @@
   },
   "1732 SAM DR|BIRMINGHAM|35235": {
     "first_seen": "2026-08-01",
-    "last_seen": "2026-08-01",
+    "last_seen": "2026-08-08",
     "owner_name": "RUBY, MCKINZY",
     "source": "apn"
   },
@@ -163,7 +163,7 @@
   },
   "2136 PINE LN|HOOVER|35226": {
     "first_seen": "2026-08-01",
-    "last_seen": "2026-08-01",
+    "last_seen": "2026-08-08",
     "owner_name": "Anne, Lateulere Hillier",
     "source": "apn"
   },
@@ -351,6 +351,12 @@
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-29",
     "owner_name": "ANGELA, MORGAN ADAMS",
+    "source": "apn"
+  },
+  "574 BRISTOL LN|BIRMINGHAM|35226": {
+    "first_seen": "2026-08-08",
+    "last_seen": "2026-08-08",
+    "owner_name": "Stacy, Powell",
     "source": "apn"
   },
   "582 BRISTOL LN|BIRMINGHAM|35226": {
