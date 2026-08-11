@@ -59,6 +59,14 @@ upload_apn_probate_retry.py
 upload_test_existing_list.py
 upload_v3_to_datasift.py
 scripts/apn_orchestrator_synth_test.py
+scratch/
+
+# SmartSkip Playwright session cookies (sensitive — do NOT commit)
+.smartskip_profile/
+
+# SmartSkip local inbox/outbox (raw result CSVs — regenerated per run)
+outbox/smartskip/
+inbox/smartskip/
 
 # IDE & OS
 .vscode/
