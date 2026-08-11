@@ -21,6 +21,7 @@ silently dropped.
 
 import asyncio
 import csv
+import json
 import os
 import re
 import sys
@@ -820,6 +821,115 @@ def _analyze_foreclosure_csvs(csvs: list[Path]) -> tuple[list[str], list[str]]:
     return breakdown, upcoming
 
 
+def _format_standard_cascade_summary() -> list[str]:
+    """Render the standard 3-vendor cascade section (Tracerfy + DataSift + Enformion + Trestle).
+
+    Parses today's thorough_skip_trace log line-by-line to pull the summary
+    the script emits at the end (Records / new phones per vendor / Trestle
+    tier distribution). Returns [] if no log found for today.
+    """
+    logs_dir = Path(__file__).parent.parent / "logs"
+    if not logs_dir.exists():
+        return []
+
+    today = date.today().strftime("%Y%m%d")
+    matching = sorted(logs_dir.glob(f"thorough_skip_trace_{today}*.log"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    if not matching:
+        return []
+
+    log_text = matching[0].read_text(errors="ignore")
+    # Look for the CASCADE SUMMARY block near the end
+    lines_out = ["*🔎 Standard Cascade (Tracerfy → DataSift native → Enformion → Trestle)*"]
+    records_m = re.search(r"Records:\s+(\d+)", log_text)
+    new_ds_m  = re.search(r"New phones via DataSift native skip-trace:\s+(\d+)", log_text)
+    new_enf_m = re.search(r"New phones via Enformion household search:\s+(\d+)\s+\((\d+) records called Enformion, ~\$([\d.]+)", log_text)
+    tiered_m  = re.search(r"Phones tiered via Trestle:\s+(\d+)", log_text)
+    if records_m:
+        lines_out.append(f"  Records:            {records_m.group(1)}")
+    if new_ds_m:
+        lines_out.append(f"  DataSift new phones: {new_ds_m.group(1)}")
+    if new_enf_m:
+        lines_out.append(f"  Enformion new phones: {new_enf_m.group(1)} "
+                         f"(${new_enf_m.group(3)} across {new_enf_m.group(2)} records)")
+    if tiered_m:
+        lines_out.append(f"  Phones Trestle-tiered: {tiered_m.group(1)}")
+    # Also grab tier distribution if present
+    tier_block = re.search(r"Tier distribution:\n((?:\s+·\s+[\w ]+\s+\d+\n)+)", log_text)
+    if tier_block:
+        lines_out.append("  Tier distribution:")
+        for tier_line in tier_block.group(1).strip().splitlines():
+            lines_out.append(f"  {tier_line.strip()}")
+    # If we only have the header + no metrics, don't render (log format changed)
+    if len(lines_out) == 1:
+        return []
+    return lines_out
+
+
+def _format_smartskip_summary() -> list[str]:
+    """Render the SmartSkip section for the Slack summary.
+
+    Reads output/observability/smartskip_last_run.json written by
+    scripts/probate_cascade.py after its run. Returns empty list if the file
+    doesn't exist or is stale (older than today), so we don't emit a
+    misleading "0 submitted" block when SmartSkip didn't run today.
+    """
+    path = Path(__file__).parent.parent / "output" / "observability" / "smartskip_last_run.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return []
+
+    # Skip stale summaries (older than 24h) — SmartSkip didn't run today
+    ran_at = data.get("ran_at", "")
+    if ran_at:
+        try:
+            ran_dt = datetime.strptime(ran_at, "%Y-%m-%dT%H:%M:%SZ")
+            if (datetime.utcnow() - ran_dt).total_seconds() > 26 * 3600:
+                return []
+        except ValueError:
+            pass
+
+    lines = [
+        "*📞 SmartSkip Enrichment (probate/pre-probate/obituary universe)*"
+    ]
+    if data.get("dry_run"):
+        lines.append("  _(DRY RUN — no records submitted)_")
+        return lines
+
+    if data.get("deferred", 0) > 0:
+        reason = data.get("deferral_reason", "session/payment failure")
+        lines.append(f"  ⚠ DEFERRED: {data['deferred']} records — {reason}")
+        lines.append("  Records queued for tomorrow's retry (`smartskip_deferred`)")
+        return lines
+
+    submitted = data.get("submitted", 0)
+    matched = data.get("matched", 0)
+    no_match = data.get("no_match", 0)
+    heirs = data.get("heirs_created", 0)
+    heir_errors = data.get("heir_creation_errors", 0)
+    cost = data.get("cost_usd", 0.0)
+    duration_min = data.get("duration_seconds", 0) / 60
+
+    if submitted == 0:
+        lines.append("  _No records in probate universe needed SmartSkip today_")
+        return lines
+
+    match_rate = f"({100 * matched / submitted:.0f}%)" if submitted else ""
+    lines.append(f"  Submitted:   {submitted} records")
+    lines.append(f"  Matched:     {matched} records {match_rate}")
+    lines.append(f"  No match:    {no_match} records → tagged `smartskip_no_match`")
+    heir_line = f"  Heirs added: {heirs} heir records"
+    if heir_errors:
+        heir_line += f" ({heir_errors} creation errors)"
+    lines.append(heir_line)
+    lines.append(f"  Cost:        ${cost:.2f}")
+    lines.append(f"  Duration:    {duration_min:.1f}m")
+    return lines
+
+
 def _build_slack_message(
     main_f: MainDailyFunnel,
     apn_f: ApnProbateFunnel,
@@ -878,6 +988,22 @@ def _build_slack_message(
             *_format_code_violation_funnel(code_violation_f),
             "",
         ])
+
+    # Standard 3-vendor cascade (Tracerfy + DataSift + Enformion + Trestle)
+    # from today's thorough_skip_trace log. Parsed from the log because the
+    # cascade script doesn't currently write a JSON summary.
+    cascade_lines = _format_standard_cascade_summary()
+    if cascade_lines:
+        lines.extend(cascade_lines)
+        lines.append("")
+
+    # SmartSkip 4th-vendor enrichment (probate/pre-probate/obituary universe).
+    # Only renders when today's smartskip_last_run.json exists (from operator's
+    # local run of probate_cascade.py — GHA doesn't run SmartSkip).
+    smartskip_lines = _format_smartskip_summary()
+    if smartskip_lines:
+        lines.extend(smartskip_lines)
+        lines.append("")
 
     if csv_count == 0:
         lines.append(
@@ -1087,6 +1213,25 @@ async def main() -> int:
                 )
     except Exception as e:
         print(f"Dropbox archive sync skipped: {e}", flush=True)
+
+    # ── Apply Courthouse Snapshot notes to probate records (Option A per
+    # 2026-08-10 operator directive). Writes readable "🏛 COURTHOUSE
+    # SNAPSHOT" text blocks to each probate record's Notes so the operator
+    # sees case #, PR, judge, obituary URL, etc. at a glance. Skips records
+    # with no probate metadata. Non-fatal on failure.
+    try:
+        import apply_courthouse_snapshots
+        cs_stats_list = []
+        for csv_path in apply_courthouse_snapshots._default_csv_paths():
+            cs_stats_list.append(
+                apply_courthouse_snapshots.apply_snapshots_to_csv(csv_path)
+            )
+        total_snapshots = sum(s["notes_written"] for s in cs_stats_list)
+        if total_snapshots:
+            print(f"🏛 Courthouse snapshots written to {total_snapshots} probate records",
+                  flush=True)
+    except Exception as e:
+        print(f"Courthouse snapshot pass skipped: {e}", flush=True)
 
     msg = _build_slack_message(
         main_funnel, apn_funnel, pre_funnel, results, len(csvs),

@@ -151,14 +151,30 @@ Alabama's non-judicial foreclosure statute (§ 35-10-13) requires 3 weeks of new
 - **McMichael Taylor Gray** — Playwright + PowerBI iframe; fragile, low incremental volume
 - **LOGS Legal** — Playwright + PowerBI iframe; same fragility profile
 
-### Uniform enrichment chain (as of b63fa6e, 2026-07-09)
+### Uniform enrichment chain (as of b63fa6e, 2026-07-09; split-vendor since 2026-08-04)
 
-All 5 sources run the same 4-stage chain. Consistency is enforced at commit time — new adapters MUST include all 4 stages before the DataSift CSV write:
+All adapters run the same address+owner enrichment chain before the DataSift CSV write:
 
 1. **County property API** — owner name recovery: Jefferson E-Ring (`src/jefferson_property_api.py`), Madison + Marshall AssuranceWeb (`src/madison_property_api.py`, `src/marshall_property_api.py`). Also recovers ZIP for HWM (address column has no ZIP).
 2. **Smarty US Street standardization** — populates `dpv_match_code`, `latitude`, `longitude`, `plus4_code` (ZIP+4). License MUST be `us-core-cloud` (not the SDK default `us-standard-cloud`, which lacks USPS-CASS). See `src/address_standardizer._build_client()` (3265316).
 3. **Tracerfy skip-trace** — phones + emails. `--skip-trace` flag on each adapter; workflow YAML passes it unconditionally. Cost ~$0.02/contact, ~$0.30-0.60/day across the 3 trustee adapters.
-4. **Trestle phone tier scoring** — populates `Phone Tags N` columns for DataSift filter presets (Tier 1 mobile / Tier 2 landline / Tier 3 VOIP).
+
+After upload to DataSift, records enter a **split-vendor skip-trace cascade** dispatched by `src/enrichment_router.py`:
+
+| Record class | Cascade | Additional vendors |
+|---|---|---|
+| Probate universe: `notice_type ∈ {probate, pre_probate}` OR in Obituary/Probate/Pre-Probate-Deceased list | **4-vendor** (`scripts/probate_cascade.py`) | SmartSkip (Playwright, local-run only) → DataSift native → Enformion → Trestle |
+| Standard: foreclosure / code_violation / tax_* / eviction / divorce | **3-vendor** (`scripts/thorough_skip_trace.py`) | DataSift native → Enformion → Trestle |
+
+**Both cascades apply 8 vendor tags** (registered in `src/vendor_tags.py`):
+- Record-level: `traced_tracerfy` · `traced_datasift` · `traced_enformion` · `traced_smartskip` (evergreen — filter-friendly)
+- Phone-level: `src:tracerfy` · `src:datasift` · `src:enformion` · `src:smartskip` (stacks with `Dial First`/`Second`/etc.)
+
+**Note ownership rule**: for probate-universe records where SmartSkip matched (has phones or relatives), SmartSkip writes the definitive family-tree Note and the downstream cascade skips its own summary Notes append. Enforced via `_record_has_smartskip_note_lock()` — checks `traced_smartskip` present AND `smartskip_no_match` absent. When SmartSkip returned no data (`smartskip_no_match` tagged), the standard cascade Notes append behavior is unchanged.
+
+**SmartSkip local-run requirement**: SmartSkip has no public API — Playwright drives the app.smartskip.io Bulk Skip wizard using a persistent-context browser profile at `.smartskip_profile/`. Session cookies can't survive GHA's ephemeral VMs, so `probate_cascade.py` runs from the operator's Mac (launchd cron or manual). Daily-sweep GHA has a status-check step that surfaces the local run's summary in Slack via `output/observability/smartskip_last_run.json`. See `~/.claude/skills/skip-trace-cascade/` for full workflow docs.
+
+4. **Trestle phone tier scoring** — populates `Phone Tags N` columns for DataSift filter presets (Tier 1 mobile / Tier 2 landline / Tier 3 VOIP). Scores union of ALL vendor phones (Tracerfy + DataSift + Enformion + SmartSkip when applicable) in one pass at the end of each cascade.
 
 **City-tier centroid ZIP fallback** (97654c2 + d05f79f, extended to trustee adapters in b63fa6e): when Smarty USPS-CASS doesn't recognize the specific house number but confirms the street is in a known Madison/Marshall city, uses the Tier-1 centroid ZIP from `address_standardizer._CITY_TIER_ZIP_FALLBACK` (Huntsville→35801, Albertville→35950, Arab→35016, Guntersville→35976, Boaz→35957) and stamps `zip_estimated_from_city` in `NoticeData.missing_data_flags` for downstream visibility. HWM adapter also uses this map directly as a hard fallback when both property API and Smarty miss.
 

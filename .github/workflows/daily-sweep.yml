@@ -517,6 +517,34 @@ jobs:
       #
       # continue-on-error: true — a single stuck record shouldn't fail the
       # cron. --max-records 200 is a safety cap (~50-70 real records/day).
+      # ── SmartSkip 4th-vendor cascade (probate/pre-probate/obituary universe) ─
+      # SmartSkip has NO API — requires a persistent browser session which
+      # can't survive between GHA's ephemeral Ubuntu VMs. Runs LOCALLY on the
+      # operator's Mac via launchd/cron reading .smartskip_profile/ session
+      # cookies. See scripts/probate_cascade.py + .claude/skills/skip-trace-
+      # cascade/ for the local-run setup.
+      #
+      # The GHA step below just checks whether operator ran probate_cascade.py
+      # locally today; if smartskip_last_run.json exists and is fresh, its
+      # summary rolls into daily_finalize.py's Slack post. If it doesn't
+      # exist, SmartSkip section is omitted from Slack (see
+      # _format_smartskip_summary staleness check).
+      #
+      # If we ever add cross-run session persistence (e.g. GHA secret with
+      # encrypted cookies restored before each run), un-comment the local
+      # invocation below. For now: local-only.
+      - name: SmartSkip probate cascade — status check only
+        continue-on-error: true
+        run: |
+          if [ -f output/observability/smartskip_last_run.json ]; then
+            echo "SmartSkip: local run summary found at output/observability/"
+            cat output/observability/smartskip_last_run.json
+          else
+            echo "SmartSkip: no local run summary. Operator runs "
+            echo "'python scripts/probate_cascade.py' on Mac (Playwright + "
+            echo ".smartskip_profile/ session)."
+          fi
+
       - name: Thorough skip-trace cascade (DataSift native + Enformion + Trestle tier)
         continue-on-error: true
         env:
