@@ -416,44 +416,236 @@ def property_exists(*, reapi_id: str = "", sift_id: str = "") -> dict:
 # ── Property mutations (replaces wizard Steps 3/5 + post-upload) ────
 
 
+_tag_uuid_to_title_cache: dict[str, str] = {}
+_list_uuid_to_title_cache: dict[str, str] = {}
+
+
+def _resolve_tag_uuid_to_title(tag_uuid: str) -> str | None:
+    """Reverse lookup: given a tag UUID, return its title. Cached per-process."""
+    if tag_uuid in _tag_uuid_to_title_cache:
+        return _tag_uuid_to_title_cache[tag_uuid]
+    try:
+        r = _get(f"/tag/{tag_uuid}/")
+        title = (r.get("title") or "").strip()
+        if title:
+            _tag_uuid_to_title_cache[tag_uuid] = title
+            return title
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_list_uuid_to_title(list_uuid: str) -> str | None:
+    """Reverse lookup: given a list UUID, return its title."""
+    if list_uuid in _list_uuid_to_title_cache:
+        return _list_uuid_to_title_cache[list_uuid]
+    try:
+        r = _get(f"/list/{list_uuid}/")
+        title = (r.get("title") or "").strip()
+        if title:
+            _list_uuid_to_title_cache[list_uuid] = title
+            return title
+    except Exception:
+        pass
+    return None
+
+
+_phone_tag_uuid_to_title_cache: dict[str, str] = {}
+
+
+def _resolve_phone_tag_uuid_to_title(phone_tag_uuid: str) -> str | None:
+    """Reverse lookup: given a phone-tag UUID, return its title.
+
+    Phone-tags live at /phone/tag/ (different table from record tags).
+    """
+    if phone_tag_uuid in _phone_tag_uuid_to_title_cache:
+        return _phone_tag_uuid_to_title_cache[phone_tag_uuid]
+    # Prime the whole phone-tag cache once — only ~50 phone-tags total
+    if not _phone_tag_uuid_to_title_cache:
+        try:
+            resp = _get("/phone/tag/", {"limit": 500})
+            for row in (resp.get("results") or []):
+                _phone_tag_uuid_to_title_cache[row["uuid"]] = (row.get("title") or "").strip()
+        except Exception:
+            pass
+    return _phone_tag_uuid_to_title_cache.get(phone_tag_uuid)
+
+
 def add_lists(property_uuid: str, list_uuids: list[str]) -> dict:
-    """POST /property/{uuid}/add-lists/ — attach the record to lists."""
-    return _post(f"/property/{property_uuid}/add-lists/", {"lists": list_uuids})
+    """POST /property/{uuid}/add-lists/ — attach the record to lists.
+
+    2026-08-10 DISCOVERY: DataSift's endpoint expects list TITLES (not UUIDs)
+    in the payload. Passing UUIDs causes DataSift to CREATE new lists with
+    those UUIDs as their titles instead of linking existing lists.
+
+    We accept UUIDs for consistency with the rest of the API surface, then
+    translate to titles before POSTing.
+    """
+    titles = []
+    for u in list_uuids:
+        title = _resolve_list_uuid_to_title(u)
+        if title:
+            titles.append(title)
+        else:
+            logger.warning("add_lists: could not resolve list UUID %s to title", u)
+    if not titles:
+        return None
+    return _post(f"/property/{property_uuid}/add-lists/", {"lists": titles})
 
 
 def add_tags(property_uuid: str, tag_uuids: list[str]) -> dict:
-    """POST /property/{uuid}/add-tags/ — attach tags to the record."""
-    return _post(f"/property/{property_uuid}/add-tags/", {"tags": tag_uuids})
+    """POST /property/{uuid}/add-tags/ — attach tags to the record.
+
+    2026-08-10 DISCOVERY: DataSift's endpoint expects tag TITLES (not UUIDs)
+    in the payload. Passing UUIDs causes DataSift to CREATE new tags with
+    those UUIDs as their titles instead of linking existing tags.
+
+    We accept UUIDs for consistency with the rest of the API surface, then
+    translate to titles before POSTing.
+    """
+    titles = []
+    for u in tag_uuids:
+        title = _resolve_tag_uuid_to_title(u)
+        if title:
+            titles.append(title)
+        else:
+            logger.warning("add_tags: could not resolve tag UUID %s to title", u)
+    if not titles:
+        return None
+    return _post(f"/property/{property_uuid}/add-tags/", {"tags": titles})
 
 
-def add_notes(property_uuid: str, notes: str) -> dict:
-    """POST /property/{uuid}/add-notes/ — append to the record's Notes field."""
+def add_notes(property_uuid: str, notes: str, *, dedup_on: str | None = None) -> dict | None:
+    """POST /property/{uuid}/add-notes/ — append to the record's Notes field.
+
+    Dedup guard (added 2026-08-11): DataSift stores notes as concatenated text
+    without merge logic, so re-uploading the same pipeline note appends a
+    duplicate. To prevent this, we check whether a `dedup_on` signature already
+    exists in the record's current notes; if so, we skip the write.
+
+    Args:
+      notes: full note text to append (may be multi-line block)
+      dedup_on: signature to check for in existing notes. If found → skip write.
+                Defaults to the first 80 non-whitespace chars of `notes` when
+                None — usually catches the note's unique header.
+    """
+    if not notes:
+        return None
+    if dedup_on is None:
+        # Auto-derive a signature: first meaningful line + case-insensitive
+        first_meaningful = next(
+            (l.strip() for l in notes.splitlines() if l.strip() and not
+             all(c in "═─=─" for c in l.strip())),
+            "",
+        )
+        dedup_on = first_meaningful[:80] if first_meaningful else notes.strip()[:80]
+
+    # Fetch current notes (they come back as a list of single-char strings; join)
+    try:
+        prop = get_property(property_uuid)
+        existing = prop.get("notes") or []
+        joined = "".join(n if isinstance(n, str) else "" for n in existing)
+        if dedup_on and dedup_on in joined:
+            logger.debug("Skipping duplicate note on %s (signature %r already present)",
+                         property_uuid[:8], dedup_on[:50])
+            return None
+    except Exception as e:
+        # If we can't verify, err on the side of writing (better dupe than lost data)
+        logger.debug("add_notes dedup check failed on %s: %s — proceeding with write",
+                     property_uuid[:8], e)
+
     return _post(f"/property/{property_uuid}/add-notes/", {"notes": notes})
 
 
 def add_phone_tag(
     property_uuid: str, phone_number: str, phone_tag_uuids: list[str],
 ) -> Any:
-    """POST /property/{uuid}/add-phone-tag/ — tag a specific phone number.
+    """POST /property/{uuid}/add-phone-tag/ — DEPRECATED / BROKEN.
 
-    Used for Trestle tier scoring: after Trestle returns 'Dial First' for
-    number X, call ``add_phone_tag(uuid, X, [phone_tag_uuid('Dial First')])``.
+    2026-08-10 E2E DISCOVERY: this endpoint returns 200 (null body) but does
+    NOT actually persist tags. Verified in DataSift UI — no tags appear on
+    phones after N calls. The correct write path is `upsert-phones` with a
+    populated `tags` field per phone (see ``apply_phone_tags`` below).
 
-    2026-07-28 E2E discoveries:
-      * Payload shape: LIST of items, not dict. Swagger says $ref Property
-        but real payload is ``[{"number": <str>, "phone_tags": [<uuid>]}]``.
-      * The POST returns 200 with no error, BUT the tag is NOT visible in
-        subsequent ``GET /property/{uuid}/`` responses under
-        ``owner.phones[].tags`` (verified with a 4s async-wait too). Likely
-        a property-serializer limitation: phone-tags may only be visible
-        via a separate ``GET /phone/{id}/`` endpoint, or in the DataSift UI
-        directly. The write DOES persist on DataSift's side — this is a
-        read-side quirk. Callers should trust the 200 response and NOT
-        try to re-read via property GET to confirm.
+    Kept for backward compat — now delegates to ``apply_phone_tags`` so any
+    caller still using this function will actually persist tags.
     """
+    return apply_phone_tags(property_uuid, {phone_number: phone_tag_uuids})
+
+
+def apply_phone_tags(
+    property_uuid: str, phone_tag_map: dict[str, list[str]],
+) -> Any:
+    """Apply phone tags via the ACTUAL working endpoint: /owner/{uuid}/upsert-phones/.
+
+    Discovered 2026-08-10 — the `/property/{uuid}/add-phone-tag/` endpoint
+    returns 200 but silently drops tags. `upsert-phones` with a `tags` field
+    per phone entry IS the write path that actually persists (verified via
+    property GET showing new tag UUIDs on the phone).
+
+    Args:
+      property_uuid: The property record UUID (used to fetch owner + existing phones)
+      phone_tag_map: {phone_number: [tag_uuid, ...]} — tags to APPEND per phone
+
+    Behavior:
+      * Fetches the property + owner to get owner_uuid + existing phone metadata
+      * For each phone, UNIONs new tags with existing tags (never loses old tags)
+      * Preserves each phone's existing type/status
+      * One upsert-phones API call per property (batched)
+
+    Returns the upsert response dict, or None if property/owner not found.
+    """
+    if not phone_tag_map:
+        return None
+
+    prop = get_property(property_uuid)
+    owner = prop.get("owner") or {}
+    owner_uuid = owner.get("uuid")
+    if not owner_uuid:
+        return None
+    existing_phones = {p["number"]: p for p in (owner.get("phones") or [])
+                       if p.get("number")}
+
+    phones_payload = []
+    for phone_number, new_tag_uuids in phone_tag_map.items():
+        existing = existing_phones.get(phone_number, {})
+        # Extract existing phone-tag values (may be UUIDs or titles depending
+        # on how they were originally applied). If UUID, resolve to title.
+        existing_tag_values = set()
+        for t in (existing.get("tags") or []):
+            val = t.get("uuid") if isinstance(t, dict) else t
+            if val:
+                # If it looks like a UUID, resolve to title
+                if len(val) == 36 and val.count("-") == 4:
+                    title = _resolve_phone_tag_uuid_to_title(val)
+                    if title:
+                        existing_tag_values.add(title)
+                    # else drop — this is a junk UUID-with-UUID-title tag
+                else:
+                    existing_tag_values.add(val)  # already a title
+        # Resolve new UUIDs to titles (same bug as record tags: /upsert-phones/
+        # tags field expects TITLES, creates junk tags from UUIDs)
+        new_titles = set()
+        for u in new_tag_uuids:
+            if len(u) == 36 and u.count("-") == 4:
+                title = _resolve_phone_tag_uuid_to_title(u)
+                if title:
+                    new_titles.add(title)
+                else:
+                    logger.warning("apply_phone_tags: could not resolve %s to title", u)
+            else:
+                new_titles.add(u)  # already a title
+        union_tags = sorted(existing_tag_values | new_titles)
+        phones_payload.append({
+            "number": phone_number,
+            "type": existing.get("type") or "UNKNOWN",
+            "status": existing.get("status") or "UNKNOWN",
+            "tags": union_tags,
+        })
+
     return _post(
-        f"/property/{property_uuid}/add-phone-tag/",
-        [{"number": phone_number, "phone_tags": phone_tag_uuids}],
+        f"/owner/{owner_uuid}/upsert-phones/",
+        {"phones": phones_payload},
     )
 
 
