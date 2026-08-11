@@ -122,6 +122,114 @@ DATASIFT_COLUMNS = [
 ]
 
 
+def format_courthouse_snapshot(notice: NoticeData) -> str:
+    """Build a readable '🏛 COURTHOUSE SNAPSHOT' note block from a NoticeData.
+
+    Purpose: the operator opens a record in DataSift and sees ALL the probate/
+    obituary/court data the scraping pipeline captured — case number, judge,
+    PR, attorney, decedent DOD, obituary URL, hearing/creditor deadlines,
+    source URL. No need to hunt across tabs or custom fields.
+
+    Called by scraping pipelines after DataSift record creation (via
+    scripts/apply_courthouse_snapshots.py) so notes get written for every
+    probate-universe record at scrape time. Cost: 1 add_notes API call
+    per record, one-time.
+
+    Returns empty string if notice has zero probate metadata — nothing
+    to snapshot.
+    """
+    def s(v):
+        return str(v).strip() if v not in (None, "") else ""
+
+    # Guard: require at least one PROBATE-SPECIFIC field before emitting a
+    # snapshot. Address alone doesn't warrant one — it's on every record.
+    probate_specific = any(s(v) for v in [
+        notice.case_number, notice.judge_name, notice.granted_date,
+        notice.creditor_deadline, notice.petition_filed_date, notice.hearing_date,
+        notice.decedent_name, notice.date_of_death, notice.owner_deceased,
+        notice.obituary_url, notice.co_pr_names, notice.heirs_named_in_notice,
+        notice.estate_purpose, notice.total_estate_value,
+        notice.secondary_addresses, notice.notice_subtype,
+    ])
+    if not probate_specific:
+        return ""  # no probate-specific data — nothing to snapshot
+
+    # Collect all probate-relevant fields
+    fields: list[tuple[str, str]] = []
+    # Source + context
+    src_bits = [b for b in [s(notice.notice_type), s(notice.county)] if b]
+    if src_bits:
+        fields.append(("Source", " · ".join(src_bits)))
+    if s(notice.notice_subtype):
+        fields.append(("Subtype", s(notice.notice_subtype)))
+    # Case / court
+    if s(notice.case_number):
+        fields.append(("Case #", s(notice.case_number)))
+    if s(notice.judge_name):
+        fields.append(("Judge", s(notice.judge_name)))
+    if s(notice.granted_date):
+        fields.append(("Letters granted", _format_date(s(notice.granted_date))))
+    if s(notice.creditor_deadline):
+        fields.append(("Creditor deadline", _format_date(s(notice.creditor_deadline))))
+    if s(notice.petition_filed_date):
+        fields.append(("Petition filed", _format_date(s(notice.petition_filed_date))))
+    if s(notice.hearing_date):
+        fields.append(("Hearing date", _format_date(s(notice.hearing_date))))
+    # Decedent
+    dec_bits = []
+    if s(notice.decedent_name):
+        dec_bits.append(s(notice.decedent_name))
+    if s(notice.date_of_death):
+        dec_bits.append(f"DOD {_format_date(s(notice.date_of_death))}")
+    if s(notice.owner_deceased) == "yes":
+        dec_bits.append("confirmed deceased")
+    if dec_bits:
+        fields.append(("Decedent", " · ".join(dec_bits)))
+    # PR / executor / attorney
+    if s(notice.owner_name):
+        fields.append(("PR / Executor", s(notice.owner_name)))
+    if s(getattr(notice, "attorney_on_file", "")):
+        fields.append(("Attorney", s(notice.attorney_on_file)))
+    if s(notice.co_pr_names):
+        fields.append(("Co-PRs", s(notice.co_pr_names)))
+    if s(notice.heirs_named_in_notice):
+        fields.append(("Heirs named in notice", s(notice.heirs_named_in_notice)))
+    # Estate details
+    if s(notice.estate_purpose):
+        fields.append(("Estate purpose", s(notice.estate_purpose)))
+    if s(notice.total_estate_value):
+        fields.append(("Total estate value", f"${s(notice.total_estate_value)}"))
+    if s(notice.secondary_addresses):
+        fields.append(("Additional parcels", s(notice.secondary_addresses)))
+    # Property
+    prop_addr = " ".join([s(notice.address), s(notice.city), s(notice.state), s(notice.zip)]).strip()
+    if prop_addr:
+        fields.append(("Property", prop_addr))
+    if s(notice.parcel_id):
+        fields.append(("Parcel ID", s(notice.parcel_id)))
+    # Obituary
+    if s(notice.obituary_url):
+        fields.append(("Obituary URL", s(notice.obituary_url)))
+    # Source URL (last — usually long)
+    if s(notice.source_url):
+        fields.append(("Source URL", s(notice.source_url)))
+
+    if not fields:
+        return ""  # nothing to snapshot
+
+    # Format as fixed-width for readability. Max label width across included fields.
+    max_label_w = max(len(k) for k, _ in fields)
+    lines = [
+        "═" * 55,
+        f"🏛 COURTHOUSE SNAPSHOT · scraped {datetime.now().strftime('%Y-%m-%d')}",
+        "═" * 55,
+    ]
+    for label, value in fields:
+        lines.append(f"  {label:<{max_label_w}} : {value}")
+    lines.append("═" * 55)
+    return "\n".join(lines)
+
+
 def _format_date(iso_date: str) -> str:
     """Convert YYYY-MM-DD to M/D/YYYY."""
     if not iso_date:
