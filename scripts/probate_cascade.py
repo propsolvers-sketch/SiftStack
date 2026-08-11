@@ -884,6 +884,10 @@ def _main(argv: list[str] | None = None) -> int:
                    help="Only process records not yet tagged traced_smartskip")
     p.add_argument("--max-records", type=int,
                    help="Cap batch size (for testing)")
+    p.add_argument("--max-cost-usd", type=float,
+                   help="Hard cost cap in USD. Computes max_records = "
+                        "int(max_cost_usd / 0.15). Safety net for daily "
+                        "cron. Recommended: 10 (= 66 records/run max).")
     p.add_argument("--dry-run", action="store_true",
                    help="Log what would be submitted, don't upload")
     p.add_argument("--headed", action="store_true",
@@ -931,9 +935,17 @@ def _main(argv: list[str] | None = None) -> int:
             headless=not args.headed,
         )
     else:
+        # Compute effective max_records from --max-cost-usd if provided
+        effective_max = args.max_records
+        if args.max_cost_usd is not None:
+            cost_cap_max = int(args.max_cost_usd / 0.15)
+            if effective_max is None or cost_cap_max < effective_max:
+                effective_max = cost_cap_max
+                logger.info("Cost cap $%.2f → max %d records this run",
+                            args.max_cost_usd, effective_max)
         summary = run_probate_cascade(
             rehash_only=args.rehash_only,
-            max_records=args.max_records,
+            max_records=effective_max,
             dry_run=args.dry_run,
             headless=not args.headed,
         )

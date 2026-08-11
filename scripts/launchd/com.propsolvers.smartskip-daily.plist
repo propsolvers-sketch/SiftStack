@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Daily SmartSkip probate cascade runner.
+         Fires at 1:00 AM CST (before GHA daily-sweep at 2:30 AM CST) so
+         SmartSkip-added phones get Trestle-tiered by today's GHA run.
+
+         Behavior:
+         - Runs `python scripts/probate_cascade.py` with:
+             --rehash-only        (only records not yet tagged traced_smartskip)
+             --max-cost-usd 10    (hard cap: ~66 records/run, safety net)
+             --and-standard-cascade   (chains DataSift+Enformion+Trestle after)
+             --notify-slack       (posts combined summary to SLACK_WEBHOOK_URL)
+         - Wakes Mac if asleep (via WakeSystemBeforeExecute)
+         - Skips if Mac is off (launchd runs it at next boot's next fire time)
+         - Logs to logs/smartskip_launchd_<date>.log for troubleshooting
+
+         Session expiry (~monthly): SmartSkip logs out. Script catches this,
+         Slack-posts "SESSION EXPIRED — log in via scratch/smartskip_recon/
+         launch_and_explore.py". No records charged when session expired.
+
+         Install:
+           launchctl load ~/Library/LaunchAgents/com.propsolvers.smartskip-daily.plist
+
+         Uninstall:
+           launchctl unload ~/Library/LaunchAgents/com.propsolvers.smartskip-daily.plist
+
+         Check status:
+           launchctl list | grep smartskip
+    -->
+    <key>Label</key>
+    <string>com.propsolvers.smartskip-daily</string>
+
+    <!-- Fire at 1:00 AM local time (Mac's local TZ; operator should be on CST) -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>1</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Wake Mac from sleep if needed to run on schedule -->
+    <key>WakeSystemBeforeExecute</key>
+    <true/>
+
+    <!-- Don't re-fire on Mac wake if we missed a slot (avoids double-runs
+         if Mac was off at 1 AM and comes on later at 8 AM) -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Working directory: the SiftStack repo root -->
+    <key>WorkingDirectory</key>
+    <string>/Users/shanismith/Desktop/SiftStack</string>
+
+    <!-- The command. Uses the venv Python + the wrapper shell script which
+         handles logging + env loading + Slack alert on any Python error. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/shanismith/Desktop/SiftStack/scripts/launchd/run_smartskip_daily.sh</string>
+    </array>
+
+    <!-- Redirect stdout + stderr to a daily log file (path picked by wrapper) -->
+    <key>StandardOutPath</key>
+    <string>/Users/shanismith/Desktop/SiftStack/logs/smartskip_launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/shanismith/Desktop/SiftStack/logs/smartskip_launchd.err</string>
+</dict>
+</plist>
