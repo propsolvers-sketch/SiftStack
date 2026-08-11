@@ -56,8 +56,108 @@ import datasift_api as ds
 import phone_validator as pv
 import config as cfg
 import enformion_client as enf
+import vendor_tags as vt
 
 logger = logging.getLogger(__name__)
+
+
+def _record_has_tag(record: dict, tag_name: str) -> bool:
+    """True if `record` has a tag with the given title OR the tag's UUID.
+
+    DataSift's property GET may return tags as {uuid, title} or just uuid
+    strings — we check both. Case-insensitive on title match.
+    """
+    tags = record.get("tags") or []
+    lowered = tag_name.strip().lower()
+    for t in tags:
+        if isinstance(t, dict):
+            title = (t.get("title") or "").strip().lower()
+            if title == lowered:
+                return True
+        elif isinstance(t, str):
+            if t.strip().lower() == lowered:
+                return True
+    return False
+
+
+def _build_notice_data_from_property(prop: dict):
+    """Build a minimal NoticeData object from a DataSift property record.
+
+    Used to hand off to tracerfy_skip_tracer.batch_skip_trace which expects
+    NoticeData objects. Returns None if the record lacks required fields
+    (owner name + property address).
+    """
+    try:
+        from notice_data import NoticeData
+    except Exception:
+        return None
+
+    owner = prop.get("owner") or {}
+    first = (owner.get("first_name") or "").strip()
+    last = (owner.get("last_name") or "").strip()
+    if not (first and last):
+        return None
+
+    prop_addr = prop.get("address") or {}
+    street = (prop_addr.get("street") or "").strip()
+    if not street:
+        return None
+
+    owner_addr = owner.get("address") or {}
+    return NoticeData(
+        # Property (used by Tracerfy for address matching)
+        address=street,
+        city=(prop_addr.get("city") or "").strip(),
+        state=(prop_addr.get("state") or "").strip(),
+        zip=(prop_addr.get("zip5") or prop_addr.get("postal_code") or "")[:5],
+        # Owner name
+        owner_name=f"{first} {last}",
+        owner_first_name=first,
+        owner_last_name=last,
+        # Mailing (Tracerfy uses this if property != mailing)
+        owner_street=(owner_addr.get("street") or "").strip(),
+        owner_city=(owner_addr.get("city") or "").strip(),
+        owner_state=(owner_addr.get("state") or "").strip(),
+        owner_zip=(owner_addr.get("zip5") or owner_addr.get("postal_code") or "")[:5],
+        # Meta (Tracerfy needs a notice_type for tagging heirs; probate is safe default)
+        notice_type="probate",
+        county=(prop_addr.get("county") or "Jefferson").strip() or "Jefferson",
+        source_url="",
+        date_added=datetime.now().strftime("%Y-%m-%d"),
+    )
+
+
+def _record_has_smartskip_note_lock(record: dict) -> bool:
+    """True if SmartSkip wrote a definitive family-tree Note on this record.
+
+    Signal = has `traced_smartskip` tag AND does NOT have `smartskip_no_match` tag.
+    When True, this cascade must NOT append its own summary Note — SmartSkip owns it.
+    """
+    tags = record.get("tags") or []
+    tag_titles = {(t.get("title") or "").strip().lower() if isinstance(t, dict) else str(t).lower()
+                  for t in tags}
+    return (vt.RECORD_TAG_TRACED_SMARTSKIP.lower() in tag_titles
+            and vt.RECORD_TAG_SMARTSKIP_NO_MATCH.lower() not in tag_titles)
+
+
+def _tag_new_phones_with_source(
+    property_uuid: str,
+    new_phones: set[str],
+    vendor: str,
+) -> None:
+    """Apply `src:<vendor>` tag to each new phone this vendor sourced."""
+    if not new_phones:
+        return
+    try:
+        src_tag_uuid = vt.src_phone_tag_uuid(vendor)
+    except Exception as e:
+        logger.debug("src_phone_tag lookup failed for %s: %s", vendor, e)
+        return
+    for phone in new_phones:
+        try:
+            ds.add_phone_tag(property_uuid, phone, [src_tag_uuid])
+        except Exception as e:
+            logger.debug("apply src:%s to %s failed: %s", vendor, phone, e)
 
 
 # ── DataSift polling knobs ──────────────────────────────────────────
@@ -257,7 +357,11 @@ def _score_phones(phones: list[str]) -> dict[str, str]:
         if not phone:
             continue
         result = pv.call_trestle(phone, api_key, add_litigator=False)
-        if "error" in result:
+        # Trestle ALWAYS includes an "error" key set to None on success.
+        # Prior bug: `if "error" in result` matched even when value was None,
+        # causing every phone to be silently skipped ("continue"). Fix: check
+        # truthiness of the value, not key presence.
+        if result.get("error"):
             logger.debug("Trestle error for %s: %s", phone, result.get("error"))
             continue
         score = None
@@ -288,9 +392,65 @@ def _process_record(
         result.action = "skipped"
         return result
 
+    # ── Step 0: EXPLICITLY call Tracerfy on this record.
+    # Previously this step only TAGGED existing phones as `src:tracerfy` on
+    # the assumption Tracerfy ran upstream in the daily-sweep pipeline. That
+    # holds for records scraped by our adapters but FAILS for records added
+    # via bulk purchase or manually. So we now actually invoke Tracerfy here
+    # unless the record already carries `traced_tracerfy` (idempotent).
+    tracerfy_new_phones: set[str] = set()
+    already_traced = _record_has_tag(prop, vt.RECORD_TAG_TRACED_TRACERFY)
+    if already_traced:
+        logger.debug("  Skipping Tracerfy — record already tagged traced_tracerfy")
+        _tag_new_phones_with_source(puuid, phones_before, "tracerfy")
+    else:
+        try:
+            import tracerfy_skip_tracer
+            # Build a synthetic NoticeData from the DataSift record so we
+            # can hand it to Tracerfy's batch API.
+            notice = _build_notice_data_from_property(prop)
+            if notice is not None:
+                stats = tracerfy_skip_tracer.batch_skip_trace(
+                    [notice], lookup_heir_addresses=False,
+                )
+                # Extract new phones from the returned NoticeData
+                for slot in range(1, 10):
+                    raw = getattr(notice, f"phone_{slot}", "") or ""
+                    n = _norm_phone(raw)
+                    if n and n not in phones_before:
+                        tracerfy_new_phones.add(n)
+                # Push new phones onto the DataSift owner
+                if tracerfy_new_phones:
+                    owner_uuid = (prop.get("owner") or {}).get("uuid")
+                    if owner_uuid:
+                        try:
+                            ds._post(
+                                f"/owner/{owner_uuid}/upsert-phones/",
+                                {"phones": [
+                                    {"number": n, "type": "UNKNOWN",
+                                     "status": "UNKNOWN", "tags": []}
+                                    for n in tracerfy_new_phones
+                                ]},
+                            )
+                        except Exception as e:
+                            logger.debug("tracerfy upsert-phones failed: %s", e)
+                logger.info("  Tracerfy: %d new phones "
+                            "(cost ~$%.2f, matched=%d)",
+                            len(tracerfy_new_phones),
+                            stats.get("cost", 0.0),
+                            stats.get("matched", 0))
+        except Exception as e:
+            logger.warning("Tracerfy call failed for %s: %s", puuid[:8], e)
+        try:
+            vt.mark_vendor_traced(puuid, "tracerfy")
+            _tag_new_phones_with_source(
+                puuid, phones_before | tracerfy_new_phones, "tracerfy",
+            )
+        except Exception as e:
+            logger.debug("tracerfy tag application failed for %s: %s", puuid[:8], e)
+
     # ── Step 1: Trigger DataSift native skip-trace ──
-    # (Tracerfy already ran upstream in the pipeline; Enformion too if
-    # not quota-blocked. Both populated phones_before if they hit.)
+    # (Enformion runs later in this same function if not quota-blocked.)
     try:
         ds.skip_trace(puuid)
     except Exception as e:
@@ -314,6 +474,13 @@ def _process_record(
 
     phones_after_datasift = _existing_phone_set(refreshed)
     result.new_phones_datasift = len(phones_after_datasift - phones_before)
+
+    # ── Tag traced_datasift + tag new phones with src:datasift ──
+    try:
+        vt.mark_vendor_traced(puuid, "datasift")
+        _tag_new_phones_with_source(puuid, phones_after_datasift - phones_before, "datasift")
+    except Exception as e:
+        logger.debug("datasift tag application failed for %s: %s", puuid[:8], e)
 
     # ── Step 3.5: Enformion household search (paid tier, $0.10/skip) ──
     # Fires when we have an owner last-name + address on the record.
@@ -388,6 +555,15 @@ def _process_record(
     result.phones_after = len(phones_after)
     result.new_phones_enformion = len(enformion_phones)
 
+    # ── Tag traced_enformion regardless of whether Enformion ran (per operator
+    # rule: attempted-vs-not is what the tag signals). Tag new phones as
+    # src:enformion only when Enformion actually contributed them. ──
+    try:
+        vt.mark_vendor_traced(puuid, "enformion")
+        _tag_new_phones_with_source(puuid, enformion_phones, "enformion")
+    except Exception as e:
+        logger.debug("enformion tag application failed for %s: %s", puuid[:8], e)
+
     if not phones_after:
         result.action = "noop"
         return result
@@ -416,28 +592,38 @@ def _process_record(
 
     # ── Step 5: Append call-view summary to Notes (load-bearing UX per
     # operator feedback — Notes must always contain the full at-a-glance
-    # snapshot the caller uses during outreach). ──
-    tier_summary = ", ".join(f"{t}: {c}" for t, c in
-                             sorted(tier_counts.items(),
-                                    key=lambda kv: pv.DEFAULT_TIERS.get(kv[0], (0,0))[1],
-                                    reverse=True))
-    if result.enformion_ran:
-        enf_line = f"Enformion household new phones: {result.new_phones_enformion}"
-    elif is_code_violation:
-        enf_line = "Enformion: skipped (Code Violation record; heir enrichment disabled per operator policy)"
+    # snapshot the caller uses during outreach).
+    #
+    # EXCEPT: for probate-universe records where SmartSkip already wrote the
+    # definitive family-tree Note, we skip this append per operator rule
+    # ("smartskip output is your determining factor"). The check reads
+    # traced_smartskip presence + smartskip_no_match absence (see
+    # _record_has_smartskip_note_lock).
+    if _record_has_smartskip_note_lock(refreshed):
+        logger.debug("Skipping cascade Note write on %s — SmartSkip owns the Notes",
+                     puuid[:8])
     else:
-        enf_line = "Enformion: skipped (no owner name + address on record)"
-    notes = (
-        "\n=== SKIP-TRACE (3-vendor cascade) ===\n"
-        f"Pre-cascade phones: {result.phones_before} (Tracerfy upstream)\n"
-        f"DataSift new phones: {result.new_phones_datasift}\n"
-        f"{enf_line}\n"
-        f"Trestle scored {tagged} of {result.phones_after}: {tier_summary or 'none tiered'}\n"
-    )
-    try:
-        ds.add_notes(puuid, notes)
-    except Exception as e:
-        logger.debug("add_notes on %s failed: %s", puuid[:8], e)
+        tier_summary = ", ".join(f"{t}: {c}" for t, c in
+                                 sorted(tier_counts.items(),
+                                        key=lambda kv: pv.DEFAULT_TIERS.get(kv[0], (0,0))[1],
+                                        reverse=True))
+        if result.enformion_ran:
+            enf_line = f"Enformion household new phones: {result.new_phones_enformion}"
+        elif is_code_violation:
+            enf_line = "Enformion: skipped (Code Violation record; heir enrichment disabled per operator policy)"
+        else:
+            enf_line = "Enformion: skipped (no owner name + address on record)"
+        notes = (
+            "\n=== SKIP-TRACE (3-vendor cascade) ===\n"
+            f"Pre-cascade phones: {result.phones_before} (Tracerfy upstream)\n"
+            f"DataSift new phones: {result.new_phones_datasift}\n"
+            f"{enf_line}\n"
+            f"Trestle scored {tagged} of {result.phones_after}: {tier_summary or 'none tiered'}\n"
+        )
+        try:
+            ds.add_notes(puuid, notes)
+        except Exception as e:
+            logger.debug("add_notes on %s failed: %s", puuid[:8], e)
 
     result.action = "processed"
     return result
@@ -459,8 +645,12 @@ def _main(argv: list[str] | None = None) -> int:
                     help="Safety cap on records processed per run (default: 200)")
     ap.add_argument("--property-uuid",
                     help="Process a single record by UUID (for testing)")
+    ap.add_argument("--property-uuids",
+                    help="Process multiple records — comma-separated UUIDs")
     ap.add_argument("--dry-run", action="store_true",
                     help="Log decisions without spending API budget")
+    ap.add_argument("--notify-slack", action="store_true",
+                    help="Post cascade summary to SLACK_WEBHOOK_URL when done")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -478,7 +668,16 @@ def _main(argv: list[str] | None = None) -> int:
     logger.info("Thorough skip-trace cascade")
     logger.info("═" * 72)
 
-    if args.property_uuid:
+    if args.property_uuids:
+        uuids = [u.strip() for u in args.property_uuids.split(",") if u.strip()]
+        logger.info("Multi-record mode: %d UUIDs", len(uuids))
+        records = []
+        for u in uuids:
+            try:
+                records.append(ds.get_property(u))
+            except Exception as e:
+                logger.warning("Failed to fetch %s: %s", u[:8], e)
+    elif args.property_uuid:
         logger.info("Single-record mode: %s", args.property_uuid)
         prop = ds.get_property(args.property_uuid)
         records = [prop]
@@ -537,6 +736,32 @@ def _main(argv: list[str] | None = None) -> int:
             if tier in tier_totals:
                 logger.info("  · %-15s %d", tier, tier_totals[tier])
     logger.info("═" * 72)
+
+    if args.notify_slack:
+        # Build a Slack-formatted summary
+        tier_lines = "\n".join(
+            f"  · {t:<12} {tier_totals[t]}"
+            for t in ("Dial First", "Dial Second", "Dial Third", "Dial Fourth", "Drop")
+            if t in tier_totals
+        )
+        block = (
+            "*🔎 Standard Cascade (Tracerfy → DataSift → Enformion → Trestle)*\n"
+            f"  Records:                       {len(all_results)}\n"
+            f"  DataSift native new phones:    {total_new_ds}\n"
+            f"  Enformion new phones:          {total_new_enf} "
+            f"(${enformion_calls * 0.10:.2f} across {enformion_calls} records)\n"
+            f"  Phones Trestle-tiered:         {total_tiered}\n"
+        )
+        if tier_lines:
+            block += f"  Tier distribution:\n{tier_lines}\n"
+        try:
+            sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+            from slack_notifier import _send_webhook
+            _send_webhook(block)
+            logger.info("Cascade summary posted to Slack")
+        except Exception as e:
+            logger.warning("Slack post failed: %s", e)
+
     return 0
 
 
