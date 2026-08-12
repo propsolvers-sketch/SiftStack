@@ -1339,7 +1339,7 @@ class SmartSkipClient:
         """, batch.batch_id)
 
         if not clicked.get("clicked"):
-            self.page.off("download", _capture_download)
+            self.page.remove_listener("download", _capture_download)
             raise SmartSkipTimeoutError(
                 f"Could not find download element for batch {batch.batch_id}: "
                 f"{clicked.get('reason', 'unknown')}"
@@ -1360,7 +1360,7 @@ class SmartSkipClient:
                 out_path.write_bytes(resp.body())
                 logger.info("  Downloaded via HTTP: %s (%d bytes)",
                             out_path, len(resp.body()))
-                self.page.off("download", _capture_download)
+                self.page.remove_listener("download", _capture_download)
                 return out_path
 
         # Otherwise wait for a download event to fire (up to 60s)
@@ -1368,7 +1368,7 @@ class SmartSkipClient:
         while time.time() < deadline and not download_future:
             self.page.wait_for_timeout(500)
 
-        self.page.off("download", _capture_download)
+        self.page.remove_listener("download", _capture_download)
 
         if not download_future:
             raise SmartSkipTimeoutError(
