@@ -1297,12 +1297,12 @@ class SmartSkipClient:
     def _download_result(self, batch: SmartSkipBatch) -> Path:
         """Click the Download icon in the batch's row + save the file.
 
-        SmartSkip's download element is an icon-button in the Download column
-        of the Skips History row. Playwright's expect_download() sometimes
-        times out because the download may fire via JS with a blob: URL that
-        the event listener doesn't catch. We register the download listener
-        BEFORE the click via context.on() so we don't miss the event, and
-        use JS-based click (bypasses potential pointer intercepts).
+        Two-step click flow — SmartSkip's row-level download icon opens a
+        modal asking Campaign Format (vertical) vs CRM Format (horizontal).
+        We want CRM Format (horizontal = one row per record, DataSift-shaped).
+
+        Step 1: Click download icon in Skips History row → modal opens
+        Step 2: Click "Download CRM Format" button in modal → actual download fires
         """
         out_path = self.download_dir / "results" / f"result_{batch.batch_id}"
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1313,20 +1313,15 @@ class SmartSkipClient:
             download_future.append(d)
         self.page.on("download", _capture_download)
 
-        # Use JS to find the download element in the row and click it.
-        # The row contains: File name link, dates, status, results count, then
-        # the download icon. Icon is typically the LAST clickable element in
-        # the row (button OR anchor).
+        # ── Step 1: click the download icon in the batch's row → opens modal ──
         clicked = self.page.evaluate("""
             (batchId) => {
-                // Find every row that contains the batch filename
                 for (const row of document.querySelectorAll('tr, [role="row"], .row')) {
                     const text = (row.innerText || '').trim();
                     if (!text.includes(batchId)) continue;
-                    // Find the download element — try button first, then anchor
                     const buttons = row.querySelectorAll('button, a');
                     if (buttons.length === 0) return {clicked: false, reason: 'no buttons in row'};
-                    // Last one is typically the download
+                    // Last one is typically the download icon
                     const btn = buttons[buttons.length - 1];
                     btn.scrollIntoView({block: 'center'});
                     btn.click();
@@ -1341,11 +1336,44 @@ class SmartSkipClient:
         if not clicked.get("clicked"):
             self.page.remove_listener("download", _capture_download)
             raise SmartSkipTimeoutError(
-                f"Could not find download element for batch {batch.batch_id}: "
+                f"Could not find download row-icon for batch {batch.batch_id}: "
                 f"{clicked.get('reason', 'unknown')}"
             )
-        logger.info("  Download-click via JS: %s text=%r href=%r",
-                    clicked.get("tag"), clicked.get("text"), clicked.get("href"))
+        logger.info("  Step 1 row-icon clicked: %s text=%r → modal should open",
+                    clicked.get("tag"), clicked.get("text"))
+
+        # ── Step 2: click "Download CRM Format" button inside the modal ──
+        # Wait for modal to appear + become interactive (Vuetify dialog)
+        self.page.wait_for_timeout(1500)
+        modal_clicked = self.page.evaluate("""
+            () => {
+                // Find any button whose text contains "CRM Format" (case-insensitive).
+                // Prefer buttons inside a dialog/modal container for safety.
+                const containers = document.querySelectorAll(
+                    '.v-dialog, .v-overlay__content, [role="dialog"], .modal, body'
+                );
+                for (const container of containers) {
+                    for (const btn of container.querySelectorAll('button, a')) {
+                        const label = (btn.innerText || btn.textContent || '').trim();
+                        if (/download\\s*crm\\s*format/i.test(label)) {
+                            btn.scrollIntoView({block: 'center'});
+                            btn.click();
+                            return {clicked: true, text: label.slice(0, 60)};
+                        }
+                    }
+                }
+                return {clicked: false, reason: 'no CRM Format button found in modal'};
+            }
+        """)
+
+        if not modal_clicked.get("clicked"):
+            self.page.remove_listener("download", _capture_download)
+            raise SmartSkipTimeoutError(
+                f"Modal opened but 'Download CRM Format' button not found for "
+                f"batch {batch.batch_id}: {modal_clicked.get('reason', 'unknown')}"
+            )
+        logger.info("  Step 2 modal CRM Format clicked: text=%r",
+                    modal_clicked.get("text"))
 
         # If the element was an anchor with an href, fetch the file via HTTP
         # (using the browser's cookies — same session as the click).
