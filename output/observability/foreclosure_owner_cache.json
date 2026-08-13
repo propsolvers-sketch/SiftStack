@@ -65,9 +65,15 @@
     "owner_name": "ANDRE, DUVAR JACOBS",
     "source": "apn"
   },
+  "1176 FIVE MILE RD|BIRMINGHAM|35215": {
+    "first_seen": "2026-08-13",
+    "last_seen": "2026-08-13",
+    "owner_name": "Valerie, Jean Payne",
+    "source": "apn"
+  },
   "121 ANDOVER LN|HUNTSVILLE|35811": {
     "first_seen": "2026-08-06",
-    "last_seen": "2026-08-06",
+    "last_seen": "2026-08-13",
     "owner_name": "Joshua, Kuykendall",
     "source": "apn"
   },
@@ -143,6 +149,12 @@
     "owner_name": "TIFFANY, FLOYD-ELLIOTT",
     "source": "apn"
   },
+  "164 CLIFT CREEK DR|MADISON|35757": {
+    "first_seen": "2026-08-13",
+    "last_seen": "2026-08-13",
+    "owner_name": "Keith, Lewis",
+    "source": "apn"
+  },
   "1732 SAM DR|BIRMINGHAM|35235": {
     "first_seen": "2026-08-01",
     "last_seen": "2026-08-08",
@@ -177,6 +189,12 @@
     "first_seen": "2026-07-25",
     "last_seen": "2026-08-01",
     "owner_name": "Richardson, Richardson",
+    "source": "apn"
+  },
+  "2411 GARDEN PARK DR NW|HUNTSVILLE|35810": {
+    "first_seen": "2026-08-13",
+    "last_seen": "2026-08-13",
+    "owner_name": "KIMBERLEE, HOGAN",
     "source": "apn"
   },
   "2508 ARCADIA PL|BIRMINGHAM|35214": {
@@ -239,6 +257,12 @@
     "owner_name": "Taneko, Murphy",
     "source": "apn"
   },
+  "3458 JEANNE LN|BESSEMER|35023": {
+    "first_seen": "2026-08-13",
+    "last_seen": "2026-08-13",
+    "owner_name": "Leonta, Cash Sr.",
+    "source": "apn"
+  },
   "3513 CABLE ST NW|HUNTSVILLE|35810": {
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-16",
@@ -259,7 +283,7 @@
   },
   "3813 SWEARENGIN RD|GRANT|35747": {
     "first_seen": "2026-08-06",
-    "last_seen": "2026-08-06",
+    "last_seen": "2026-08-13",
     "owner_name": "Ellen, Springer",
     "source": "apn"
   },
@@ -309,6 +333,12 @@
     "first_seen": "2026-07-25",
     "last_seen": "2026-08-01",
     "owner_name": "DERRICK, FIELDS",
+    "source": "apn"
+  },
+  "481 HERITAGE PL|PINSON|35126": {
+    "first_seen": "2026-08-13",
+    "last_seen": "2026-08-13",
+    "owner_name": "Patsy, Cates",
     "source": "apn"
   },
   "4857 WOOD SPRINGS LN|HOOVER|35226": {
@@ -369,6 +399,12 @@
     "first_seen": "2026-07-30",
     "last_seen": "2026-08-12",
     "owner_name": "JONATHAN, COSHATT",
+    "source": "apn"
+  },
+  "625 WOODBROOK RD|CENTER POINT|35215": {
+    "first_seen": "2026-08-13",
+    "last_seen": "2026-08-13",
+    "owner_name": "Carl, Christian Sr.",
     "source": "apn"
   },
   "6263 CLAY PALMERDALE RD|PINSON|35126": {

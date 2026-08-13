@@ -1,11 +1,6 @@
 {
   "2captcha": [
     {
-      "date": "2026-08-01",
-      "success": 122,
-      "total": 122
-    },
-    {
       "date": "2026-08-02",
       "success": 29,
       "total": 29
@@ -34,14 +29,14 @@
       "date": "2026-08-12",
       "success": 104,
       "total": 104
+    },
+    {
+      "date": "2026-08-13",
+      "success": 368,
+      "total": 369
     }
   ],
   "smarty": [
-    {
-      "date": "2026-08-01",
-      "success": 19,
-      "total": 19
-    },
     {
       "date": "2026-08-02",
       "success": 1,
@@ -71,14 +66,14 @@
       "date": "2026-08-12",
       "success": 19,
       "total": 19
+    },
+    {
+      "date": "2026-08-13",
+      "success": 24,
+      "total": 24
     }
   ],
   "tracerfy": [
-    {
-      "date": "2026-08-01",
-      "success": 12,
-      "total": 19
-    },
     {
       "date": "2026-08-02",
       "success": 1,
@@ -108,14 +103,14 @@
       "date": "2026-08-12",
       "success": 9,
       "total": 19
+    },
+    {
+      "date": "2026-08-13",
+      "success": 5,
+      "total": 24
     }
   ],
   "llm": [
-    {
-      "date": "2026-08-01",
-      "success": 127,
-      "total": 127
-    },
     {
       "date": "2026-08-02",
       "success": 34,
@@ -145,6 +140,11 @@
       "date": "2026-08-12",
       "success": 110,
       "total": 111
+    },
+    {
+      "date": "2026-08-13",
+      "success": 419,
+      "total": 419
     }
   ]
 }
