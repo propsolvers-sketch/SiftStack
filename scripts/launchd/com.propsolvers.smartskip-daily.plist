@@ -4,10 +4,10 @@
 <plist version="1.0">
 <dict>
     <!-- Daily SmartSkip probate cascade runner.
-         Fires at 5:00 AM CST — AFTER GHA daily-sweep (2:30 AM CST) has
-         finished landing today's fresh probate records in DataSift.
-         probate_cascade then adds SmartSkip's family-tree enrichment +
-         re-runs Trestle so today's records are calling-ready by 8 AM.
+         Fires at 6:00 AM CST — AFTER GHA daily-sweep typically completes
+         (4-5:30 AM CST average, occasional slow day up to 8 AM). Buffer
+         chosen so 6/7 days catch same-day; rare slow days catch next-day
+         via --rehash-only tag dedup. Records calling-ready by 8-9 AM.
 
          Behavior:
          - Runs `python scripts/probate_cascade.py` with:
@@ -35,13 +35,14 @@
     <key>Label</key>
     <string>com.propsolvers.smartskip-daily</string>
 
-    <!-- Fire at 5:00 AM local time (Mac's local TZ; operator should be on CST).
-         5 AM = GHA daily-sweep (2:30 AM) has usually finished by 3:30-4:00,
-         giving 1+ hour buffer for a slow GHA run. Records ready to call by 8-9 AM. -->
+    <!-- Fire at 6:00 AM local time (Mac's local TZ; operator should be on CST).
+         GHA daily-sweep finishes 4-5:30 AM typical (rare 8 AM slow day).
+         6 AM = 30-90 min buffer catches all typical days. Slow-day records
+         picked up on the NEXT day's run via traced_smartskip tag dedup. -->
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
-        <integer>5</integer>
+        <integer>6</integer>
         <key>Minute</key>
         <integer>0</integer>
     </dict>
