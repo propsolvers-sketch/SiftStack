@@ -5,6 +5,7 @@
 #   1. cd to SiftStack repo root + load .env
 #   2. Run probate_cascade.py with production flags:
 #        --rehash-only           only records not yet SmartSkip'd (dedup)
+#        --target-zips-only      only Tier 1+2 ZIPs (operator calling scope)
 #        --max-cost-usd 10       $10 hard cap = ~66 records max per run
 #        --and-standard-cascade  chains Tracerfy+DataSift+Enformion+Trestle
 #        --notify-slack          combined Slack post
@@ -40,6 +41,7 @@ mkdir -p "$REPO_ROOT/logs"
 "$REPO_ROOT/.venv/bin/python" \
     "$REPO_ROOT/scripts/probate_cascade.py" \
     --rehash-only \
+    --target-zips-only \
     --max-cost-usd 10 \
     --and-standard-cascade \
     --notify-slack \

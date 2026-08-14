@@ -754,6 +754,7 @@ def run_probate_cascade(
     max_records: int | None = None,
     dry_run: bool = False,
     headless: bool = True,
+    target_zips_only: bool = False,
 ) -> ProbateCascadeSummary:
     """Full SmartSkip pass over the probate universe."""
     started = time.time()
@@ -764,8 +765,15 @@ def run_probate_cascade(
 
     # ── 1. Query probate universe records
     logger.info("Querying probate universe records...")
+    target_zip_set = None
+    if target_zips_only:
+        from target_zips import ALL_TARGET
+        target_zip_set = ALL_TARGET
+        logger.info("Target-ZIP-only mode: constraining to %d Tier 1+2 ZIPs",
+                    len(target_zip_set))
     records = router.query_probate_universe_records(
         require_traced_smartskip_missing=rehash_only,
+        target_zips=target_zip_set,
         limit=500,
     )
     if max_records:
@@ -888,6 +896,11 @@ def _main(argv: list[str] | None = None) -> int:
                    help="Hard cost cap in USD. Computes max_records = "
                         "int(max_cost_usd / 0.15). Safety net for daily "
                         "cron. Recommended: 10 (= 66 records/run max).")
+    p.add_argument("--target-zips-only", action="store_true",
+                   help="Constrain SmartSkip to records whose property ZIP "
+                        "is in the operator's calling scope (Tier 1 + Tier 2). "
+                        "Saves cost on out-of-scope records. Recommended for "
+                        "daily cron.")
     p.add_argument("--dry-run", action="store_true",
                    help="Log what would be submitted, don't upload")
     p.add_argument("--headed", action="store_true",
@@ -948,6 +961,7 @@ def _main(argv: list[str] | None = None) -> int:
             max_records=effective_max,
             dry_run=args.dry_run,
             headless=not args.headed,
+            target_zips_only=args.target_zips_only,
         )
 
     print()

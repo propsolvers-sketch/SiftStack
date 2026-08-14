@@ -170,6 +170,7 @@ def route_records(records: Iterable[dict]) -> dict[Cascade, list[RoutedRecord]]:
 def query_probate_universe_records(
     *,
     require_traced_smartskip_missing: bool = False,
+    target_zips: frozenset[str] | None = None,
     limit: int | None = 500,
     page_size: int = 500,
 ) -> list[dict]:
@@ -178,6 +179,9 @@ def query_probate_universe_records(
     Args:
       require_traced_smartskip_missing: if True, filter out records already
         tagged `traced_smartskip` client-side (used by WEEKLY REHASH pass).
+      target_zips: if provided, keep ONLY records whose property ZIP is in
+        this set (5-digit match). Used to constrain SmartSkip spend to the
+        operator's calling scope (Tier 1 + Tier 2 ZIPs).
       limit: max total records to return (None = up to DataSift's 10K cap).
       page_size: per-page fetch size.
 
@@ -211,6 +215,8 @@ def query_probate_universe_records(
             break
         offset += page
 
+    total_in_universe = len(all_records)
+
     # Client-side filter for the traced_smartskip exclusion
     if smartskip_uuid:
         def _has_smartskip(r):
@@ -223,6 +229,21 @@ def query_probate_universe_records(
         before = len(all_records)
         all_records = [r for r in all_records if not _has_smartskip(r)]
         logger.info("Filtered smartskip-already-traced: %d → %d", before, len(all_records))
+
+    # Client-side filter to target ZIPs (property ZIP, 5-digit match)
+    if target_zips:
+        def _in_target_zip(r):
+            addr = r.get("address") or {}
+            zip5 = (addr.get("zip5") or addr.get("postal_code") or "").strip()[:5]
+            return zip5 in target_zips
+        before = len(all_records)
+        all_records = [r for r in all_records if _in_target_zip(r)]
+        logger.info(
+            "Filtered to target ZIPs (%d ZIPs in scope): %d → %d "
+            "(funnel: universe %d → smartskip-eligible %d → in-scope %d)",
+            len(target_zips), before, len(all_records),
+            total_in_universe, before, len(all_records),
+        )
 
     return all_records
 
