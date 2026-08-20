@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import re
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -39,6 +40,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import certifi
 
 # Reuse dataclasses + exceptions + CSV helpers from the legacy client so
 # downstream code (probate_cascade.py, parse_result_csv, format_note)
@@ -60,6 +63,11 @@ API_BASE = "https://api.smartskip.io"
 SESSION_FILE = Path.home() / ".smartskip_profile" / "api_session.json"
 POLL_INTERVAL_S = 15
 POLL_TIMEOUT_S = 45 * 60  # 45 min
+
+# Python 3.14 on macOS ships without a system-wide CA bundle — stdlib
+# urllib fails with CERTIFICATE_VERIFY_FAILED unless we hand it one.
+# certifi is already a transitive dep (requests uses it) so free to import.
+_SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 
 
 def _resolve_creds() -> tuple[str, str]:
@@ -94,7 +102,7 @@ def _http(
         h.update(headers)
     req = urllib.request.Request(url, data=raw_body, headers=h, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as resp:
             data = resp.read()
             ct = resp.headers.get("content-type", "")
             cd = resp.headers.get("content-disposition", "")
