@@ -91,6 +91,11 @@ jobs:
       # ── Skip-trace + phone validation ──────────
       TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
       TRESTLE_API_KEY: ${{ secrets.TRESTLE_API_KEY }}
+      # SmartSkip REST API creds — used by probate_cascade step below.
+      # Same login as app.smartskip.io. Requires GitHub secrets to be set.
+      SMARTSKIP_EMAIL: ${{ secrets.SMARTSKIP_EMAIL }}
+      SMARTSKIP_PASSWORD: ${{ secrets.SMARTSKIP_PASSWORD }}
+      SMARTSKIP_CLIENT: api
 
       # ── CRM upload + notifications ─────────────
       DATASIFT_EMAIL: ${{ secrets.DATASIFT_EMAIL }}
@@ -533,18 +538,6 @@ jobs:
       # If we ever add cross-run session persistence (e.g. GHA secret with
       # encrypted cookies restored before each run), un-comment the local
       # invocation below. For now: local-only.
-      - name: SmartSkip probate cascade — status check only
-        continue-on-error: true
-        run: |
-          if [ -f output/observability/smartskip_last_run.json ]; then
-            echo "SmartSkip: local run summary found at output/observability/"
-            cat output/observability/smartskip_last_run.json
-          else
-            echo "SmartSkip: no local run summary. Operator runs "
-            echo "'python scripts/probate_cascade.py' on Mac (Playwright + "
-            echo ".smartskip_profile/ session)."
-          fi
-
       - name: Thorough skip-trace cascade (DataSift native + Enformion + Trestle tier)
         continue-on-error: true
         env:
@@ -562,8 +555,43 @@ jobs:
           # budget counter from the scraper-stage cap above.
           ENFORMION_BUDGET: "100"
         run: |
-          python scripts/thorough_skip_trace.py --since-hours 24 --max-records 200 -v \
+          python scripts/thorough_skip_trace.py --max-records 200 -v \
             2>&1 | tee logs/thorough_skip_trace_${{ steps.run_start.outputs.ts }}.log
+
+      # ── SmartSkip probate cascade ──
+      # Runs AFTER the 3-vendor cascade above (which deferred Trestle for
+      # probate records so SmartSkip's heir phones get Trestle-scored in
+      # ONE pass). Only processes records lacking traced_smartskip in
+      # Probate/Pre-Probate/Obituary lists within Tier 1+2 ZIPs.
+      #
+      # $10/day hard cap = max ~66 records via --max-cost-usd 10.
+      # --and-standard-cascade re-runs cascade + Trestle for probate records
+      # (Enformion self-dedups via traced_enformion tag — no double-charge).
+      #
+      # Local launchd cron (6 AM) stays enabled as safety net — will
+      # mostly no-op via --rehash-only since GHA tagged them here.
+      - name: SmartSkip probate cascade (REST API)
+        continue-on-error: true
+        env:
+          DATASIFT_API_KEY: ${{ secrets.DATASIFT_API_KEY }}
+          TRESTLE_API_KEY: ${{ secrets.TRESTLE_API_KEY }}
+          ENFORMION_AP_NAME: ${{ secrets.ENFORMION_AP_NAME }}
+          ENFORMION_AP_PASSWORD: ${{ secrets.ENFORMION_AP_PASSWORD }}
+          ENFORMION_BUDGET: "100"
+          TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
+        run: |
+          if [ -z "${SMARTSKIP_EMAIL:-}" ] || [ -z "${SMARTSKIP_PASSWORD:-}" ]; then
+            echo "⚠ SMARTSKIP_EMAIL / SMARTSKIP_PASSWORD not set as GitHub secrets."
+            echo "  Skipping SmartSkip step. Add secrets to enable."
+            exit 0
+          fi
+          python scripts/probate_cascade.py \
+            --rehash-only \
+            --target-zips-only \
+            --max-cost-usd 10 \
+            --and-standard-cascade \
+            --notify-slack \
+            2>&1 | tee logs/probate_cascade_${{ steps.run_start.outputs.ts }}.log
 
       # ── DataSift export enrichment (inbox → outbox) ─────────────────────
       # Bridge tool for the ~90-day window until DataSift ships REST API keys.

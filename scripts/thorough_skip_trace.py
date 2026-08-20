@@ -544,6 +544,12 @@ def _process_record(
     enformion_phones: set[str] = set()
     if is_code_violation:
         logger.debug("  Skipping Enformion (record is on Code Violation list)")
+    elif _record_has_tag(refreshed, vt.RECORD_TAG_TRACED_ENFORMION):
+        # Prevent re-charging when probate_cascade's --and-standard-cascade
+        # re-runs _process_record on records already Enformion'd by an
+        # earlier GHA pass. Only NEW heir records (which lack this tag)
+        # will actually invoke Enformion during the re-cascade.
+        logger.debug("  Skipping Enformion — record already tagged traced_enformion")
     elif (enf.is_configured() and owner_last and addr_street
             and addr_state and addr_zip):
         result.enformion_ran = True
