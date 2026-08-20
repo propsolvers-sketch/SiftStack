@@ -221,12 +221,29 @@ def _existing_phone_set(prop: dict) -> set[str]:
 
 def _fetch_records(
     *, list_name: str | None, since_dt: datetime, max_records: int = 500,
+    tag_filter: str | None = None,
 ) -> list[dict]:
-    """Pull recently-created records from DataSift, optionally filtered by list.
+    """Pull records from DataSift that need cascade processing.
 
-    Uses -created descending order + walks pages until we hit the since_dt
-    cutoff or the max_records safety cap.
+    Selection logic (client-side because DataSift's /property/ API doesn't
+    reliably filter by tag or timestamp per prior diagnostics):
+
+      1. Fetch pages of records (up to page_limit * safety_buffer)
+      2. If tag_filter is set: keep ONLY records carrying that tag
+         (e.g. --tag queue_cascade selects operator-queued records)
+      3. Otherwise: keep records LACKING `traced_tracerfy` (never cascaded)
+         — this replaces the old `created`-timestamp filter which was
+         silently no-op'ing because DataSift's /property/ response doesn't
+         include a `created` field
+      4. If list_name is set: further filter to records in that list
+      5. Return first max_records survivors
+
+    `since_dt` retained for interface compatibility but unused — the
+    tag-absence filter naturally excludes previously-processed records
+    without needing a time cutoff.
     """
+    from vendor_tags import RECORD_TAG_TRACED_TRACERFY, RECORD_TAG_QUEUE_CASCADE
+
     list_filter_uuid: str | None = None
     if list_name:
         list_filter_uuid = ds.list_uuid(list_name, create_if_missing=False)
@@ -234,30 +251,41 @@ def _fetch_records(
             logger.warning("List %r not found in DataSift — nothing to process", list_name)
             return []
 
+    # Resolve tag UUIDs once (cached in datasift_api)
+    tracerfy_tag_uuid = ds.tag_uuid(RECORD_TAG_TRACED_TRACERFY, create_if_missing=False)
+    queue_tag_uuid = ds.tag_uuid(RECORD_TAG_QUEUE_CASCADE, create_if_missing=False) if tag_filter == RECORD_TAG_QUEUE_CASCADE else None
+
+    def _record_has_tag(rec: dict, uid: str | None) -> bool:
+        if not uid:
+            return False
+        for t in (rec.get("tags") or []):
+            tuid = t.get("uuid") if isinstance(t, dict) else t
+            if tuid == uid:
+                return True
+        return False
+
     results: list[dict] = []
     limit = 100
     offset = 0
-    since_iso = since_dt.isoformat()
+    # Safety buffer — page up to 10x max_records looking for survivors
+    max_offset = max_records * 10
 
-    while len(results) < max_records:
-        params = {
-            "limit": limit,
-            "offset": offset,
-            "ordering": "-created",
-        }
-        # NOTE: not all DataSift filters are exposed on /property/. If list
-        # filtering isn't natively supported, we filter locally after fetch.
+    while len(results) < max_records and offset < max_offset:
+        params = {"limit": limit, "offset": offset, "ordering": "-created"}
         resp = ds._get("/property/", params)
-        page = resp.get("results") or []
+        page = resp.get("data") or resp.get("results") or []
         if not page:
             break
 
         for row in page:
-            created_str = (row.get("created") or "")
-            if created_str and created_str < since_iso:
-                # We've paged past the cutoff — stop
-                return _apply_list_filter(results, list_filter_uuid)
-            # Skip records without the target list, if we're list-filtering
+            # Apply tag filter — either "must have queue_cascade" or
+            # "must lack traced_tracerfy" (default: never-cascaded)
+            if tag_filter == RECORD_TAG_QUEUE_CASCADE:
+                if not _record_has_tag(row, queue_tag_uuid):
+                    continue
+            else:
+                if _record_has_tag(row, tracerfy_tag_uuid):
+                    continue  # skip already-cascaded records
             results.append(row)
             if len(results) >= max_records:
                 break
@@ -266,6 +294,10 @@ def _fetch_records(
             break
         offset += limit
 
+    logger.info(
+        "Fetched %d records after tag filter (tag_filter=%r, pages walked=%d)",
+        len(results), tag_filter or "not-traced-yet", offset // limit,
+    )
     return _apply_list_filter(results, list_filter_uuid)
 
 
@@ -625,6 +657,13 @@ def _process_record(
         except Exception as e:
             logger.debug("add_notes on %s failed: %s", puuid[:8], e)
 
+    # Clear queue_cascade tag if operator had queued this record — its work
+    # is done, remove from the pending queue view.
+    try:
+        vt.clear_queue_cascade(puuid)
+    except Exception as e:
+        logger.debug("clear_queue_cascade failed for %s: %s", puuid[:8], e)
+
     result.action = "processed"
     return result
 
@@ -640,7 +679,12 @@ def _main(argv: list[str] | None = None) -> int:
                     help="Only process records in this DataSift list "
                          "(e.g. 'Foreclosure', 'Probate'). Default: all lists.")
     ap.add_argument("--since-hours", type=int, default=24,
-                    help="Look back this many hours (default: 24 = last daily-cron run)")
+                    help="[Deprecated — retained for compat, no longer used] "
+                         "Cascade now filters by tag absence, not timestamp.")
+    ap.add_argument("--tag", dest="tag_filter",
+                    help="Only process records carrying this tag. Use "
+                         "'queue_cascade' to process operator-queued records. "
+                         "Default: records lacking traced_tracerfy.")
     ap.add_argument("--max-records", type=int, default=200,
                     help="Safety cap on records processed per run (default: 200)")
     ap.add_argument("--property-uuid",
@@ -683,11 +727,12 @@ def _main(argv: list[str] | None = None) -> int:
         records = [prop]
     else:
         logger.info("List filter: %s", args.list_name or "(all)")
-        logger.info("Since: %s (%dh ago)", since_dt.isoformat(), args.since_hours)
+        logger.info("Tag filter:  %s", args.tag_filter or "(not-traced-yet — default)")
         records = _fetch_records(
             list_name=args.list_name,
             since_dt=since_dt,
             max_records=args.max_records,
+            tag_filter=args.tag_filter,
         )
     logger.info("Records to process: %d", len(records))
 

@@ -61,6 +61,11 @@ RECORD_TAG_SMARTSKIP_SUBMITTED = "smartskip_submitted"
 # Rehash flag — set when standard cascade finishes but phones are weak
 RECORD_TAG_NEEDS_4TH_TRACE = "needs_4th_trace"
 
+# Manual cascade queue — operator applies via DataSift UI to prioritize
+# specific records for the next cascade run. Auto-removed after cascade
+# succeeds on the record. Filter preset "Pending Cascade" = tag:queue_cascade.
+RECORD_TAG_QUEUE_CASCADE = "queue_cascade"
+
 
 # Group aliases for iteration
 ALL_TRACED_RECORD_TAGS = (
@@ -114,6 +119,7 @@ def state_tag_uuid(name: str) -> str:
         RECORD_TAG_SMARTSKIP_DEFERRED,
         RECORD_TAG_SMARTSKIP_SUBMITTED,
         RECORD_TAG_NEEDS_4TH_TRACE,
+        RECORD_TAG_QUEUE_CASCADE,
     }
     if name not in valid:
         raise ValueError(f"Unknown state tag {name!r} — expected one of {valid}")
@@ -137,9 +143,27 @@ def ensure_all_tags_exist() -> dict[str, str]:
         RECORD_TAG_SMARTSKIP_DEFERRED,
         RECORD_TAG_SMARTSKIP_SUBMITTED,
         RECORD_TAG_NEEDS_4TH_TRACE,
+        RECORD_TAG_QUEUE_CASCADE,
     ):
         resolved[state] = state_tag_uuid(state)
     return resolved
+
+
+def clear_queue_cascade(property_uuid: str) -> None:
+    """Remove the queue_cascade tag from a record — call after cascade finishes.
+
+    Idempotent — silent no-op if the tag isn't on the record.
+    """
+    tag_uuid = state_tag_uuid(RECORD_TAG_QUEUE_CASCADE)
+    try:
+        ds.remove_tags(property_uuid, [tag_uuid])
+    except AttributeError:
+        # Older datasift_api without remove_tags — try low-level endpoint
+        try:
+            ds._post(f"/property/{property_uuid}/remove-tags/",
+                     {"tags": [RECORD_TAG_QUEUE_CASCADE]})
+        except Exception:
+            pass  # Not fatal — tag will still show but record is otherwise done
 
 
 # ─────────────────────────────────────────────────────────────────────
