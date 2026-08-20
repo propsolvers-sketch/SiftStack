@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -56,9 +57,30 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 import datasift_api as ds
 import enrichment_router as router
 import vendor_tags as vt
-import smartskip_client as ss
+import smartskip_client as ss  # dataclasses + parsers reused by both clients
 
 logger = logging.getLogger(__name__)
+
+
+def _get_smartskip_client(*, headless: bool = True):
+    """Return a SmartSkip client based on SMARTSKIP_CLIENT env var.
+
+    - "api" (RECOMMENDED once validated): REST HTTP client at api.smartskip.io
+    - "playwright" (DEFAULT for safety): browser automation (legacy)
+
+    To switch: `export SMARTSKIP_CLIENT=api` in .env, or set inline for
+    one-off testing: `SMARTSKIP_CLIENT=api python scripts/probate_cascade.py ...`
+
+    Both expose the same submit_batch / wait_and_download interface and
+    write submitted CSVs + downloaded results into outbox/smartskip/.
+    """
+    backend = os.environ.get("SMARTSKIP_CLIENT", "playwright").strip().lower()
+    if backend == "api":
+        logger.info("SmartSkip backend: REST API (api.smartskip.io)")
+        from smartskip_api_client import SmartSkipApiClient
+        return SmartSkipApiClient(headless=headless)
+    logger.info("SmartSkip backend: Playwright (browser automation)")
+    return ss.SmartSkipClient(headless=headless)
 
 
 def _relationship_phone_tag(role: str) -> str | None:
@@ -716,7 +738,7 @@ def _recover_paid_batch(
 
     scraped_date = time.strftime("%Y-%m-%d")
 
-    with ss.SmartSkipClient(headless=headless) as client:
+    with _get_smartskip_client(headless=headless) as client:
         try:
             result_csv_path = client.wait_and_download(batch)
         except (ss.SmartSkipTimeoutError, ss.SmartSkipSessionExpired) as e:
@@ -806,12 +828,12 @@ def run_probate_cascade(
         summary.duration_seconds = time.time() - started
         return summary
 
-    # ── 3. Submit batch to SmartSkip via Playwright, wait, download
+    # ── 3. Submit batch to SmartSkip (REST API or Playwright per env var)
     scraped_date = time.strftime("%Y-%m-%d")
     batch_label = f"Probate_Cascade_{scraped_date}"
 
     try:
-        with ss.SmartSkipClient(headless=headless) as client:
+        with _get_smartskip_client(headless=headless) as client:
             rows = [rp[0] for rp in rows_and_records]
             batch = client.submit_batch(rows, batch_label=batch_label)
             logger.info("SmartSkip batch submitted: %s", batch.batch_id)
