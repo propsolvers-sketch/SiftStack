@@ -600,6 +600,38 @@ def _process_record(
         result.action = "noop"
         return result
 
+    # ── DEFER Trestle for probate-universe records awaiting SmartSkip ──
+    # Records in Probate / Pre-Probate / Obituary lists get SmartSkip
+    # enrichment at 6 AM (adds heir phones). Trestle should score the
+    # FULL phone set (owner + heirs) in ONE pass — not twice. So we skip
+    # Trestle here for probate records lacking traced_smartskip; SmartSkip
+    # cron's re-cascade will Trestle them after adding heir phones.
+    #
+    # Operator-visible signal: traced_tracerfy/datasift/enformion present
+    # but traced_smartskip missing = "SmartSkip pending, Trestle deferred".
+    from enrichment_router import OBITUARY_UNIVERSE_LIST_UUIDS
+    record_lists = refreshed.get("lists") or []
+    is_probate_universe = any(
+        (lst if isinstance(lst, str) else (lst.get("uuid") if isinstance(lst, dict) else None))
+        in OBITUARY_UNIVERSE_LIST_UUIDS
+        for lst in record_lists
+    )
+    smartskip_done = _record_has_tag(refreshed, vt.RECORD_TAG_TRACED_SMARTSKIP)
+    if is_probate_universe and not smartskip_done:
+        logger.info(
+            "  Deferring Trestle for %s — probate-universe record awaiting "
+            "SmartSkip cron (6 AM). SmartSkip will Trestle full phone set.",
+            puuid[:8],
+        )
+        result.action = "processed_awaiting_smartskip"
+        # Clear queue_cascade if operator had queued this record — cascade
+        # is done, SmartSkip is next. Record moves out of pending view.
+        try:
+            vt.clear_queue_cascade(puuid)
+        except Exception:
+            pass
+        return result
+
     # ── Step 4: Trestle-score EVERY unique phone (belt + suspenders — some
     # existing phones may be untiered from prior runs) and tag each ──
     tier_map = _score_phones(sorted(phones_after))
