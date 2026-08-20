@@ -11,9 +11,15 @@
     "owner_name": "MIQUEL, BECCERRA SANCHEZ",
     "source": "apn"
   },
+  "101 HAZELWOOD DR|HAZEL GREEN|35750": {
+    "first_seen": "2026-08-20",
+    "last_seen": "2026-08-20",
+    "owner_name": "Quamae, Jackson",
+    "source": "apn"
+  },
   "1021 QUAIL RUN|TRUSSVILLE|35173": {
     "first_seen": "2026-08-06",
-    "last_seen": "2026-08-12",
+    "last_seen": "2026-08-20",
     "owner_name": "Dustin, Clay Parker",
     "source": "apn"
   },
@@ -65,15 +71,21 @@
     "owner_name": "ANDRE, DUVAR JACOBS",
     "source": "apn"
   },
+  "117 SAN LEONARDO WAY|HUNTSVILLE|35811": {
+    "first_seen": "2026-08-20",
+    "last_seen": "2026-08-20",
+    "owner_name": "REGINALD, FORTSON",
+    "source": "apn"
+  },
   "1176 FIVE MILE RD|BIRMINGHAM|35215": {
     "first_seen": "2026-08-13",
-    "last_seen": "2026-08-13",
+    "last_seen": "2026-08-20",
     "owner_name": "Valerie, Jean Payne",
     "source": "apn"
   },
   "121 ANDOVER LN|HUNTSVILLE|35811": {
     "first_seen": "2026-08-06",
-    "last_seen": "2026-08-13",
+    "last_seen": "2026-08-20",
     "owner_name": "Joshua, Kuykendall",
     "source": "apn"
   },
@@ -125,10 +137,22 @@
     "owner_name": "MICHAEL, JOE BYERS",
     "source": "apn"
   },
+  "1553 PINE TREE DR|BIRMINGHAM|35235": {
+    "first_seen": "2026-08-20",
+    "last_seen": "2026-08-20",
+    "owner_name": "ALFONSO, WINDELL BIGGS CYNTHIA BIGGS",
+    "source": "apn"
+  },
   "1577 BREWSTER CIR|BIRMINGHAM|35235": {
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-16",
     "owner_name": "Brian, Lewis Bennett",
+    "source": "apn"
+  },
+  "159 RED FOX WAY|MERIDIANVILLE|35759": {
+    "first_seen": "2026-08-20",
+    "last_seen": "2026-08-20",
+    "owner_name": "TROY, ORLANDUS RAGLAND",
     "source": "apn"
   },
   "16 BONNIE CIR|HUEYTOWN|35023": {
@@ -151,7 +175,7 @@
   },
   "164 CLIFT CREEK DR|MADISON|35757": {
     "first_seen": "2026-08-13",
-    "last_seen": "2026-08-13",
+    "last_seen": "2026-08-20",
     "owner_name": "Keith, Lewis",
     "source": "apn"
   },
@@ -165,6 +189,12 @@
     "first_seen": "2026-07-15",
     "last_seen": "2026-08-06",
     "owner_name": "ROBERT, LEE EVERSON JR",
+    "source": "apn"
+  },
+  "208 COZY CREEK RD|MERIDIANVILLE|35759": {
+    "first_seen": "2026-08-20",
+    "last_seen": "2026-08-20",
+    "owner_name": "DERRICK, BYRD",
     "source": "apn"
   },
   "208 OAKVIEW RD|HAZEL GREEN|35750": {
@@ -193,7 +223,7 @@
   },
   "2411 GARDEN PARK DR NW|HUNTSVILLE|35810": {
     "first_seen": "2026-08-13",
-    "last_seen": "2026-08-13",
+    "last_seen": "2026-08-20",
     "owner_name": "KIMBERLEE, HOGAN",
     "source": "apn"
   },
@@ -201,6 +231,12 @@
     "first_seen": "2026-07-15",
     "last_seen": "2026-07-15",
     "owner_name": "Timothy, Lee",
+    "source": "apn"
+  },
+  "2514 ASPEN CIR|HUEYTOWN|35023": {
+    "first_seen": "2026-08-20",
+    "last_seen": "2026-08-20",
+    "owner_name": "Derrick, Todd",
     "source": "apn"
   },
   "2605 IVY CIR|BIRMINGHAM|35226": {
@@ -259,7 +295,7 @@
   },
   "3458 JEANNE LN|BESSEMER|35023": {
     "first_seen": "2026-08-13",
-    "last_seen": "2026-08-13",
+    "last_seen": "2026-08-20",
     "owner_name": "Leonta, Cash Sr.",
     "source": "apn"
   },
@@ -283,13 +319,13 @@
   },
   "3813 SWEARENGIN RD|GRANT|35747": {
     "first_seen": "2026-08-06",
-    "last_seen": "2026-08-13",
+    "last_seen": "2026-08-20",
     "owner_name": "Ellen, Springer",
     "source": "apn"
   },
   "3817 VENUS AVE|BIRMINGHAM|35215": {
     "first_seen": "2026-08-06",
-    "last_seen": "2026-08-12",
+    "last_seen": "2026-08-20",
     "owner_name": "Trishan, Little",
     "source": "apn"
   },
@@ -337,7 +373,7 @@
   },
   "481 HERITAGE PL|PINSON|35126": {
     "first_seen": "2026-08-13",
-    "last_seen": "2026-08-13",
+    "last_seen": "2026-08-20",
     "owner_name": "Patsy, Cates",
     "source": "apn"
   },
@@ -377,6 +413,18 @@
     "owner_name": "Juan, Carlos Perdomo",
     "source": "apn"
   },
+  "555 CLOUDS COVE RD SE|HUNTSVILLE|35803": {
+    "first_seen": "2026-08-20",
+    "last_seen": "2026-08-20",
+    "owner_name": "PATRICIA, CARPENTER",
+    "source": "apn"
+  },
+  "5603 5TH ST S|BESSEMER|35020": {
+    "first_seen": "2026-08-20",
+    "last_seen": "2026-08-20",
+    "owner_name": "PAMELA, CUNNINGHAM",
+    "source": "apn"
+  },
   "5643 DESOTO DR|PINSON|35126": {
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-29",
@@ -403,7 +451,7 @@
   },
   "625 WOODBROOK RD|CENTER POINT|35215": {
     "first_seen": "2026-08-13",
-    "last_seen": "2026-08-13",
+    "last_seen": "2026-08-20",
     "owner_name": "Carl, Christian Sr.",
     "source": "apn"
   },
@@ -411,6 +459,12 @@
     "first_seen": "2026-07-23",
     "last_seen": "2026-08-05",
     "owner_name": "LACEY, NICHOLE WILLIAMS",
+    "source": "apn"
+  },
+  "628 AVE V|BIRMINGHAM|35214": {
+    "first_seen": "2026-08-20",
+    "last_seen": "2026-08-20",
+    "owner_name": "JOANN, WRENN",
     "source": "apn"
   },
   "668 COALFIRE AVE|HUEYTOWN|35023": {
@@ -421,7 +475,7 @@
   },
   "6705 MOSSY OAK CV|TRUSSVILLE|35173": {
     "first_seen": "2026-08-06",
-    "last_seen": "2026-08-12",
+    "last_seen": "2026-08-20",
     "owner_name": "Leigh, Renda",
     "source": "apn"
   },
@@ -443,6 +497,12 @@
     "owner_name": "Misty, Hall",
     "source": "apn"
   },
+  "7296 BAYBERRY RD|HELENA|35022": {
+    "first_seen": "2026-08-20",
+    "last_seen": "2026-08-20",
+    "owner_name": "JAMES, KENT JORDAN JR LISA JORDAN",
+    "source": "apn"
+  },
   "7316 PINEWOOD DR|TRUSSVILLE|35173": {
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-16",
@@ -457,7 +517,7 @@
   },
   "825 HILLVIEW DR|BIRMINGHAM|35235": {
     "first_seen": "2026-07-16",
-    "last_seen": "2026-07-29",
+    "last_seen": "2026-08-20",
     "owner_name": "BEATRICE, MULLIN",
     "source": "apn"
   },
