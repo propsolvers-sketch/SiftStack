@@ -46,6 +46,15 @@ OBITUARY_UNIVERSE_LIST_UUIDS = frozenset({
     "9349c0c5-d46e-4621-8ebf-0f0de2c93fcf",  # Pre-Probate/Deceased
 })
 
+# DataSift's /property/{uuid} response returns `lists` as a list of TITLE
+# strings, not UUIDs (diagnostic 2026-08-21). So client-side list membership
+# checks must compare against titles, not UUIDs.
+OBITUARY_UNIVERSE_LIST_TITLES = frozenset({
+    "Obituary",
+    "Probate",
+    "Pre-Probate/Deceased",
+})
+
 PROBATE_NOTICE_TYPES = frozenset({"probate", "pre_probate"})
 
 
@@ -173,19 +182,39 @@ def query_probate_universe_records(
     target_zips: frozenset[str] | None = None,
     limit: int | None = 500,
     page_size: int = 500,
+    max_candidates: int = 100,
 ) -> list[dict]:
     """Query DataSift for records in the probate/obituary universe.
 
-    Args:
-      require_traced_smartskip_missing: if True, filter out records already
-        tagged `traced_smartskip` client-side (used by WEEKLY REHASH pass).
-      target_zips: if provided, keep ONLY records whose property ZIP is in
-        this set (5-digit match). Used to constrain SmartSkip spend to the
-        operator's calling scope (Tier 1 + Tier 2 ZIPs).
-      limit: max total records to return (None = up to DataSift's 10K cap).
-      page_size: per-page fetch size.
+    Rewritten 2026-08-21 (v2) to fix the actual root cause: DataSift's
+    /property/ list endpoint returns records with `list_count` + `tag_count`
+    (integers) but NO `lists` or `tags` fields with the actual UUIDs.
+    Client-side list/tag validation was silently returning False on every
+    record because those fields don't exist in the response.
 
-    DataSift's /property/ has a hard 10K cap on offset+limit — we respect it.
+    Correct pattern (works around the API's list-endpoint limitation):
+
+      1. Query with ?lists=<probate universe> + ordering=-created
+         → returns candidate UUIDs (server-side list filter — trusted)
+      2. Filter candidates by property ZIP (address IS in the list response)
+      3. For each ZIP-passing candidate, fetch FULL record via
+         get_property(uuid) → returns {tags, lists, ...} with UUIDs
+      4. Client-side validate list membership (belt+suspenders)
+      5. Filter out records already tagged traced_smartskip
+      6. Return up to `limit` matching records
+
+    Trade-off: this makes N GET calls (1 per candidate). For probate universe
+    daily volume (~30 fresh records + backlog), that's typically 50-200 extra
+    GETs = a few seconds. Small cost for reliability.
+
+    Args:
+      require_traced_smartskip_missing: filter out records already SmartSkip'd
+      target_zips: keep ONLY records whose property ZIP is in this set (recommended
+        — cheap ZIP filter runs BEFORE expensive per-record fetches)
+      limit: max matching records to return
+      page_size: records per API list call (default 500)
+      max_candidates: hard cap on how many candidates we fetch full-detail for
+        (safety net — prevents runaway GET calls if server filter is broken)
     """
     from vendor_tags import RECORD_TAG_TRACED_SMARTSKIP  # avoid circular
 
@@ -193,59 +222,119 @@ def query_probate_universe_records(
     if require_traced_smartskip_missing:
         smartskip_uuid = ds.tag_uuid(RECORD_TAG_TRACED_SMARTSKIP, create_if_missing=False)
 
-    # DataSift's 10K offset+limit cap
-    HARD_CAP = 9500
-    effective_max = min(limit or HARD_CAP, HARD_CAP)
+    def _in_target_zip(r: dict) -> bool:
+        """Cheap ZIP filter using the address field (present in list response)."""
+        if not target_zips:
+            return True
+        addr = r.get("address") or {}
+        zip5 = (addr.get("zip5") or addr.get("postal_code") or "").strip()[:5]
+        return zip5 in target_zips
 
-    all_records: list[dict] = []
+    # DataSift returns list/tag membership as TITLES (strings), not UUIDs.
+    # Discovered via diagnostic 2026-08-21 — full['lists'] = ['Probate', ...].
+    from vendor_tags import RECORD_TAG_TRACED_SMARTSKIP as _SMARTSKIP_TITLE
+
+    def _has_smartskip_full(full_rec: dict) -> bool:
+        """Tag check by TITLE — full['tags'] holds title strings."""
+        if not require_traced_smartskip_missing:
+            return False
+        for t in (full_rec.get("tags") or []):
+            title = t if isinstance(t, str) else (
+                (t.get("title") or t.get("name") or "") if isinstance(t, dict) else ""
+            )
+            if title == _SMARTSKIP_TITLE:
+                return True
+        return False
+
+    def _in_probate_universe_full(full_rec: dict) -> bool:
+        """List check by TITLE — full['lists'] holds title strings."""
+        for lst in (full_rec.get("lists") or []):
+            title = lst if isinstance(lst, str) else (
+                (lst.get("title") or lst.get("name") or "") if isinstance(lst, dict) else ""
+            )
+            if title in OBITUARY_UNIVERSE_LIST_TITLES:
+                return True
+        return False
+
+    HARD_CAP = 9500
+    scan_cap = min(max_candidates * 5, HARD_CAP)  # scan up to 5x candidate cap
+    return_cap = limit if limit is not None else max_candidates
+
+    # ── Stage 1: fetch candidate UUIDs via list query (ordering=-created) ──
+    candidates: list[dict] = []
     offset = 0
-    while len(all_records) < effective_max:
-        page = min(page_size, effective_max - len(all_records))
+    while len(candidates) < scan_cap:
         params = {
             "lists": ",".join(OBITUARY_UNIVERSE_LIST_UUIDS),
-            "limit": page,
+            "limit": page_size,
             "offset": offset,
+            "ordering": "-created",
         }
         resp = ds._get("/property/", params)
         data = resp.get("data") or resp.get("results") or []
         if not data:
             break
-        all_records.extend(data)
-        if len(data) < page:
+        candidates.extend(data)
+        if len(data) < page_size:
             break
-        offset += page
+        offset += page_size
 
-    total_in_universe = len(all_records)
+    # Cheap ZIP filter FIRST (address is in list response)
+    zip_filtered = [c for c in candidates if _in_target_zip(c)]
+    logger.info(
+        "Stage 1 candidates: %d fetched → %d after ZIP filter (%s ZIPs)",
+        len(candidates), len(zip_filtered),
+        f"{len(target_zips)} target" if target_zips else "any",
+    )
 
-    # Client-side filter for the traced_smartskip exclusion
-    if smartskip_uuid:
-        def _has_smartskip(r):
-            tags = r.get("tags") or []
-            for t in tags:
-                uid = t.get("uuid") if isinstance(t, dict) else t
-                if uid == smartskip_uuid:
-                    return True
-            return False
-        before = len(all_records)
-        all_records = [r for r in all_records if not _has_smartskip(r)]
-        logger.info("Filtered smartskip-already-traced: %d → %d", before, len(all_records))
-
-    # Client-side filter to target ZIPs (property ZIP, 5-digit match)
-    if target_zips:
-        def _in_target_zip(r):
-            addr = r.get("address") or {}
-            zip5 = (addr.get("zip5") or addr.get("postal_code") or "").strip()[:5]
-            return zip5 in target_zips
-        before = len(all_records)
-        all_records = [r for r in all_records if _in_target_zip(r)]
-        logger.info(
-            "Filtered to target ZIPs (%d ZIPs in scope): %d → %d "
-            "(funnel: universe %d → smartskip-eligible %d → in-scope %d)",
-            len(target_zips), before, len(all_records),
-            total_in_universe, before, len(all_records),
+    # ── Stage 2: fetch FULL details for ZIP-passing candidates ──
+    # Cap the number of expensive GET calls
+    to_fetch = zip_filtered[:max_candidates]
+    if len(zip_filtered) > max_candidates:
+        logger.warning(
+            "Truncating candidate fetch: %d → %d (max_candidates cap). Increase "
+            "cap if truncation is dropping legitimate matches.",
+            len(zip_filtered), max_candidates,
         )
 
-    return all_records
+    matching: list[dict] = []
+    probate_confirmed = 0
+    already_smartskip = 0
+    fetch_errors = 0
+    for i, cand in enumerate(to_fetch):
+        if len(matching) >= return_cap:
+            break
+        uuid = cand.get("uuid")
+        if not uuid:
+            continue
+        try:
+            full = ds.get_property(uuid)
+        except Exception as e:
+            fetch_errors += 1
+            logger.debug("get_property(%s) failed: %s", uuid[:8], e)
+            continue
+        if not _in_probate_universe_full(full):
+            continue  # server ?lists= filter returned a non-probate record
+        probate_confirmed += 1
+        if _has_smartskip_full(full):
+            already_smartskip += 1
+            continue
+        matching.append(full)
+
+    logger.info(
+        "Stage 2 full-detail check: fetched %d → %d confirmed probate → "
+        "%d already SmartSkip'd → %d matching (fetch_errors=%d)",
+        len(to_fetch), probate_confirmed, already_smartskip, len(matching),
+        fetch_errors,
+    )
+    logger.info(
+        "SmartSkip queue: %d records ready to submit "
+        "(pipeline: %d candidates → %d in scope → %d confirmed probate → "
+        "%d pending SmartSkip)",
+        len(matching), len(candidates), len(zip_filtered),
+        probate_confirmed, len(matching),
+    )
+    return matching
 
 
 __all__ = [

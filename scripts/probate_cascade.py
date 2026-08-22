@@ -777,6 +777,7 @@ def run_probate_cascade(
     dry_run: bool = False,
     headless: bool = True,
     target_zips_only: bool = False,
+    backlog_catchup: bool = False,
 ) -> ProbateCascadeSummary:
     """Full SmartSkip pass over the probate universe."""
     started = time.time()
@@ -793,10 +794,16 @@ def run_probate_cascade(
         target_zip_set = ALL_TARGET
         logger.info("Target-ZIP-only mode: constraining to %d Tier 1+2 ZIPs",
                     len(target_zip_set))
+    # Widen candidate scan for backlog burn — 500 = ~2-3 min of extra get_property calls
+    candidate_cap = 500 if backlog_catchup else 100
+    if backlog_catchup:
+        logger.info("Backlog-catchup mode: scanning up to %d candidates for "
+                    "full-detail check (vs default 100)", candidate_cap)
     records = router.query_probate_universe_records(
         require_traced_smartskip_missing=rehash_only,
         target_zips=target_zip_set,
         limit=500,
+        max_candidates=candidate_cap,
     )
     if max_records:
         records = records[:max_records]
@@ -923,6 +930,12 @@ def _main(argv: list[str] | None = None) -> int:
                         "is in the operator's calling scope (Tier 1 + Tier 2). "
                         "Saves cost on out-of-scope records. Recommended for "
                         "daily cron.")
+    p.add_argument("--backlog-catchup", action="store_true",
+                   help="Widen candidate scan to catch up multi-day backlog "
+                        "(scans up to 500 candidates for full-detail fetch, "
+                        "vs default 100). Pair with higher --max-cost-usd. "
+                        "Example: --backlog-catchup --max-cost-usd 30 to "
+                        "process ~200 records in one shot.")
     p.add_argument("--dry-run", action="store_true",
                    help="Log what would be submitted, don't upload")
     p.add_argument("--headed", action="store_true",
@@ -984,6 +997,7 @@ def _main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             headless=not args.headed,
             target_zips_only=args.target_zips_only,
+            backlog_catchup=args.backlog_catchup,
         )
 
     print()
