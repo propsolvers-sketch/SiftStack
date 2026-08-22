@@ -930,6 +930,154 @@ def _format_smartskip_summary() -> list[str]:
     return lines
 
 
+def _format_enrichment_contribution() -> list[str]:
+    """Build a consolidated 📊 Enrichment Contribution section for the Slack post.
+
+    Combines per-vendor stats from:
+      - Tracerfy: from output/observability/service_rates.json + cascade log
+      - DataSift native (free) + Enformion + Trestle: from thorough_skip_trace log
+      - SmartSkip: from output/observability/smartskip_last_run.json
+
+    Returns [] if no enrichment data available (nothing to render).
+    """
+    logs_dir = Path(__file__).parent.parent / "logs"
+    today = date.today().strftime("%Y%m%d")
+
+    # ── Parse cascade log for DataSift + Enformion + Trestle metrics ──
+    cascade_metrics = {}
+    if logs_dir.exists():
+        matching = sorted(logs_dir.glob(f"thorough_skip_trace_{today}*.log"),
+                          key=lambda p: p.stat().st_mtime, reverse=True)
+        if matching:
+            log_text = matching[0].read_text(errors="ignore")
+            records_m = re.search(r"Records:\s+(\d+)", log_text)
+            new_ds_m  = re.search(r"New phones via DataSift native skip-trace:\s+(\d+)", log_text)
+            new_enf_m = re.search(
+                r"New phones via Enformion household search:\s+(\d+)\s+"
+                r"\((\d+) records called Enformion, ~\$([\d.]+)", log_text,
+            )
+            tiered_m  = re.search(r"Phones tiered via Trestle:\s+(\d+)", log_text)
+            tier_block = re.search(
+                r"Tier distribution:\n((?:\s+·\s+[\w ]+\s+\d+\n)+)", log_text,
+            )
+            if records_m: cascade_metrics["records"] = int(records_m.group(1))
+            if new_ds_m: cascade_metrics["ds_new_phones"] = int(new_ds_m.group(1))
+            if new_enf_m:
+                cascade_metrics["enf_new_phones"] = int(new_enf_m.group(1))
+                cascade_metrics["enf_records_called"] = int(new_enf_m.group(2))
+                cascade_metrics["enf_cost"] = float(new_enf_m.group(3))
+            if tiered_m: cascade_metrics["phones_tiered"] = int(tiered_m.group(1))
+            if tier_block:
+                tiers = {}
+                for tier_line in tier_block.group(1).strip().splitlines():
+                    tm = re.match(r"\s+·\s+([\w ]+?)\s+(\d+)", tier_line)
+                    if tm: tiers[tm.group(1).strip()] = int(tm.group(2))
+                cascade_metrics["tier_dist"] = tiers
+
+    # ── Parse Tracerfy stats from service_rates.json ──
+    tracerfy_today = None
+    rates_path = Path(__file__).parent.parent / "output" / "observability" / "service_rates.json"
+    if rates_path.exists():
+        try:
+            rates_data = json.loads(rates_path.read_text())
+            today_iso = date.today().strftime("%Y-%m-%d")
+            for entry in (rates_data.get("tracerfy") or []):
+                if entry.get("date") == today_iso:
+                    tracerfy_today = entry
+                    break
+        except Exception:
+            pass
+
+    # ── Parse SmartSkip stats from smartskip_last_run.json ──
+    smartskip_today = None
+    ss_path = Path(__file__).parent.parent / "output" / "observability" / "smartskip_last_run.json"
+    if ss_path.exists():
+        try:
+            ss_data = json.loads(ss_path.read_text())
+            ran_at = ss_data.get("ran_at", "")
+            if ran_at:
+                ran_dt = datetime.strptime(ran_at, "%Y-%m-%dT%H:%M:%SZ")
+                if (datetime.utcnow() - ran_dt).total_seconds() <= 26 * 3600:
+                    smartskip_today = ss_data
+        except Exception:
+            pass
+
+    # Bail out if we have absolutely nothing
+    if not cascade_metrics and not tracerfy_today and not smartskip_today:
+        return []
+
+    lines = ["*📊 Enrichment Contribution*"]
+
+    # Tracerfy — attempts, matches, cost (~$0.30/match)
+    if tracerfy_today:
+        attempts = tracerfy_today.get("total", 0)
+        matched = tracerfy_today.get("success", 0)
+        match_pct = f"({100 * matched / attempts:.0f}%)" if attempts else ""
+        cost = matched * 0.30
+        lines.append(
+            f"  Tracerfy: {matched}/{attempts} matched {match_pct} · ${cost:.2f}"
+        )
+
+    # DataSift native — free
+    if cascade_metrics.get("ds_new_phones") is not None:
+        recs = cascade_metrics.get("records", "?")
+        lines.append(
+            f"  DataSift native: {cascade_metrics['ds_new_phones']} new phones "
+            f"across {recs} records · FREE"
+        )
+
+    # Enformion — cost + records called
+    if cascade_metrics.get("enf_records_called") is not None:
+        lines.append(
+            f"  Enformion: {cascade_metrics['enf_new_phones']} household phones "
+            f"across {cascade_metrics['enf_records_called']} records · "
+            f"${cascade_metrics['enf_cost']:.2f}"
+        )
+
+    # SmartSkip — probate universe only
+    if smartskip_today and smartskip_today.get("submitted", 0) > 0:
+        submitted = smartskip_today["submitted"]
+        matched = smartskip_today.get("matched", 0)
+        heirs = smartskip_today.get("heirs_created", 0)
+        cost = smartskip_today.get("cost_usd", 0.0)
+        match_pct = f"({100 * matched / submitted:.0f}%)" if submitted else ""
+        lines.append(
+            f"  SmartSkip (probate): {matched}/{submitted} matched {match_pct} · "
+            f"{heirs} heirs created · ${cost:.2f}"
+        )
+
+    # Trestle — tier distribution
+    if cascade_metrics.get("phones_tiered") is not None:
+        scored = cascade_metrics["phones_tiered"]
+        # Trestle cost estimate: $0.05/phone scored
+        trestle_cost = scored * 0.05
+        lines.append(
+            f"  Trestle: {scored} phones scored · ${trestle_cost:.2f}"
+        )
+        tiers = cascade_metrics.get("tier_dist") or {}
+        if tiers:
+            parts = []
+            for tier_name in ("Dial First", "Dial Second", "Dial Third",
+                              "Dial Fourth", "Drop"):
+                if tier_name in tiers:
+                    parts.append(f"{tier_name} {tiers[tier_name]}")
+            if parts:
+                lines.append(f"    Distribution: {' · '.join(parts)}")
+
+    # Total spend (Tracerfy + Enformion + SmartSkip + Trestle)
+    total = 0.0
+    if tracerfy_today:
+        total += tracerfy_today.get("success", 0) * 0.30
+    total += cascade_metrics.get("enf_cost", 0.0)
+    if smartskip_today:
+        total += smartskip_today.get("cost_usd", 0.0)
+    total += cascade_metrics.get("phones_tiered", 0) * 0.05
+    if total > 0:
+        lines.append(f"  💰 Total enrichment spend: ${total:.2f}")
+
+    return lines
+
+
 def _build_slack_message(
     main_f: MainDailyFunnel,
     apn_f: ApnProbateFunnel,
@@ -989,20 +1137,13 @@ def _build_slack_message(
             "",
         ])
 
-    # Standard 3-vendor cascade (Tracerfy + DataSift + Enformion + Trestle)
-    # from today's thorough_skip_trace log. Parsed from the log because the
-    # cascade script doesn't currently write a JSON summary.
-    cascade_lines = _format_standard_cascade_summary()
-    if cascade_lines:
-        lines.extend(cascade_lines)
-        lines.append("")
-
-    # SmartSkip 4th-vendor enrichment (probate/pre-probate/obituary universe).
-    # Only renders when today's smartskip_last_run.json exists (from operator's
-    # local run of probate_cascade.py — GHA doesn't run SmartSkip).
-    smartskip_lines = _format_smartskip_summary()
-    if smartskip_lines:
-        lines.extend(smartskip_lines)
+    # Consolidated 📊 Enrichment Contribution section — combines Tracerfy +
+    # DataSift native + Enformion + SmartSkip + Trestle metrics + total spend
+    # into ONE clean block. Replaces the previous separate cascade + SmartSkip
+    # sections. Renders only when at least one vendor produced output today.
+    enrichment_lines = _format_enrichment_contribution()
+    if enrichment_lines:
+        lines.extend(enrichment_lines)
         lines.append("")
 
     if csv_count == 0:

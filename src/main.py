@@ -573,20 +573,30 @@ async def actor_main() -> None:
                 try:
                     from slack_notifier import _send_webhook
 
-                    # Phase 2: post the daily summary + funnel block +
-                    # service-rates block in ONE Block Kit message (D-02:
-                    # one message, more content). Rolling-rates ordering
-                    # (D-03) and save-on-success-only (W6) are enforced
-                    # inside the helper. The legacy text-only
-                    # send_slack_notification path stays byte-identical
-                    # for any caller that still uses it (W5).
-                    _post_daily_slack_with_funnel(
-                        notices,
-                        funnel,
-                        rate_tracker,
-                        elapsed_min=elapsed_min,
-                        cost_breakdown=cost_breakdown,
-                    )
+                    # APN preliminary Slack post — gated by env var so GHA
+                    # (which posts a comprehensive daily-sweep summary via
+                    # daily_finalize.py ~90 min later) can suppress this
+                    # duplicative early post. Set SUPPRESS_APN_PRELIMINARY_SLACK=1
+                    # in GHA env to skip it. Local one-off runs (without the
+                    # env var) still post the preliminary for testing visibility.
+                    import os as _os
+                    _suppress_prelim = _os.environ.get(
+                        "SUPPRESS_APN_PRELIMINARY_SLACK", ""
+                    ).strip().lower() in ("1", "true", "yes")
+                    if not _suppress_prelim:
+                        _post_daily_slack_with_funnel(
+                            notices,
+                            funnel,
+                            rate_tracker,
+                            elapsed_min=elapsed_min,
+                            cost_breakdown=cost_breakdown,
+                        )
+                    else:
+                        logger.info(
+                            "APN preliminary Slack post SUPPRESSED via "
+                            "SUPPRESS_APN_PRELIMINARY_SLACK env var — "
+                            "consolidated daily-sweep post will handle summary."
+                        )
 
                     # Send DataSift CSV download links as a follow-up message
                     if datasift_csv_urls:

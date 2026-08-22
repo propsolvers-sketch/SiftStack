@@ -97,6 +97,11 @@ jobs:
       SMARTSKIP_PASSWORD: ${{ secrets.SMARTSKIP_PASSWORD }}
       SMARTSKIP_CLIENT: api
 
+      # Suppress the APN preliminary Slack post from src/main.py — the
+      # consolidated "SiftStack Daily Sweep" post from daily_finalize.py
+      # covers everything ~90 min later, so the preliminary is duplicative.
+      SUPPRESS_APN_PRELIMINARY_SLACK: "1"
+
       # ── CRM upload + notifications ─────────────
       DATASIFT_EMAIL: ${{ secrets.DATASIFT_EMAIL }}
       DATASIFT_PASSWORD: ${{ secrets.DATASIFT_PASSWORD }}
