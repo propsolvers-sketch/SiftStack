@@ -1441,6 +1441,27 @@ async def main() -> int:
     except Exception as e:
         print(f"Courthouse snapshot pass skipped: {e}", flush=True)
 
+    # ── Apply high-signal subtype tags to freshly-uploaded records ──
+    # DataSift wizard's Custom Tags input is unreliable — verified 2026-08-22
+    # that foreclosure_cancelled / foreclosure_postponed / probate_sale /
+    # probate_final_settlement subtypes go into Notes but not record tags.
+    # Operator can't filter/sort DataSift by note text — needs tag membership.
+    # This post-upload pass reads each CSV row, searches DataSift for the
+    # matched record by address, and applies the subtype via ds.add_tags
+    # (title-based, matches the mark_vendor_traced pattern we know works).
+    try:
+        import apply_subtype_tags
+        total_subtype_tagged = 0
+        for csv_path in csvs:
+            stats = apply_subtype_tags.apply_subtypes_from_csv(csv_path)
+            total_subtype_tagged += stats["rows_tagged"]
+        if total_subtype_tagged:
+            print(f"🏷 Subtype tags applied to {total_subtype_tagged} records "
+                  f"(foreclosure_cancelled / postponed / probate_sale / etc.)",
+                  flush=True)
+    except Exception as e:
+        print(f"Subtype tag pass skipped: {e}", flush=True)
+
     # ── --upload-only mode: save state, skip Slack post (Slack fires later
     # in workflow via --slack-only step, after cascade + SmartSkip complete). ──
     if args.upload_only:
