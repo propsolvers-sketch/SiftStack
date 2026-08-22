@@ -1235,7 +1235,49 @@ def _build_slack_message(
     return "\n".join(lines)
 
 
+STATE_FILE = Path(__file__).parent.parent / "output" / "observability" / "daily_finalize_state.json"
+
+
+def _save_state(state: dict) -> None:
+    """Persist upload/dropbox results between --upload-only and --slack-only steps."""
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # Convert Path objects to strings for JSON serialization
+    STATE_FILE.write_text(json.dumps(state, indent=2, default=str))
+
+
+def _load_state() -> dict:
+    """Read state saved by --upload-only for use in --slack-only mode."""
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
 async def main() -> int:
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Daily finalize: upload CSVs to DataSift + post Slack summary. "
+                    "Split into --upload-only and --slack-only modes so the Slack "
+                    "post can run AFTER cascade + SmartSkip steps in the GHA workflow "
+                    "(so the Enrichment Contribution section has full vendor data).",
+    )
+    parser.add_argument(
+        "--upload-only", action="store_true",
+        help="Do uploads + Dropbox sync + courthouse snapshots. Skip Slack post. "
+             "Saves state to output/observability/daily_finalize_state.json.",
+    )
+    parser.add_argument(
+        "--slack-only", action="store_true",
+        help="Read state from previous --upload-only run + fresh logs, then post "
+             "consolidated Slack summary (includes cascade + SmartSkip metrics).",
+    )
+    args = parser.parse_args()
+    if args.upload_only and args.slack_only:
+        print("ERROR: --upload-only and --slack-only are mutually exclusive", flush=True)
+        return 1
+
     if RUN_MARKER.exists():
         start_ts = RUN_MARKER.stat().st_mtime
     else:
@@ -1256,6 +1298,32 @@ async def main() -> int:
     apn_funnel = parse_apn_probate(apn_log) if apn_log else ApnProbateFunnel()
     pre_funnel = parse_pre_probate(pre_log) if pre_log else PreProbateFunnel()
     code_funnel = parse_code_violation(code_log) if code_log else CodeViolationFunnel()
+
+    # ── --slack-only mode: skip uploads, load saved state, build+post Slack ──
+    if args.slack_only:
+        print("\n========== --slack-only MODE ==========", flush=True)
+        state = _load_state()
+        if not state:
+            print("ERROR: no state file found. Run --upload-only first, then --slack-only.",
+                  flush=True)
+            return 1
+        # Rehydrate results + dropbox from saved state
+        results = state.get("upload_results", [])
+        dropbox_results = state.get("dropbox_results", [])
+        csvs = [Path(p) for p in state.get("csv_paths", [])]
+        print(f"Loaded state: {len(results)} upload results, "
+              f"{len(dropbox_results)} dropbox results, {len(csvs)} CSVs", flush=True)
+        msg = _build_slack_message(
+            main_funnel, apn_funnel, pre_funnel, results, len(csvs),
+            dropbox_results=dropbox_results,
+            csvs=csvs,
+            code_violation_f=code_funnel,
+        )
+        print("\n--- SLACK ---", flush=True)
+        print(msg, flush=True)
+        posted = _send_webhook(msg)
+        print(f"\nSlack posted: {posted}", flush=True)
+        return 0
 
     csvs = _csvs_from_this_run(start_ts)
     print(f"\nFound {len(csvs)} CSV(s) produced this run:", flush=True)
@@ -1373,6 +1441,25 @@ async def main() -> int:
     except Exception as e:
         print(f"Courthouse snapshot pass skipped: {e}", flush=True)
 
+    # ── --upload-only mode: save state, skip Slack post (Slack fires later
+    # in workflow via --slack-only step, after cascade + SmartSkip complete). ──
+    if args.upload_only:
+        state = {
+            "upload_results": results,
+            "dropbox_results": dropbox_results,
+            "csv_paths": [str(p) for p in csvs],
+        }
+        _save_state(state)
+        print(f"\n[--upload-only] Saved state to {STATE_FILE.name} "
+              f"({len(results)} upload results, {len(dropbox_results)} dropbox). "
+              f"Slack post will fire via --slack-only step at end of workflow.",
+              flush=True)
+        if results and not all(r.get("success") for r in results):
+            return 1
+        return 0
+
+    # ── Default (no flags): full flow, upload + Slack in one shot ──
+    # Used by local one-off runs OR back-compat with pre-split GHA workflow.
     msg = _build_slack_message(
         main_funnel, apn_funnel, pre_funnel, results, len(csvs),
         dropbox_results=dropbox_results,

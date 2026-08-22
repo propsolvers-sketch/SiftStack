@@ -473,8 +473,8 @@ jobs:
       #   (3) routes each via upload_to_datasift_per_distressor
       #   (4) posts ONE consolidated Slack with funnel blocks + upload results
       # Exits non-zero if any upload fails so the job surfaces it.
-      - name: Upload to DataSift + post Slack
-        run: python scripts/daily_finalize.py
+      - name: Upload to DataSift (no Slack yet)
+        run: python scripts/daily_finalize.py --upload-only
 
       # ── DataSift → Send to → Skip Trace on today's uploads ──
       # Operator validated 2026-07-16 that "Send to → Skip Trace" from the
@@ -573,8 +573,19 @@ jobs:
       # --and-standard-cascade re-runs cascade + Trestle for probate records
       # (Enformion self-dedups via traced_enformion tag — no double-charge).
       #
-      # Local launchd cron (6 AM) stays enabled as safety net — will
-      # mostly no-op via --rehash-only since GHA tagged them here.
+      # Local launchd cron disabled 2026-08-22 — GHA is sole SmartSkip runner.
+
+      # DataSift routing lag: after CSV upload with `Lists: Probate` column,
+      # DataSift's background job takes 5-15 min to actually route records
+      # into the Probate/Pre-Probate/Obituary lists. Without this sleep,
+      # SmartSkip's list-based query misses freshly-uploaded records
+      # (2026-08-22 saw 4/29 miss rate for this reason). 5 min covers most
+      # of the routing lag; notice_type fallback in query catches stragglers.
+      - name: Wait for DataSift list routing
+        run: |
+          echo "Sleeping 5 min to let DataSift route fresh uploads into Probate/Pre-Probate/Obituary lists"
+          sleep 300
+
       - name: SmartSkip probate cascade (REST API)
         continue-on-error: true
         env:
@@ -622,6 +633,17 @@ jobs:
           mkdir -p inbox outbox
           python scripts/enrich_datasift_export.py -v \
             2>&1 | tee logs/enrich_datasift_${{ steps.run_start.outputs.ts }}.log
+
+      # Post the consolidated daily-sweep Slack summary AT THE END so the
+      # 📊 Enrichment Contribution section has full vendor data (Tracerfy +
+      # DataSift native + Enformion + SmartSkip + Trestle). The --upload-only
+      # step earlier saved uploaded-CSV state; this step reads that state +
+      # today's fresh logs (thorough_skip_trace + smartskip_last_run.json)
+      # to produce ONE clean Slack post with the complete picture.
+      - name: Post consolidated daily-sweep Slack summary
+        if: always()
+        continue-on-error: true
+        run: python scripts/daily_finalize.py --slack-only
 
       # ── Persistence + observability ──
 
