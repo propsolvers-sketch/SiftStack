@@ -145,19 +145,31 @@ def _tag_new_phones_with_source(
     new_phones: set[str],
     vendor: str,
 ) -> None:
-    """Apply `src:<vendor>` tag to each new phone this vendor sourced."""
+    """Apply `src:<vendor>` tag to each new phone this vendor sourced.
+
+    Passes the tag TITLE directly to apply_phone_tags — bypasses the flaky
+    UUID→title reverse lookup that was silently dropping tags."""
     if not new_phones:
         return
-    try:
-        src_tag_uuid = vt.src_phone_tag_uuid(vendor)
-    except Exception as e:
-        logger.debug("src_phone_tag lookup failed for %s: %s", vendor, e)
+    if vendor not in vt.VENDOR_TAGS:
+        logger.warning("unknown vendor %r for phone-tag application", vendor)
         return
-    for phone in new_phones:
-        try:
-            ds.add_phone_tag(property_uuid, phone, [src_tag_uuid])
-        except Exception as e:
-            logger.debug("apply src:%s to %s failed: %s", vendor, phone, e)
+    # Ensure phone tag exists (idempotent — cached after first call)
+    try:
+        vt.src_phone_tag_uuid(vendor)
+    except Exception as e:
+        logger.debug("src_phone_tag ensure failed for %s: %s", vendor, e)
+        return
+    src_title = vt.VENDOR_TAGS[vendor]["phone"]  # e.g. "src:datasift"
+    # Build phone-tag map with title strings (upsert-phones accepts titles)
+    phone_tag_map = {phone: [src_title] for phone in new_phones}
+    try:
+        ds.apply_phone_tags(property_uuid, phone_tag_map)
+    except Exception as e:
+        logger.warning(
+            "apply src:%s to %d phones on %s failed: %s",
+            vendor, len(new_phones), property_uuid[:8], e,
+        )
 
 
 # ── DataSift polling knobs ──────────────────────────────────────────

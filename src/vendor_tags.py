@@ -173,15 +173,35 @@ def clear_queue_cascade(property_uuid: str) -> None:
 
 def mark_vendor_traced(property_uuid: str, vendor: str) -> None:
     """Apply the `traced_<vendor>` tag to a record — call at end of each
-    cascade step regardless of whether the vendor returned data."""
-    tag = traced_record_tag_uuid(vendor)
-    ds.add_tags(property_uuid, [tag])
+    cascade step regardless of whether the vendor returned data.
+
+    Bypasses UUID→title reverse lookup (which was failing silently on
+    freshly-created tags) by POSTing the TITLE directly. DataSift's
+    /property/{uuid}/add-tags/ endpoint accepts title strings and creates
+    the association if the tag exists.
+    """
+    if vendor not in VENDOR_TAGS:
+        raise ValueError(f"Unknown vendor {vendor!r}")
+    title = VENDOR_TAGS[vendor]["record"]
+    # Ensure tag exists in DataSift account (idempotent — cached after first call)
+    ds.tag_uuid(title, create_if_missing=True)
+    # POST title directly — no UUID→title round-trip
+    ds._post(f"/property/{property_uuid}/add-tags/", {"tags": [title]})
 
 
 def mark_state(property_uuid: str, state: str) -> None:
     """Apply one of the state tags (smartskip_no_match, needs_4th_trace, etc.)."""
-    tag = state_tag_uuid(state)
-    ds.add_tags(property_uuid, [tag])
+    valid = {
+        RECORD_TAG_SMARTSKIP_NO_MATCH,
+        RECORD_TAG_SMARTSKIP_DEFERRED,
+        RECORD_TAG_SMARTSKIP_SUBMITTED,
+        RECORD_TAG_NEEDS_4TH_TRACE,
+        RECORD_TAG_QUEUE_CASCADE,
+    }
+    if state not in valid:
+        raise ValueError(f"Unknown state tag {state!r}")
+    ds.tag_uuid(state, create_if_missing=True)
+    ds._post(f"/property/{property_uuid}/add-tags/", {"tags": [state]})
 
 
 def apply_phone_source(

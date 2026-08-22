@@ -1137,15 +1137,6 @@ def _build_slack_message(
             "",
         ])
 
-    # Consolidated 📊 Enrichment Contribution section — combines Tracerfy +
-    # DataSift native + Enformion + SmartSkip + Trestle metrics + total spend
-    # into ONE clean block. Replaces the previous separate cascade + SmartSkip
-    # sections. Renders only when at least one vendor produced output today.
-    enrichment_lines = _format_enrichment_contribution()
-    if enrichment_lines:
-        lines.extend(enrichment_lines)
-        lines.append("")
-
     if csv_count == 0:
         lines.append(
             ":information_source: No DataSift CSVs produced — see funnels above "
@@ -1191,6 +1182,14 @@ def _build_slack_message(
                 lines.append(
                     f"  {emoji} {r['csv']}{mode_tag}: {r.get('message','')}"
                 )
+        lines.append("")
+
+    # Consolidated 📊 Enrichment Contribution — placed AFTER DataSift Uploads
+    # so operator sees the natural flow: scrape → upload → enrich.
+    # Renders only when at least one vendor produced output today.
+    enrichment_lines = _format_enrichment_contribution()
+    if enrichment_lines:
+        lines.extend(enrichment_lines)
         lines.append("")
 
     # Always include a working link to the source-of-truth artifact for this
