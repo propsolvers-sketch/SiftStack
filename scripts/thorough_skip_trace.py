@@ -618,37 +618,18 @@ def _process_record(
         result.action = "noop"
         return result
 
-    # ── DEFER Trestle for probate-universe records awaiting SmartSkip ──
-    # Records in Probate / Pre-Probate / Obituary lists get SmartSkip
-    # enrichment at 6 AM (adds heir phones). Trestle should score the
-    # FULL phone set (owner + heirs) in ONE pass — not twice. So we skip
-    # Trestle here for probate records lacking traced_smartskip; SmartSkip
-    # cron's re-cascade will Trestle them after adding heir phones.
+    # ── Trestle runs for ALL records (Phase 1B deferral REMOVED 2026-08-23) ──
+    # Prior design deferred Trestle for probate universe records expecting
+    # SmartSkip to re-cascade them. But SmartSkip has a hard-to-fix routing
+    # lag problem (DataSift takes 5-15+ min to route new uploads into the
+    # Probate/Pre-Probate/Obituary lists), so many records never reached
+    # SmartSkip on the same day → their Trestle deferral was never fulfilled
+    # → records stuck unusable for prioritized calling.
     #
-    # Operator-visible signal: traced_tracerfy/datasift/enformion present
-    # but traced_smartskip missing = "SmartSkip pending, Trestle deferred".
-    from enrichment_router import OBITUARY_UNIVERSE_LIST_UUIDS
-    record_lists = refreshed.get("lists") or []
-    is_probate_universe = any(
-        (lst if isinstance(lst, str) else (lst.get("uuid") if isinstance(lst, dict) else None))
-        in OBITUARY_UNIVERSE_LIST_UUIDS
-        for lst in record_lists
-    )
-    smartskip_done = _record_has_tag(refreshed, vt.RECORD_TAG_TRACED_SMARTSKIP)
-    if is_probate_universe and not smartskip_done:
-        logger.info(
-            "  Deferring Trestle for %s — probate-universe record awaiting "
-            "SmartSkip cron (6 AM). SmartSkip will Trestle full phone set.",
-            puuid[:8],
-        )
-        result.action = "processed_awaiting_smartskip"
-        # Clear queue_cascade if operator had queued this record — cascade
-        # is done, SmartSkip is next. Record moves out of pending view.
-        try:
-            vt.clear_queue_cascade(puuid)
-        except Exception:
-            pass
-        return result
+    # Fix: run Trestle for EVERY record during cascade. When SmartSkip runs
+    # later and adds heir phones, its --and-standard-cascade re-runs Trestle
+    # on those NEW phones. Cost: ~$1-2/day for double-Trestling records that
+    # SmartSkip does reach same-day. Trivial vs the lost-record cost.
 
     # ── Step 4: Trestle-score EVERY unique phone (belt + suspenders — some
     # existing phones may be untiered from prior runs) and tag each ──

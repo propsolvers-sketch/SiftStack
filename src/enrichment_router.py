@@ -252,28 +252,30 @@ def query_probate_universe_records(
     # variance in DataSift's returned list titles (defensive after 2026-08-22
     # miss where fresh records weren't in list at query time due to routing lag).
     _NORMALIZED_UNIVERSE = frozenset(t.strip().lower() for t in OBITUARY_UNIVERSE_LIST_TITLES)
-    _PROBATE_NOTICE_TYPES_LC = frozenset({"probate", "pre_probate", "obituary"})
-
     def _in_probate_universe_full(full_rec: dict) -> bool:
         """Membership check with 2 signals — tolerant to DataSift routing lag:
 
         1. Case-insensitive list-title match (Probate, Pre-Probate/Deceased, Obituary)
-        2. notice_type fallback (probate/pre_probate/obituary)
+        2. owner.deceased fallback (probate scrapers set Owner Deceased=yes at upload)
 
-        Either signal counts as membership. Notice_type is set at upload time
-        (no routing lag), so it catches records that were just uploaded but
-        haven't been added to the list yet by DataSift's background job.
+        Either signal counts as membership. Owner-deceased flag is set on the
+        record at upload time (no routing lag), so it catches probate/pre-probate/
+        obituary records that were just uploaded but haven't been added to the
+        list yet by DataSift's background routing job.
+
+        Note: notice_type field doesn't exist on DataSift's record response
+        (diagnostic 2026-08-22) — that's why we use owner.deceased instead.
         """
-        # Signal 1: list title (may lag ~5-15 min after upload)
+        # Signal 1: list title (may lag 5-15+ min after upload)
         for lst in (full_rec.get("lists") or []):
             title = lst if isinstance(lst, str) else (
                 (lst.get("title") or lst.get("name") or "") if isinstance(lst, dict) else ""
             )
             if title and title.strip().lower() in _NORMALIZED_UNIVERSE:
                 return True
-        # Signal 2: notice_type field (set at upload — no lag)
-        notice_type = (full_rec.get("notice_type") or "").strip().lower()
-        if notice_type in _PROBATE_NOTICE_TYPES_LC:
+        # Signal 2: owner.deceased boolean (set at upload — no lag)
+        owner = full_rec.get("owner") or {}
+        if isinstance(owner, dict) and owner.get("deceased"):
             return True
         return False
 

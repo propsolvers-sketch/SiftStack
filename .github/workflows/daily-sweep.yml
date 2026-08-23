@@ -576,15 +576,18 @@ jobs:
       # Local launchd cron disabled 2026-08-22 — GHA is sole SmartSkip runner.
 
       # DataSift routing lag: after CSV upload with `Lists: Probate` column,
-      # DataSift's background job takes 5-15 min to actually route records
-      # into the Probate/Pre-Probate/Obituary lists. Without this sleep,
-      # SmartSkip's list-based query misses freshly-uploaded records
-      # (2026-08-22 saw 4/29 miss rate for this reason). 5 min covers most
-      # of the routing lag; notice_type fallback in query catches stragglers.
+      # DataSift's background job takes 5-15+ min to route records into the
+      # Probate/Pre-Probate/Obituary lists. Without this sleep, SmartSkip's
+      # list-based query misses freshly-uploaded records.
+      # History:
+      #   2026-08-22: 5-min sleep, 4/29 records reached SmartSkip
+      #   2026-08-23: 5-min sleep, 1/50 records reached SmartSkip → increased to 15 min
+      # Paired with owner.deceased fallback in query_probate_universe_records
+      # to catch stragglers via a non-list signal set at upload time.
       - name: Wait for DataSift list routing
         run: |
-          echo "Sleeping 5 min to let DataSift route fresh uploads into Probate/Pre-Probate/Obituary lists"
-          sleep 300
+          echo "Sleeping 15 min to let DataSift route fresh uploads into Probate/Pre-Probate/Obituary lists"
+          sleep 900
 
       - name: SmartSkip probate cascade (REST API)
         continue-on-error: true
