@@ -414,5 +414,21 @@
         "corroborated_phones": 0
       }
     }
+  },
+  {
+    "run_date": "2026-08-23",
+    "run_time": "08:46:55",
+    "pipeline": "pre_probate",
+    "notices_analyzed": 22,
+    "sources": {
+      "enformion": {
+        "records_contributed_to": 12,
+        "total_phones": 610,
+        "tier_distribution": {
+          "(unscored)": 610
+        },
+        "corroborated_phones": 0
+      }
+    }
   }
 ]
