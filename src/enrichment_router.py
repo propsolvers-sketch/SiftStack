@@ -252,31 +252,44 @@ def query_probate_universe_records(
     # variance in DataSift's returned list titles (defensive after 2026-08-22
     # miss where fresh records weren't in list at query time due to routing lag).
     _NORMALIZED_UNIVERSE = frozenset(t.strip().lower() for t in OBITUARY_UNIVERSE_LIST_TITLES)
+    # Keyword-match set catches DataSift list-title variations discovered
+    # via diagnostic 2026-08-24 (owner.deceased fallback was returning False
+    # for ALL records because DataSift doesn't map "Owner Deceased: yes" CSV
+    # column to owner.deceased field). Actual DataSift list titles we've
+    # observed:
+    #   - "Probate", "Probate Properties"
+    #   - "Pre-Probate/Deceased"
+    #   - "Obituary"
+    #   - "Estate and Heirs"    ← new list we didn't have hardcoded
+    # Rather than chase exact titles, match on keyword presence.
+    _PROBATE_LIST_KEYWORDS = (
+        "probate",       # matches "Probate", "Probate Properties", "Pre-Probate/..."
+        "obituary",      # matches "Obituary"
+        "deceased",      # matches "Pre-Probate/Deceased"
+        "estate and heirs",  # matches the "Estate and Heirs" DataSift list
+    )
+
     def _in_probate_universe_full(full_rec: dict) -> bool:
-        """Membership check with 2 signals — tolerant to DataSift routing lag:
+        """Membership check by list-title keyword match.
 
-        1. Case-insensitive list-title match (Probate, Pre-Probate/Deceased, Obituary)
-        2. owner.deceased fallback (probate scrapers set Owner Deceased=yes at upload)
+        DataSift list titles have evolved ("Probate Properties" vs "Probate",
+        addition of "Estate and Heirs" list). Instead of hardcoded titles,
+        we look for probate/obituary/deceased keywords in ANY of the record's
+        list titles. Case-insensitive, whitespace-tolerant.
 
-        Either signal counts as membership. Owner-deceased flag is set on the
-        record at upload time (no routing lag), so it catches probate/pre-probate/
-        obituary records that were just uploaded but haven't been added to the
-        list yet by DataSift's background routing job.
-
-        Note: notice_type field doesn't exist on DataSift's record response
-        (diagnostic 2026-08-22) — that's why we use owner.deceased instead.
+        owner.deceased fallback removed — diagnostic proved DataSift doesn't
+        set that field from the CSV upload, so it was always False.
         """
-        # Signal 1: list title (may lag 5-15+ min after upload)
         for lst in (full_rec.get("lists") or []):
             title = lst if isinstance(lst, str) else (
                 (lst.get("title") or lst.get("name") or "") if isinstance(lst, dict) else ""
             )
-            if title and title.strip().lower() in _NORMALIZED_UNIVERSE:
-                return True
-        # Signal 2: owner.deceased boolean (set at upload — no lag)
-        owner = full_rec.get("owner") or {}
-        if isinstance(owner, dict) and owner.get("deceased"):
-            return True
+            title_lc = (title or "").strip().lower()
+            if not title_lc:
+                continue
+            for kw in _PROBATE_LIST_KEYWORDS:
+                if kw in title_lc:
+                    return True
         return False
 
     HARD_CAP = 9500

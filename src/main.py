@@ -2134,16 +2134,29 @@ def _run_scrape_pipeline(args, searches) -> None:
 
     # ── Slack/Discord notification (Phase 2: blocks-aware) ────────
     # Posts the legacy summary + funnel block + service-rates block in
-    # a single Block Kit message per D-02. send_slack_notification is
-    # NOT called from this path; the legacy text helper stays
-    # byte-identical for callers that still use it directly (W5).
+    # a single Block Kit message per D-02.
+    #
+    # Gated by SUPPRESS_APN_PRELIMINARY_SLACK env var — GHA sets this to
+    # suppress the duplicative preliminary post (daily_finalize's
+    # consolidated summary covers everything ~90 min later). Local one-off
+    # runs (without the env var) still post the preliminary for testing.
     if getattr(args, "notify_slack", False):
-        _post_daily_slack_with_funnel(
-            notices,
-            funnel,
-            rate_tracker,
-            upload_result=upload_result,
-        )
+        import os as _os
+        _suppress_prelim = _os.environ.get(
+            "SUPPRESS_APN_PRELIMINARY_SLACK", ""
+        ).strip().lower() in ("1", "true", "yes")
+        if not _suppress_prelim:
+            _post_daily_slack_with_funnel(
+                notices,
+                funnel,
+                rate_tracker,
+                upload_result=upload_result,
+            )
+        else:
+            logger.info(
+                "APN preliminary Slack post SUPPRESSED via "
+                "SUPPRESS_APN_PRELIMINARY_SLACK env var"
+            )
 
     # D-04 — terminal mirrors Slack: always log the funnel at end-of-run
     # regardless of whether --notify-slack is set.
