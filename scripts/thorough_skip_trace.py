@@ -243,18 +243,24 @@ def _fetch_records(
       1. Fetch pages of records (up to page_limit * safety_buffer)
       2. If tag_filter is set: keep ONLY records carrying that tag
          (e.g. --tag queue_cascade selects operator-queued records)
-      3. Otherwise: keep records LACKING `traced_tracerfy` (never cascaded)
-         — this replaces the old `created`-timestamp filter which was
-         silently no-op'ing because DataSift's /property/ response doesn't
-         include a `created` field
+      3. Otherwise: keep records LACKING all 3 vendor tags (partial or
+         never-cascaded). This catches records that got only traced_tracerfy
+         from the buggy pre-2026-08-22 tag-write pattern and backfills the
+         missing datasift/enformion tags on subsequent runs. Fully-tagged
+         records (all 3 present) are skipped.
       4. If list_name is set: further filter to records in that list
       5. Return first max_records survivors
 
-    `since_dt` retained for interface compatibility but unused — the
-    tag-absence filter naturally excludes previously-processed records
-    without needing a time cutoff.
+    `since_dt` retained for interface compatibility but unused.
+
+    Note: DataSift returns tags in the /property/ list response as TITLES
+    (strings), not UUIDs (diagnostic 2026-08-21). Check by title string
+    match, case-insensitive.
     """
-    from vendor_tags import RECORD_TAG_TRACED_TRACERFY, RECORD_TAG_QUEUE_CASCADE
+    from vendor_tags import (
+        RECORD_TAG_TRACED_TRACERFY, RECORD_TAG_TRACED_DATASIFT,
+        RECORD_TAG_TRACED_ENFORMION, RECORD_TAG_QUEUE_CASCADE,
+    )
 
     list_filter_uuid: str | None = None
     if list_name:
@@ -263,18 +269,25 @@ def _fetch_records(
             logger.warning("List %r not found in DataSift — nothing to process", list_name)
             return []
 
-    # Resolve tag UUIDs once (cached in datasift_api)
-    tracerfy_tag_uuid = ds.tag_uuid(RECORD_TAG_TRACED_TRACERFY, create_if_missing=False)
-    queue_tag_uuid = ds.tag_uuid(RECORD_TAG_QUEUE_CASCADE, create_if_missing=False) if tag_filter == RECORD_TAG_QUEUE_CASCADE else None
+    # Tag TITLES (DataSift returns titles in list response, not UUIDs)
+    _CASCADE_COMPLETE_TAGS_LC = frozenset({
+        RECORD_TAG_TRACED_TRACERFY.lower(),
+        RECORD_TAG_TRACED_DATASIFT.lower(),
+        RECORD_TAG_TRACED_ENFORMION.lower(),
+    })
+    _QUEUE_CASCADE_LC = RECORD_TAG_QUEUE_CASCADE.lower()
 
-    def _record_has_tag(rec: dict, uid: str | None) -> bool:
-        if not uid:
-            return False
+    def _record_tag_titles_lc(rec: dict) -> set[str]:
+        """Extract tag titles (lowercased) from a record's tag list."""
+        titles: set[str] = set()
         for t in (rec.get("tags") or []):
-            tuid = t.get("uuid") if isinstance(t, dict) else t
-            if tuid == uid:
-                return True
-        return False
+            if isinstance(t, str):
+                titles.add(t.strip().lower())
+            elif isinstance(t, dict):
+                title = t.get("title") or t.get("name") or ""
+                if title:
+                    titles.add(title.strip().lower())
+        return titles
 
     results: list[dict] = []
     limit = 100
@@ -290,14 +303,18 @@ def _fetch_records(
             break
 
         for row in page:
-            # Apply tag filter — either "must have queue_cascade" or
-            # "must lack traced_tracerfy" (default: never-cascaded)
+            row_tags_lc = _record_tag_titles_lc(row)
             if tag_filter == RECORD_TAG_QUEUE_CASCADE:
-                if not _record_has_tag(row, queue_tag_uuid):
+                # Operator-driven queue mode
+                if _QUEUE_CASCADE_LC not in row_tags_lc:
                     continue
             else:
-                if _record_has_tag(row, tracerfy_tag_uuid):
-                    continue  # skip already-cascaded records
+                # Default: skip only if ALL 3 vendor tags are present.
+                # Records with partial tagging (e.g. only traced_tracerfy from
+                # the pre-fix buggy period) get re-processed so cascade
+                # backfills the missing datasift/enformion tags.
+                if _CASCADE_COMPLETE_TAGS_LC.issubset(row_tags_lc):
+                    continue
             results.append(row)
             if len(results) >= max_records:
                 break
