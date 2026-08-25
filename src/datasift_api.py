@@ -398,6 +398,21 @@ def get_property(uuid: str) -> dict:
     return _get(f"/property/{uuid}/")
 
 
+def update_owner_name(owner_uuid: str, *, first_name: str, last_name: str) -> dict:
+    """PATCH /owner/{uuid}/ — update owner's first + last name.
+
+    Used by recover_missing_owners.py to backfill owner names recovered
+    via Enformion AddressID. Both first + last are required (empty strings
+    would overwrite existing values — caller must ensure both are set).
+    """
+    if not (first_name and last_name):
+        raise ValueError("Both first_name and last_name are required")
+    return _patch(f"/owner/{owner_uuid}/", {
+        "first_name": first_name.strip(),
+        "last_name": last_name.strip(),
+    })
+
+
 def delete_property(uuid: str) -> None:
     """DELETE /property/{uuid}/ — permanent. Use for test-cleanup only."""
     _delete(f"/property/{uuid}/")

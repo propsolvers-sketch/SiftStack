@@ -1502,6 +1502,36 @@ async def main() -> int:
     except Exception as e:
         print(f"Path A UUID capture skipped: {e}", flush=True)
 
+    # ── Enformion AddressID owner recovery for Bucket D records ──
+    # Some probate universe records land in DataSift without owner names
+    # (obituary lists survivors only, no decedent full name; or older
+    # records lacking owner data). These CAN'T go through SmartSkip
+    # (which requires First+Last Name). Enformion AddressID reverse-
+    # lookup on the mailing/property address recovers the likely owner
+    # name so SmartSkip can process them same-day.
+    # Cost: ~$0.10/lookup. Only runs on records with genuinely missing owner.
+    # Runs AFTER Path A capture (so recovery happens on the exact same
+    # UUIDs SmartSkip will process) and BEFORE SmartSkip step.
+    try:
+        import recover_missing_owners
+        if recover_missing_owners.CAPTURED_JSON.exists():
+            uuids_payload = json.loads(recover_missing_owners.CAPTURED_JSON.read_text())
+            uuids = uuids_payload.get("uuids") or []
+            if uuids:
+                print(f"\n🩹 Checking {len(uuids)} captured records for missing "
+                      f"owner info (Enformion AddressID recovery)...", flush=True)
+                recovered_count = 0
+                for u in uuids:
+                    s = recover_missing_owners.recover_one(u)
+                    if s["action"] == "recovered":
+                        recovered_count += 1
+                if recovered_count:
+                    print(f"🩹 Owner recovery: {recovered_count} record(s) "
+                          f"backfilled via Enformion AddressID "
+                          f"(${recovered_count * 0.10:.2f})", flush=True)
+    except Exception as e:
+        print(f"Owner recovery pass skipped: {e}", flush=True)
+
     # ── --upload-only mode: save state, skip Slack post (Slack fires later
     # in workflow via --slack-only step, after cascade + SmartSkip complete). ──
     if args.upload_only:
