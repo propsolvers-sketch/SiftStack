@@ -2071,14 +2071,26 @@ def _run_scrape_pipeline(args, searches) -> None:
 
     if not notices:
         logging.warning("No notices found")
-        # Send Slack ping even on empty runs so operators know the job
-        # ran successfully (vs silently dying).
+        # Send Slack keep-alive ping — gated by SUPPRESS_APN_PRELIMINARY_SLACK
+        # env var so GHA (where daily_finalize's consolidated post covers the
+        # "main.py had no output" line) can suppress the duplicative early
+        # post. Local one-off runs still get the ping for testing visibility.
         if getattr(args, "notify_slack", False):
-            try:
-                from slack_notifier import send_slack_notification
-                send_slack_notification([])
-            except Exception:
-                logging.exception("Slack notification for empty run failed")
+            import os as _os
+            _suppress_prelim = _os.environ.get(
+                "SUPPRESS_APN_PRELIMINARY_SLACK", ""
+            ).strip().lower() in ("1", "true", "yes")
+            if not _suppress_prelim:
+                try:
+                    from slack_notifier import send_slack_notification
+                    send_slack_notification([])
+                except Exception:
+                    logging.exception("Slack notification for empty run failed")
+            else:
+                logging.info(
+                    "Empty-run APN Slack ping SUPPRESSED via "
+                    "SUPPRESS_APN_PRELIMINARY_SLACK env var"
+                )
         sys.exit(0)
 
     # ── Master CSV (CLI-only: split-by-type or unified) ───────────
