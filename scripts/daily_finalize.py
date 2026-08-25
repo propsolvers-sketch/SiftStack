@@ -1462,6 +1462,46 @@ async def main() -> int:
     except Exception as e:
         print(f"Subtype tag pass skipped: {e}", flush=True)
 
+    # ── Path A: capture DataSift UUIDs of today's probate-universe records ──
+    # Reads each probate/pre_probate/obituary CSV, searches DataSift by address,
+    # persists UUIDs to output/observability/today_probate_uuids.json. SmartSkip
+    # step then reads that file via --property-uuids-file, bypassing the query
+    # entirely. Solves the list-add scenario where fresh records have stale
+    # `created` timestamps and get missed by -created ordering.
+    try:
+        import capture_today_probate_uuids
+        total_uuids = 0
+        all_records = []
+        probate_csvs = [
+            p for p in csvs if capture_today_probate_uuids._is_probate_universe_csv(p)
+        ]
+        for csv_path in probate_csvs:
+            recs = capture_today_probate_uuids.capture_uuids_from_csv(csv_path)
+            all_records.extend(recs)
+        # Dedup
+        seen = set()
+        unique = []
+        for r in all_records:
+            if r["uuid"] not in seen:
+                seen.add(r["uuid"])
+                unique.append(r)
+        # Write JSON (empty is fine — SmartSkip step handles no-op gracefully)
+        capture_today_probate_uuids.OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        capture_today_probate_uuids.OUTPUT_PATH.write_text(json.dumps({
+            "captured_at": date.today().isoformat(),
+            "count": len(unique),
+            "uuids": [r["uuid"] for r in unique],
+            "records": unique,
+        }, indent=2))
+        if unique:
+            print(f"🎯 Path A: captured {len(unique)} probate-universe UUIDs "
+                  f"for SmartSkip step (bypasses query)", flush=True)
+        else:
+            print(f"Path A: no probate-universe uploads today "
+                  f"(from {len(probate_csvs)} CSVs)", flush=True)
+    except Exception as e:
+        print(f"Path A UUID capture skipped: {e}", flush=True)
+
     # ── --upload-only mode: save state, skip Slack post (Slack fires later
     # in workflow via --slack-only step, after cascade + SmartSkip complete). ──
     if args.upload_only:

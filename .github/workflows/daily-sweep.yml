@@ -604,15 +604,23 @@ jobs:
             echo "  Skipping SmartSkip step. Add secrets to enable."
             exit 0
           fi
-          # --notify-slack removed 2026-08-25 per operator UX: SmartSkip
-          # results now appear ONLY in the consolidated Enrichment Contribution
-          # section of the daily-sweep post at the end of the workflow.
-          # No more intermediate SmartSkip Slack post at ~4:40 AM.
+          # Path A (2026-08-25): pass --property-uuids-file so SmartSkip processes
+          # the EXACT UUIDs daily_finalize captured from today's uploads. Bypasses
+          # DataSift's flaky query entirely — no more "records missed because their
+          # created timestamp is old" issue.
+          #
+          # --notify-slack removed: SmartSkip results now appear ONLY in the
+          # consolidated Enrichment Contribution section of the daily-sweep post
+          # (via --slack-only step at end of workflow).
+          #
+          # --target-zips-only + --rehash-only + --max-cost-usd 10 still apply
+          # as safety nets on top of the file-based UUID pipe.
           python scripts/probate_cascade.py \
             --rehash-only \
             --target-zips-only \
             --max-cost-usd 10 \
             --and-standard-cascade \
+            --property-uuids-file output/observability/today_probate_uuids.json \
             2>&1 | tee logs/probate_cascade_${{ steps.run_start.outputs.ts }}.log
 
       # ── DataSift export enrichment (inbox → outbox) ─────────────────────

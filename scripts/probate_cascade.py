@@ -778,37 +778,73 @@ def run_probate_cascade(
     headless: bool = True,
     target_zips_only: bool = False,
     backlog_catchup: bool = False,
+    property_uuids: list[str] | None = None,
 ) -> ProbateCascadeSummary:
-    """Full SmartSkip pass over the probate universe."""
+    """Full SmartSkip pass over the probate universe.
+
+    property_uuids: Path A mode — if provided, fetch these UUIDs directly
+    (via get_property) and skip the query entirely. Solves the list-add
+    scenario where fresh records have stale `created` timestamps and get
+    buried in -created ordering.
+    """
     started = time.time()
     summary = ProbateCascadeSummary(dry_run=dry_run)
 
     # Ensure vendor + state tags exist before we start applying them
     vt.ensure_all_tags_exist()
 
-    # ── 1. Query probate universe records
-    logger.info("Querying probate universe records...")
-    target_zip_set = None
-    if target_zips_only:
-        from target_zips import ALL_TARGET
-        target_zip_set = ALL_TARGET
-        logger.info("Target-ZIP-only mode: constraining to %d Tier 1+2 ZIPs",
-                    len(target_zip_set))
-    # Widen candidate scan — default 300 (up from 100 on 2026-08-25 because
-    # today's fresh pre-probate records are LIST-ADDS on existing DataSift
-    # properties, so their `created` timestamp is old and they sit deep in
-    # the -created ordering. 300 gives us better coverage while keeping
-    # runtime reasonable (~3-4 min of get_property calls).
-    candidate_cap = 500 if backlog_catchup else 300
-    if backlog_catchup:
-        logger.info("Backlog-catchup mode: scanning up to %d candidates for "
-                    "full-detail check (vs default 300)", candidate_cap)
-    records = router.query_probate_universe_records(
-        require_traced_smartskip_missing=rehash_only,
-        target_zips=target_zip_set,
-        limit=500,
-        max_candidates=candidate_cap,
-    )
+    # ── 1. Get records ──
+    if property_uuids:
+        # Path A: fetch each UUID directly (no query, no ordering dependency)
+        logger.info("Path A: fetching %d records by UUID (skipping query)",
+                    len(property_uuids))
+        records: list[dict] = []
+        smartskip_tag_lc = vt.RECORD_TAG_TRACED_SMARTSKIP.lower()
+        for uuid in property_uuids:
+            try:
+                full = ds.get_property(uuid)
+            except Exception as e:
+                logger.debug("get_property(%s) failed: %s", uuid[:8], e)
+                continue
+            # In rehash-only mode, drop records already SmartSkip'd
+            if rehash_only:
+                tag_titles = set()
+                for t in (full.get("tags") or []):
+                    if isinstance(t, str):
+                        tag_titles.add(t.strip().lower())
+                    elif isinstance(t, dict):
+                        title = t.get("title") or t.get("name") or ""
+                        if title:
+                            tag_titles.add(title.strip().lower())
+                if smartskip_tag_lc in tag_titles:
+                    logger.debug("Skipping %s — already SmartSkip'd", uuid[:8])
+                    continue
+            records.append(full)
+        logger.info("Path A: %d/%d records fetched + eligible after filter",
+                    len(records), len(property_uuids))
+    else:
+        logger.info("Querying probate universe records...")
+        target_zip_set = None
+        if target_zips_only:
+            from target_zips import ALL_TARGET
+            target_zip_set = ALL_TARGET
+            logger.info("Target-ZIP-only mode: constraining to %d Tier 1+2 ZIPs",
+                        len(target_zip_set))
+        # Widen candidate scan — default 300 (up from 100 on 2026-08-25 because
+        # today's fresh pre-probate records are LIST-ADDS on existing DataSift
+        # properties, so their `created` timestamp is old and they sit deep in
+        # the -created ordering. 300 gives us better coverage while keeping
+        # runtime reasonable (~3-4 min of get_property calls).
+        candidate_cap = 500 if backlog_catchup else 300
+        if backlog_catchup:
+            logger.info("Backlog-catchup mode: scanning up to %d candidates for "
+                        "full-detail check (vs default 300)", candidate_cap)
+        records = router.query_probate_universe_records(
+            require_traced_smartskip_missing=rehash_only,
+            target_zips=target_zip_set,
+            limit=500,
+            max_candidates=candidate_cap,
+        )
     if max_records:
         records = records[:max_records]
     logger.info("Fetched %d records", len(records))
@@ -940,6 +976,13 @@ def _main(argv: list[str] | None = None) -> int:
                         "vs default 100). Pair with higher --max-cost-usd. "
                         "Example: --backlog-catchup --max-cost-usd 30 to "
                         "process ~200 records in one shot.")
+    p.add_argument("--property-uuids-file", metavar="PATH", type=Path,
+                   help="Path A (2026-08-25): read record UUIDs directly from a "
+                        "JSON file (written by capture_today_probate_uuids.py) "
+                        "and process THOSE records only. Bypasses the query "
+                        "entirely — solves the list-add scenario where fresh "
+                        "records have old `created` timestamps and get buried "
+                        "in -created ordering. GHA workflow uses this daily.")
     p.add_argument("--dry-run", action="store_true",
                    help="Log what would be submitted, don't upload")
     p.add_argument("--headed", action="store_true",
@@ -995,6 +1038,29 @@ def _main(argv: list[str] | None = None) -> int:
                 effective_max = cost_cap_max
                 logger.info("Cost cap $%.2f → max %d records this run",
                             args.max_cost_usd, effective_max)
+
+        # Path A: load UUIDs from file (bypasses query entirely)
+        uuids_from_file: list[str] | None = None
+        if args.property_uuids_file:
+            f = args.property_uuids_file
+            if not f.exists():
+                logger.warning(
+                    "--property-uuids-file %s does not exist. Falling back to "
+                    "query-based mode.", f,
+                )
+            else:
+                try:
+                    payload = json.loads(f.read_text())
+                    uuids_from_file = payload.get("uuids") or []
+                    logger.info(
+                        "Path A: loaded %d UUIDs from %s — bypassing query, "
+                        "processing THOSE records directly.",
+                        len(uuids_from_file), f.name,
+                    )
+                except Exception as e:
+                    logger.error("Failed to load %s: %s. Falling back to query.",
+                                 f, e)
+
         summary = run_probate_cascade(
             rehash_only=args.rehash_only,
             max_records=effective_max,
@@ -1002,6 +1068,7 @@ def _main(argv: list[str] | None = None) -> int:
             headless=not args.headed,
             target_zips_only=args.target_zips_only,
             backlog_catchup=args.backlog_catchup,
+            property_uuids=uuids_from_file,
         )
 
     print()
