@@ -794,11 +794,15 @@ def run_probate_cascade(
         target_zip_set = ALL_TARGET
         logger.info("Target-ZIP-only mode: constraining to %d Tier 1+2 ZIPs",
                     len(target_zip_set))
-    # Widen candidate scan for backlog burn — 500 = ~2-3 min of extra get_property calls
-    candidate_cap = 500 if backlog_catchup else 100
+    # Widen candidate scan — default 300 (up from 100 on 2026-08-25 because
+    # today's fresh pre-probate records are LIST-ADDS on existing DataSift
+    # properties, so their `created` timestamp is old and they sit deep in
+    # the -created ordering. 300 gives us better coverage while keeping
+    # runtime reasonable (~3-4 min of get_property calls).
+    candidate_cap = 500 if backlog_catchup else 300
     if backlog_catchup:
         logger.info("Backlog-catchup mode: scanning up to %d candidates for "
-                    "full-detail check (vs default 100)", candidate_cap)
+                    "full-detail check (vs default 300)", candidate_cap)
     records = router.query_probate_universe_records(
         require_traced_smartskip_missing=rehash_only,
         target_zips=target_zip_set,

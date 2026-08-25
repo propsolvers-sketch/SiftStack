@@ -604,12 +604,15 @@ jobs:
             echo "  Skipping SmartSkip step. Add secrets to enable."
             exit 0
           fi
+          # --notify-slack removed 2026-08-25 per operator UX: SmartSkip
+          # results now appear ONLY in the consolidated Enrichment Contribution
+          # section of the daily-sweep post at the end of the workflow.
+          # No more intermediate SmartSkip Slack post at ~4:40 AM.
           python scripts/probate_cascade.py \
             --rehash-only \
             --target-zips-only \
             --max-cost-usd 10 \
             --and-standard-cascade \
-            --notify-slack \
             2>&1 | tee logs/probate_cascade_${{ steps.run_start.outputs.ts }}.log
 
       # ── DataSift export enrichment (inbox → outbox) ─────────────────────
