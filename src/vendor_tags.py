@@ -66,6 +66,17 @@ RECORD_TAG_NEEDS_4TH_TRACE = "needs_4th_trace"
 # succeeds on the record. Filter preset "Pending Cascade" = tag:queue_cascade.
 RECORD_TAG_QUEUE_CASCADE = "queue_cascade"
 
+# Tax-distress lifecycle tags (applied by tax_distress_pipeline + detect_tax_caught_up).
+# tax_delinquent   — set when property is on the current county delinquent roll
+# tax_caught_up    — set when property was previously delinquent but has now
+#                    paid off (parcel disappeared from the current roll).
+#                    Auto-removes tax_delinquent to stop tax-distress marketing.
+# Operator filter presets:
+#   "Currently Tax Delinquent" = tag:tax_delinquent AND NOT tag:tax_caught_up
+#   "Tax Caught Up (stop tax mail)" = tag:tax_caught_up
+RECORD_TAG_TAX_DELINQUENT = "tax_delinquent"
+RECORD_TAG_TAX_CAUGHT_UP = "tax_caught_up"
+
 
 # Group aliases for iteration
 ALL_TRACED_RECORD_TAGS = (
@@ -113,13 +124,15 @@ def src_phone_tag_uuid(vendor: str) -> str:
 
 
 def state_tag_uuid(name: str) -> str:
-    """Return UUID of a SmartSkip lifecycle / rehash-state tag."""
+    """Return UUID of a SmartSkip lifecycle / rehash-state / tax-distress tag."""
     valid = {
         RECORD_TAG_SMARTSKIP_NO_MATCH,
         RECORD_TAG_SMARTSKIP_DEFERRED,
         RECORD_TAG_SMARTSKIP_SUBMITTED,
         RECORD_TAG_NEEDS_4TH_TRACE,
         RECORD_TAG_QUEUE_CASCADE,
+        RECORD_TAG_TAX_DELINQUENT,
+        RECORD_TAG_TAX_CAUGHT_UP,
     }
     if name not in valid:
         raise ValueError(f"Unknown state tag {name!r} — expected one of {valid}")
@@ -144,6 +157,8 @@ def ensure_all_tags_exist() -> dict[str, str]:
         RECORD_TAG_SMARTSKIP_SUBMITTED,
         RECORD_TAG_NEEDS_4TH_TRACE,
         RECORD_TAG_QUEUE_CASCADE,
+        RECORD_TAG_TAX_DELINQUENT,
+        RECORD_TAG_TAX_CAUGHT_UP,
     ):
         resolved[state] = state_tag_uuid(state)
     return resolved

@@ -52,6 +52,14 @@ PROMOTABLE_SUBTYPES = frozenset({
     "probate_final_settlement",
 })
 
+# Notice Types that map to record tags. Handles the tax-distress lifecycle
+# (paired with detect_tax_caught_up.py which flips tax_delinquent → tax_caught_up
+# when a parcel drops off the current delinquent roll).
+PROMOTABLE_NOTICE_TYPES = {
+    "tax_delinquent": "tax_delinquent",
+    "tax_sale":       "tax_delinquent",   # tax sale = still delinquent, same lifecycle
+}
+
 
 def _find_property_uuid(street: str, zip5: str) -> str | None:
     """Address-based DataSift search — matches on street + zip5."""
@@ -90,7 +98,14 @@ def apply_subtypes_from_csv(csv_path: Path, *, dry_run: bool = False) -> dict:
         for row in reader:
             stats["rows_total"] += 1
             subtype = (row.get("Probate Subtype") or "").strip().lower()
-            if subtype not in PROMOTABLE_SUBTYPES:
+            notice_type = (row.get("Notice Type") or "").strip().lower()
+            # Determine which tag to apply — subtype takes precedence, then notice_type
+            tag_to_apply = None
+            if subtype in PROMOTABLE_SUBTYPES:
+                tag_to_apply = subtype
+            elif notice_type in PROMOTABLE_NOTICE_TYPES:
+                tag_to_apply = PROMOTABLE_NOTICE_TYPES[notice_type]
+            if not tag_to_apply:
                 continue
             stats["rows_with_subtype"] += 1
 
@@ -109,21 +124,21 @@ def apply_subtypes_from_csv(csv_path: Path, *, dry_run: bool = False) -> dict:
             if dry_run:
                 logger.info(
                     "  [DRY] would tag %s (%s) with '%s'",
-                    uuid[:8], street[:40], subtype,
+                    uuid[:8], street[:40], tag_to_apply,
                 )
                 continue
 
             # Ensure tag exists in DataSift (idempotent) + POST title directly
             # (bypasses UUID→title reverse lookup — same fix as mark_vendor_traced).
             try:
-                ds.tag_uuid(subtype, create_if_missing=True)
+                ds.tag_uuid(tag_to_apply, create_if_missing=True)
                 ds._post(
                     f"/property/{uuid}/add-tags/",
-                    {"tags": [subtype]},
+                    {"tags": [tag_to_apply]},
                 )
                 stats["rows_tagged"] += 1
                 logger.info("  ✅ tagged %s (%s) with '%s'",
-                            uuid[:8], street[:40], subtype)
+                            uuid[:8], street[:40], tag_to_apply)
             except Exception as e:
                 stats["rows_failed"] += 1
                 logger.warning("  ❌ tag apply failed for %s: %s", uuid[:8], e)

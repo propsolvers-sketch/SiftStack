@@ -430,6 +430,52 @@ jobs:
             --days-back 14 \
             2>&1 | tee logs/daily_obit_refresh_${{ steps.run_start.outputs.ts }}.log
 
+      # ── Sunday tax-distress scrape (weekly) ─────────────────────────
+      # Public tax-delinquent rolls change slowly (weekly is plenty). Scrapes
+      # Jefferson + Madison delinquent parcels (Marshall is a stub until the
+      # county re-enables their listing). Filters:
+      #   --individuals-only  drops LLC/Corp/Inc owners (SmartSkip target)
+      #   --min-balance 5000  drops <$5k owed (noise floor)
+      #   --tiers 1,2         Tier 1+2 ZIPs only
+      # Output CSV lands in output/leads/datasift_upload_tax_distress_*.csv,
+      # daily_finalize globs it + uploads to DataSift (notice_type=tax_delinquent
+      # or tax_sale). Records get tagged `tax_delinquent` at upload for the
+      # tax_caught_up detector step (next).
+      - name: Sunday tax-distress scrape (weekly)
+        continue-on-error: true
+        run: |
+          if [ "$(date +%u)" != "7" ]; then
+            echo "Not Sunday ($(date +%A)) - skipping tax-distress scrape"
+            exit 0
+          fi
+          echo "Sunday - running tax-distress scrape for Jefferson + Madison + Marshall"
+          python src/tax_distress_pipeline.py \
+            --counties Madison,Jefferson,Marshall \
+            --individuals-only \
+            --min-balance 5000 \
+            --tiers 1,2 \
+            --output-datasift-csv output/leads/datasift_upload_tax_distress_$(date +%Y-%m-%d_%H%M%S).csv \
+            2>&1 | tee logs/tax_distress_${{ steps.run_start.outputs.ts }}.log
+
+      # ── Sunday tax-caught-up detector (weekly, after scrape) ────────
+      # Cross-references this week's scraped parcels vs DataSift records
+      # currently tagged `tax_delinquent`. Records whose parcel_id dropped
+      # off the current list = paid off → apply `tax_caught_up` + remove
+      # `tax_delinquent` so tax-distress marketing stops.
+      # Operator filters:
+      #   "Currently Tax Delinquent" = tag:tax_delinquent AND NOT tag:tax_caught_up
+      #   "Tax Caught Up" = tag:tax_caught_up
+      - name: Sunday tax caught-up detector (weekly)
+        continue-on-error: true
+        run: |
+          if [ "$(date +%u)" != "7" ]; then
+            echo "Not Sunday ($(date +%A)) - skipping tax caught-up detector"
+            exit 0
+          fi
+          echo "Sunday - detecting records that caught up on delinquent taxes"
+          python scripts/detect_tax_caught_up.py -v \
+            2>&1 | tee logs/tax_caught_up_${{ steps.run_start.outputs.ts }}.log
+
       # ── DataSift session cookies (fixes Loom-modal failure mode) ──
       # Fresh GHA browsers have no DataSift session cookies → DataSift treats
       # the runner as a first-time user → onboarding modal with a Loom-video
