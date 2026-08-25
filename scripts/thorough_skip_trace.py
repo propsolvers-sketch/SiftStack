@@ -510,25 +510,40 @@ def _process_record(
         except Exception as e:
             logger.debug("tracerfy tag application failed for %s: %s", puuid[:8], e)
 
-    # ── Step 1: Trigger DataSift native skip-trace ──
-    # (Enformion runs later in this same function if not quota-blocked.)
+    # ── Step 1: Trigger DataSift native skip-trace (best-effort) ──
+    # DataSift rejects duplicate skip-trace requests with 400 for records
+    # already skip-traced recently. That's fine — we still want to run
+    # Enformion + Trestle + apply tags. So make DataSift native BEST-EFFORT:
+    # log warnings on failure but CONTINUE the cascade.
+    #
+    # 2026-08-24: prior hard-fail behavior caused 99/100 records to skip
+    # all downstream steps when DataSift returned 400 on re-attempts,
+    # leaving records permanently missing traced_datasift + traced_enformion
+    # tags — my e3b4e17 fetch filter then re-queued them every run,
+    # infinite loop.
+    datasift_skip_trace_ok = True
     try:
         ds.skip_trace(puuid)
     except Exception as e:
-        result.action = "error"
-        result.error = f"skip_trace trigger: {e}"
-        return result
+        # 400 = already skip-traced (expected on backfill runs). Warn + continue.
+        # Other errors (500, network) also non-fatal — just skip the wait step.
+        logger.warning(
+            "  DataSift native skip_trace failed for %s: %s "
+            "(continuing with cascade — Enformion + Trestle + tags still run)",
+            puuid[:8], e,
+        )
+        datasift_skip_trace_ok = False
 
-    # ── Step 2: Wait for completion ──
-    # NB: called ONCE per record in this loop. For a large batch it'd be
-    # more efficient to call skip_trace for all N uuids up-front and then
-    # poll one activity; that's a future optimization. Today: correctness > speed.
-    _wait_for_activity_completion(None, expected_min_records=1, timeout_s=180)
+    # ── Step 2: Wait for completion (only if skip_trace was accepted) ──
+    if datasift_skip_trace_ok:
+        _wait_for_activity_completion(None, expected_min_records=1, timeout_s=180)
 
     # ── Step 3: Re-fetch record, identify new phones ──
     try:
         refreshed = ds.get_property(puuid)
     except Exception as e:
+        # Re-fetch failure IS fatal — we need the current record state to
+        # compute new phones + apply tags correctly.
         result.action = "error"
         result.error = f"re-fetch: {e}"
         return result
