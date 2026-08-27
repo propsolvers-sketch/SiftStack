@@ -46,21 +46,20 @@ PROBATE_NOTICE_TYPES = frozenset({
 
 
 def _find_property_uuid(street: str, zip5: str) -> str | None:
-    """Search DataSift by street address, match on street + zip5."""
+    """Look up DataSift property UUID by street + zip5.
+
+    Uses ds.find_property_uuid_by_address which builds a paginated index
+    on first call (DataSift's ?search= filter is confirmed broken as of
+    2026-08-26 diagnostic — silently ignored, always returns same 5 records).
+    Subsequent calls are O(1) dict lookups.
+    """
     if not (street and zip5):
         return None
-    zip5 = zip5.strip()[:5]
     try:
-        resp = ds._get("/property/", {"search": street, "limit": 25})
-        for cand in (resp.get("data") or []):
-            addr = cand.get("address") or {}
-            cand_street = (addr.get("street") or "").strip().lower()
-            cand_zip = (addr.get("zip5") or addr.get("postal_code") or "").strip()[:5]
-            if cand_street == street.strip().lower() and cand_zip == zip5:
-                return cand.get("uuid")
+        return ds.find_property_uuid_by_address(street, zip5.strip()[:5])
     except Exception as e:
-        logger.debug("Property search failed for %r: %s", street, e)
-    return None
+        logger.debug("Property index lookup failed for %r: %s", street, e)
+        return None
 
 
 def _is_probate_universe_csv(csv_path: Path) -> bool:

@@ -62,21 +62,20 @@ PROMOTABLE_NOTICE_TYPES = {
 
 
 def _find_property_uuid(street: str, zip5: str) -> str | None:
-    """Address-based DataSift search — matches on street + zip5."""
+    """Look up DataSift property UUID by street + zip5.
+
+    2026-08-26: Uses ds.find_property_uuid_by_address (paginated index)
+    instead of ?search= (broken — silently returned same 5 records
+    regardless of query). This script has been silently failing to
+    promote foreclosure_cancelled / probate_sale / etc. tags.
+    """
     if not (street and zip5):
         return None
-    zip5 = zip5.strip()[:5]
     try:
-        resp = ds._get("/property/", {"search": street, "limit": 25})
-        for cand in (resp.get("data") or []):
-            addr = cand.get("address") or {}
-            cand_street = (addr.get("street") or "").strip().lower()
-            cand_zip = (addr.get("zip5") or addr.get("postal_code") or "").strip()[:5]
-            if cand_street == street.strip().lower() and cand_zip == zip5:
-                return cand.get("uuid")
+        return ds.find_property_uuid_by_address(street, zip5.strip()[:5])
     except Exception as e:
-        logger.debug("Property search failed for %r: %s", street, e)
-    return None
+        logger.debug("Property index lookup failed for %r: %s", street, e)
+        return None
 
 
 def apply_subtypes_from_csv(csv_path: Path, *, dry_run: bool = False) -> dict:

@@ -398,6 +398,85 @@ def get_property(uuid: str) -> dict:
     return _get(f"/property/{uuid}/")
 
 
+# ── Address→UUID lookup index (works around broken /property/ filters) ──
+#
+# DataSift's /property/ endpoint IGNORES every filter param we've tested
+# (?search, ?q, ?query, ?filter, ?zip5, ?zip, ?address, ?street, etc.).
+# Only ?ordering= and ?limit= have effect.
+#
+# Workaround: paginate ALL records once per run, build in-memory
+# {"street_lower|zip5": uuid} dict, look up by address client-side.
+#
+# Slow first call (~5-15 min for 141K records) but subsequent lookups
+# are O(1) dict access. Cache is per-process.
+
+_property_index: dict[str, str] | None = None
+
+
+def _property_index_key(street: str, zip5: str) -> str:
+    """Canonical index key: lowercased-street + | + zip5."""
+    return f"{(street or '').strip().lower()}|{(zip5 or '').strip()[:5]}"
+
+
+def build_property_index(*, page_size: int = 500, hard_cap: int = 20000) -> dict[str, str]:
+    """Paginate /property/ and build {street|zip5: uuid} index.
+
+    hard_cap protects against runaway pagination. DataSift's total record
+    count is ~141K but only ~20K should be in Tier 1+2 ZIPs anyway (our
+    calling scope). Adjust if needed.
+
+    Returns the built index. Also caches it in the module-level
+    _property_index so subsequent calls to find_property_uuid_by_address
+    reuse it for the same process.
+    """
+    global _property_index
+    index: dict[str, str] = {}
+    offset = 0
+    while offset < hard_cap:
+        resp = _get("/property/", {
+            "limit": page_size, "offset": offset, "ordering": "-created",
+        })
+        page = resp.get("data") or resp.get("results") or []
+        if not page:
+            break
+        for rec in page:
+            addr = rec.get("address") or {}
+            street = (addr.get("street") or "").strip()
+            zip5 = (addr.get("zip5") or addr.get("postal_code") or "").strip()[:5]
+            uuid = rec.get("uuid")
+            if street and zip5 and uuid:
+                key = _property_index_key(street, zip5)
+                # Prefer earliest occurrence (older records — more stable UUIDs)
+                if key not in index:
+                    index[key] = uuid
+        if len(page) < page_size:
+            break
+        offset += page_size
+    _property_index = index
+    logger.info("Built property address→UUID index: %d entries from %d records scanned",
+                len(index), offset)
+    return index
+
+
+def find_property_uuid_by_address(street: str, zip5: str, *, rebuild: bool = False) -> str | None:
+    """Look up a property UUID by street + zip5.
+
+    On first call (or if rebuild=True), paginates all DataSift records to
+    build an in-memory index. Subsequent calls are O(1) dict lookups.
+
+    Returns UUID or None if not found in DataSift.
+
+    Replaces the broken pattern:
+        resp = _get("/property/", {"search": street, "limit": 25})
+        for candidate in resp["data"]: if candidate matches → return
+    …which was silently failing because ?search= is ignored.
+    """
+    global _property_index
+    if _property_index is None or rebuild:
+        build_property_index()
+    return (_property_index or {}).get(_property_index_key(street, zip5))
+
+
 def update_owner_name(owner_uuid: str, *, first_name: str, last_name: str) -> dict:
     """PATCH /owner/{uuid}/ — update owner's first + last name.
 
