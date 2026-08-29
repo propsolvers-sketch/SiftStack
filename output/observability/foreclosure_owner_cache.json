@@ -41,6 +41,12 @@
     "owner_name": "Doris, Stephens",
     "source": "apn"
   },
+  "1090 MARTINWOOD LN|BIRMINGHAM|35235": {
+    "first_seen": "2026-08-29",
+    "last_seen": "2026-08-29",
+    "owner_name": "Jimmie, Gilchrist Jr",
+    "source": "apn"
+  },
   "110 SUFFOLK DR|MADISON|35757": {
     "first_seen": "2026-08-27",
     "last_seen": "2026-08-27",
@@ -193,7 +199,7 @@
   },
   "1605 KERRY DR|BESSEMER|35023": {
     "first_seen": "2026-08-22",
-    "last_seen": "2026-08-22",
+    "last_seen": "2026-08-29",
     "owner_name": "MARK, PARKER UNMARRIED",
     "source": "apn"
   },
@@ -231,6 +237,12 @@
     "first_seen": "2026-07-15",
     "last_seen": "2026-08-06",
     "owner_name": "ROBERT, LEE EVERSON JR",
+    "source": "apn"
+  },
+  "2024 8TH ST NW|BIRMINGHAM|35215": {
+    "first_seen": "2026-08-29",
+    "last_seen": "2026-08-29",
+    "owner_name": "MYRTICE, WIGFALL",
     "source": "apn"
   },
   "208 COZY CREEK RD|MERIDIANVILLE|35759": {
@@ -331,7 +343,7 @@
   },
   "299 CEDAR RIDGE DR|UNION GROVE|35175": {
     "first_seen": "2026-08-23",
-    "last_seen": "2026-08-23",
+    "last_seen": "2026-08-29",
     "owner_name": "MaKayla, Lynn Barrett",
     "source": "apn"
   },
@@ -431,6 +443,12 @@
     "owner_name": "DERRICK, FIELDS",
     "source": "apn"
   },
+  "4794 MOUNTAIN GAP DR|BESSEMER|35022": {
+    "first_seen": "2026-08-29",
+    "last_seen": "2026-08-29",
+    "owner_name": "Brazie, Brown",
+    "source": "apn"
+  },
   "481 HERITAGE PL|PINSON|35126": {
     "first_seen": "2026-08-13",
     "last_seen": "2026-08-26",
@@ -447,6 +465,12 @@
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-16",
     "owner_name": "Danny, Eric Holcomb",
+    "source": "apn"
+  },
+  "5000 PARADISE LAKE CIR|HOOVER|35244": {
+    "first_seen": "2026-08-29",
+    "last_seen": "2026-08-29",
+    "owner_name": "Christopher, Demoss Sr.",
     "source": "apn"
   },
   "5075 BUD HOLMES RD|PINSON|35126": {
@@ -481,7 +505,7 @@
   },
   "5439 FAUCETT RD|PINSON|35126": {
     "first_seen": "2026-08-22",
-    "last_seen": "2026-08-22",
+    "last_seen": "2026-08-29",
     "owner_name": "Madison, Wright",
     "source": "apn"
   },
@@ -529,7 +553,7 @@
   },
   "6012 DUG HOLLOW RD|PINSON|35126": {
     "first_seen": "2026-08-22",
-    "last_seen": "2026-08-22",
+    "last_seen": "2026-08-29",
     "owner_name": "Gregory, Burrow",
     "source": "apn"
   },
@@ -607,7 +631,7 @@
   },
   "712 CEDAR CONE CIR|BIRMINGHAM|35214": {
     "first_seen": "2026-08-22",
-    "last_seen": "2026-08-22",
+    "last_seen": "2026-08-29",
     "owner_name": "TYREE, YOUNG",
     "source": "apn"
   },
