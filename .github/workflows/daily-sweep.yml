@@ -6,7 +6,7 @@ name: SiftStack Daily Sweep
 # https://api.github.com/repos/propsolvers-sketch/SiftStack/actions/workflows/daily-sweep.yml/dispatches
 # at 02:30 America/Chicago daily (DST-handled by cron-job.org, so Slack
 # reliably lands at ~3:30 AM local year-round). Uses a fine-grained GitHub
-# PAT (Actions: Read+Write, SiftStack only, expires 2026-08-27).
+# PAT (Actions: Read+Write, SiftStack only, expires 2027-08-28).
 #
 # Why no `schedule:` trigger here: GHA's scheduled cron proved unreliable —
 # delayed 4–11 hr on free tier (2026-05-22 → 27), then silently stopped
