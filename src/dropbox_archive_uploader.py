@@ -24,7 +24,9 @@ import os
 from pathlib import Path
 
 import dropbox
+from dropbox.exceptions import ApiError
 from dropbox.files import WriteMode
+from dropbox.sharing import RequestedVisibility, SharedLinkSettings
 
 import config
 
@@ -52,6 +54,47 @@ def _resolve_archive_root() -> str:
     env var if the operator wants a different folder layout."""
     raw = os.environ.get("DROPBOX_ARCHIVE_FOLDER", "/SiftStack/Archives")
     return raw.rstrip("/") or "/SiftStack/Archives"
+
+
+def ensure_shared_link(
+    dbx: dropbox.Dropbox, dropbox_path: str
+) -> str | None:
+    """Return a public shared-link URL for a Dropbox path.
+
+    Creates a new public link if none exists; returns the existing one
+    otherwise (Dropbox's create-link call errors with
+    ``shared_link_already_exists`` on re-runs, and we then fall through
+    to the list-links call to fetch the current URL).
+
+    Returns None if the link couldn't be created (missing perms, path
+    not found, etc.) — the caller is expected to render the link
+    optionally so a failure here doesn't break the Slack post.
+    """
+    try:
+        result = dbx.sharing_create_shared_link_with_settings(
+            dropbox_path,
+            settings=SharedLinkSettings(
+                requested_visibility=RequestedVisibility.public
+            ),
+        )
+        return result.url
+    except ApiError as e:
+        if "shared_link_already_exists" in str(e):
+            try:
+                links = dbx.sharing_list_shared_links(path=dropbox_path).links
+                if links:
+                    return links[0].url
+            except ApiError as inner:
+                logger.debug(
+                    "list_shared_links failed for %s: %s", dropbox_path, inner
+                )
+        else:
+            logger.debug(
+                "create_shared_link failed for %s: %s", dropbox_path, e
+            )
+    except Exception as e:
+        logger.debug("ensure_shared_link unexpected error on %s: %s", dropbox_path, e)
+    return None
 
 
 def upload_file(local_path: Path, dbx: dropbox.Dropbox | None = None) -> str:
@@ -93,8 +136,14 @@ def upload_files(local_paths: list[Path]) -> list[dict]:
     """Upload multiple files in one authenticated session.
 
     Returns one result dict per input path:
-      ``{"path": Path, "dropbox_path": str | None, "success": bool,
-         "error": str | None}``
+      ``{"path": Path, "dropbox_path": str | None, "shared_link": str | None,
+         "success": bool, "error": str | None}``
+
+    ``shared_link`` is a public Dropbox URL (rlkey=... share link) for
+    each successfully-uploaded file. Rendered in the daily Slack post so
+    the operator can jump straight to any file without opening Dropbox
+    first. None when creation fails — the upload itself still counts as
+    a success.
 
     Failures are caught + reported per file — one bad upload doesn't
     abort the rest. Caller (daily_finalize) decides whether to mark the
@@ -115,6 +164,7 @@ def upload_files(local_paths: list[Path]) -> list[dict]:
             results.append({
                 "path": p,
                 "dropbox_path": None,
+                "shared_link": None,
                 "success": False,
                 "error": str(e),
             })
@@ -123,9 +173,11 @@ def upload_files(local_paths: list[Path]) -> list[dict]:
     for p in local_paths:
         try:
             dest = upload_file(p, dbx=dbx)
+            link = ensure_shared_link(dbx, dest)
             results.append({
                 "path": p,
                 "dropbox_path": dest,
+                "shared_link": link,
                 "success": True,
                 "error": None,
             })
@@ -134,7 +186,23 @@ def upload_files(local_paths: list[Path]) -> list[dict]:
             results.append({
                 "path": p,
                 "dropbox_path": None,
+                "shared_link": None,
                 "success": False,
                 "error": str(e),
             })
     return results
+
+
+def get_archive_folder_link(dbx: dropbox.Dropbox | None = None) -> str | None:
+    """Return the shared-link URL for the Dropbox archive root folder.
+
+    Called after ``upload_files()`` so the Slack post can render one
+    "browse all archives" link alongside the per-file links.
+    """
+    if dbx is None:
+        try:
+            dbx = _get_client()
+        except Exception as e:
+            logger.debug("get_archive_folder_link: no client — %s", e)
+            return None
+    return ensure_shared_link(dbx, _resolve_archive_root())

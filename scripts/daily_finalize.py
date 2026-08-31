@@ -1087,6 +1087,7 @@ def _build_slack_message(
     dropbox_results: list[dict] | None = None,
     csvs: list[Path] | None = None,
     code_violation_f: CodeViolationFunnel | None = None,
+    dropbox_folder_link: str | None = None,
 ) -> str:
     today = datetime.now().strftime("%Y-%m-%d")
     out = str(OUT)
@@ -1211,26 +1212,43 @@ def _build_slack_message(
         # these files, so showing the on-disk path is correct here.
         lines.append(f"_Output dir: {out}_")
 
-    # Dropbox archive sync status (2026-06-12). One line so the operator
-    # knows whether today's archive is already on their Mac via Dropbox.
+    # Dropbox archive sync status (2026-06-12; per-file links added
+    # 2026-08-31 at operator request — one Slack post now has clickable
+    # jump-offs to every CSV, avoiding the need to log into Dropbox to
+    # audit a specific pipeline's output).
     if dropbox_results:
         ok = sum(1 for r in dropbox_results if r["success"])
         total = len(dropbox_results)
         if ok == total:
-            lines.append(
-                f"_:open_file_folder: Dropbox: {ok}/{total} archives synced "
-                f"to SiftStack/Archives/_"
-            )
+            header = f":open_file_folder: *Dropbox archive* — {ok}/{total} files synced"
         elif ok > 0:
-            lines.append(
-                f"_:warning: Dropbox: {ok}/{total} archives synced "
-                f"({total - ok} failed — see logs)_"
+            header = (
+                f":warning: *Dropbox archive* — {ok}/{total} files synced "
+                f"({total - ok} failed — see logs)"
             )
         else:
-            lines.append(
-                f"_:warning: Dropbox sync failed for all {total} files "
-                f"— check DROPBOX_* env vars_"
+            header = (
+                f":warning: *Dropbox archive* — sync failed for all {total} files "
+                f"— check DROPBOX_* env vars"
             )
+        if dropbox_folder_link:
+            header += f" · <{dropbox_folder_link}|Browse all in Dropbox>"
+        lines.append(header)
+
+        # Per-file bulleted links so the operator can jump straight to
+        # any single distressor's CSV. Skip files whose share link
+        # couldn't be created (rare — usually a Dropbox permissions
+        # blip); the count in the header still reflects the sync result.
+        link_lines: list[str] = []
+        for r in dropbox_results:
+            link = r.get("shared_link")
+            if not link:
+                continue
+            p = r.get("path")
+            name = getattr(p, "name", None) or str(p) if p else "(unknown)"
+            link_lines.append(f"  • <{link}|{name}>")
+        if link_lines:
+            lines.extend(link_lines)
 
     return "\n".join(lines)
 
@@ -1310,6 +1328,7 @@ async def main() -> int:
         # Rehydrate results + dropbox from saved state
         results = state.get("upload_results", [])
         dropbox_results = state.get("dropbox_results", [])
+        dropbox_folder_link = state.get("dropbox_folder_link")
         csvs = [Path(p) for p in state.get("csv_paths", [])]
         print(f"Loaded state: {len(results)} upload results, "
               f"{len(dropbox_results)} dropbox results, {len(csvs)} CSVs", flush=True)
@@ -1318,6 +1337,7 @@ async def main() -> int:
             dropbox_results=dropbox_results,
             csvs=csvs,
             code_violation_f=code_funnel,
+            dropbox_folder_link=dropbox_folder_link,
         )
         print("\n--- SLACK ---", flush=True)
         print(msg, flush=True)
@@ -1395,8 +1415,12 @@ async def main() -> int:
     # workflow for daily auditing. Non-fatal if Dropbox is unreachable —
     # the run still succeeds based on DataSift upload outcomes.
     dropbox_results: list[dict] = []
+    dropbox_folder_link: str | None = None
     try:
-        from dropbox_archive_uploader import upload_files as _dbx_upload
+        from dropbox_archive_uploader import (
+            get_archive_folder_link as _dbx_folder_link,
+            upload_files as _dbx_upload,
+        )
         # Upload BOTH the archive file (audit) AND every per-distressor
         # upload CSV (in case the operator wants to re-upload one by
         # hand later). All fresh files from this run, sourced from the
@@ -1419,6 +1443,14 @@ async def main() -> int:
                     f"Dropbox: {ok}/{len(dropbox_results)} files synced",
                     flush=True,
                 )
+                # One shared link for the Archives root folder so the
+                # Slack post can offer a "browse all" jump-off in addition
+                # to per-file links. Cheap (1 API call) + idempotent
+                # (returns the existing link on re-runs).
+                try:
+                    dropbox_folder_link = _dbx_folder_link()
+                except Exception as e:
+                    print(f"Dropbox folder link fetch failed: {e}", flush=True)
     except Exception as e:
         print(f"Dropbox archive sync skipped: {e}", flush=True)
 
@@ -1538,6 +1570,7 @@ async def main() -> int:
         state = {
             "upload_results": results,
             "dropbox_results": dropbox_results,
+            "dropbox_folder_link": dropbox_folder_link,
             "csv_paths": [str(p) for p in csvs],
         }
         _save_state(state)
@@ -1556,6 +1589,7 @@ async def main() -> int:
         dropbox_results=dropbox_results,
         csvs=csvs,
         code_violation_f=code_funnel,
+        dropbox_folder_link=dropbox_folder_link,
     )
     print("\n--- SLACK ---", flush=True)
     print(msg, flush=True)
