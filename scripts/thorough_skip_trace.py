@@ -57,8 +57,32 @@ import phone_validator as pv
 import config as cfg
 import enformion_client as enf
 import vendor_tags as vt
+from target_zips import ALL_TARGET as _TIER_1_2_ZIPS
 
 logger = logging.getLogger(__name__)
+
+
+# Probate-universe list titles (per operator policy 2026-08-31): records in
+# any of these lists MUST be handled by scripts/probate_cascade.py, NOT by
+# this standard cascade. Extended set beyond enrichment_router.py's
+# OBITUARY_UNIVERSE_LIST_TITLES to cover every list name the operator listed:
+#   Probate, Pre-Probate, Obituary, Inherited, Estate and Heirs, Estate Sales,
+#   Pre-Probate/Deceased, Probate Properties
+#
+# Comparison is case-insensitive on the record's `lists` field which DataSift
+# returns as TITLE strings in the /property/ list response (per diagnostic
+# 2026-08-21). Kept as a module-level frozenset so the filter check inside
+# the per-record loop is O(1).
+_PROBATE_UNIVERSE_LIST_TITLES_LC = frozenset({
+    "probate",
+    "pre-probate",
+    "obituary",
+    "inherited",
+    "estate and heirs",
+    "estate sales",
+    "pre-probate/deceased",
+    "probate properties",
+})
 
 
 def _record_has_tag(record: dict, tag_name: str) -> bool:
@@ -234,6 +258,8 @@ def _existing_phone_set(prop: dict) -> set[str]:
 def _fetch_records(
     *, list_name: str | None, since_dt: datetime, max_records: int = 500,
     tag_filter: str | None = None,
+    target_zips_only: bool = False,
+    exclude_probate_lists: bool = False,
 ) -> list[dict]:
     """Pull records from DataSift that need cascade processing.
 
@@ -248,14 +274,22 @@ def _fetch_records(
          from the buggy pre-2026-08-22 tag-write pattern and backfills the
          missing datasift/enformion tags on subsequent runs. Fully-tagged
          records (all 3 present) are skipped.
-      4. If list_name is set: further filter to records in that list
-      5. Return first max_records survivors
+      4. If target_zips_only: drop records whose situs zip5 isn't in the
+         Jefferson/Madison/Marshall Tier 1 ∪ Tier 2 set. Operator policy
+         (2026-08-31): standard cascade only spends vendor $ on tier ZIPs.
+      5. If exclude_probate_lists: drop records that appear in any
+         probate-universe list (Probate, Pre-Probate, Obituary, Inherited,
+         Estate and Heirs, Estate Sales, Pre-Probate/Deceased, Probate
+         Properties). Those go through scripts/probate_cascade.py's
+         4-vendor lane, not this one.
+      6. If list_name is set: further filter to records in that list
+      7. Return first max_records survivors
 
     `since_dt` retained for interface compatibility but unused.
 
     Note: DataSift returns tags in the /property/ list response as TITLES
     (strings), not UUIDs (diagnostic 2026-08-21). Check by title string
-    match, case-insensitive.
+    match, case-insensitive. Same for the `lists` field.
     """
     from vendor_tags import (
         RECORD_TAG_TRACED_TRACERFY, RECORD_TAG_TRACED_DATASIFT,
@@ -289,7 +323,37 @@ def _fetch_records(
                     titles.add(title.strip().lower())
         return titles
 
+    def _record_list_titles_lc(rec: dict) -> set[str]:
+        """Extract list titles (lowercased) from a record's `lists` field.
+
+        DataSift returns `lists` as TITLE strings in the /property/ list
+        response (diagnostic 2026-08-21) — dict-shaped entries are handled
+        defensively for the /property/{uuid} detail endpoint.
+        """
+        titles: set[str] = set()
+        for entry in (rec.get("lists") or []):
+            if isinstance(entry, str):
+                titles.add(entry.strip().lower())
+            elif isinstance(entry, dict):
+                title = entry.get("title") or entry.get("name") or ""
+                if title:
+                    titles.add(title.strip().lower())
+        return titles
+
+    def _record_situs_zip5(rec: dict) -> str:
+        """Situs (property) zip5 for the tier filter — falls back to owner
+        mailing zip when situs is missing so we don't drop records with only
+        the mailing address populated."""
+        addr = rec.get("address") or {}
+        z = (addr.get("zip5") or addr.get("postal_code") or "").strip()
+        if not z:
+            owner_addr = (rec.get("owner") or {}).get("address") or {}
+            z = (owner_addr.get("zip5") or owner_addr.get("postal_code") or "").strip()
+        return z[:5]
+
     results: list[dict] = []
+    dropped_off_tier = 0
+    dropped_probate_universe = 0
     limit = 100
     offset = 0
     # Safety buffer — page up to 10x max_records looking for survivors
@@ -315,6 +379,23 @@ def _fetch_records(
                 # backfills the missing datasift/enformion tags.
                 if _CASCADE_COMPLETE_TAGS_LC.issubset(row_tags_lc):
                     continue
+
+            # Policy filters (2026-08-31): scope standard cascade to
+            # non-probate Tier 1/2 records only. Probate lists are handled
+            # by probate_cascade.py; off-tier records aren't worth the
+            # per-record vendor spend.
+            if exclude_probate_lists:
+                row_lists_lc = _record_list_titles_lc(row)
+                if row_lists_lc & _PROBATE_UNIVERSE_LIST_TITLES_LC:
+                    dropped_probate_universe += 1
+                    continue
+
+            if target_zips_only:
+                zip5 = _record_situs_zip5(row)
+                if zip5 not in _TIER_1_2_ZIPS:
+                    dropped_off_tier += 1
+                    continue
+
             results.append(row)
             if len(results) >= max_records:
                 break
@@ -324,8 +405,10 @@ def _fetch_records(
         offset += limit
 
     logger.info(
-        "Fetched %d records after tag filter (tag_filter=%r, pages walked=%d)",
+        "Fetched %d records after all filters (tag_filter=%r, pages walked=%d, "
+        "dropped_off_tier=%d, dropped_probate_universe=%d)",
         len(results), tag_filter or "not-traced-yet", offset // limit,
+        dropped_off_tier, dropped_probate_universe,
     )
     return _apply_list_filter(results, list_filter_uuid)
 
@@ -437,9 +520,16 @@ def _score_phones(phones: list[str]) -> dict[str, str]:
 
 
 def _process_record(
-    prop: dict, *, dry_run: bool = False,
+    prop: dict, *, dry_run: bool = False, skip_enformion: bool = False,
 ) -> RecordResult:
-    """Run the 3-vendor cascade + Trestle tagging on ONE record."""
+    """Run the 3-vendor cascade + Trestle tagging on ONE record.
+
+    ``skip_enformion`` (operator policy 2026-08-31): when True, the
+    Enformion household-search step is bypassed entirely. Used by the
+    daily-sweep GHA invocation because Enformion is intended to run only
+    inside probate_cascade.py's --and-standard-cascade path. DataSift
+    native skip + Trestle scoring still run.
+    """
     puuid = prop["uuid"]
     addr = ((prop.get("address") or {}).get("street") or "")[:40]
     result = RecordResult(property_uuid=puuid, address=addr)
@@ -586,7 +676,9 @@ def _process_record(
     is_code_violation = _CODE_VIOLATION_LIST_UUID in record_lists
 
     enformion_phones: set[str] = set()
-    if is_code_violation:
+    if skip_enformion:
+        logger.debug("  Skipping Enformion — --skip-enformion flag set")
+    elif is_code_violation:
         logger.debug("  Skipping Enformion (record is on Code Violation list)")
     elif _record_has_tag(refreshed, vt.RECORD_TAG_TRACED_ENFORMION):
         # Prevent re-charging when probate_cascade's --and-standard-cascade
@@ -758,6 +850,22 @@ def _main(argv: list[str] | None = None) -> int:
                     help="Log decisions without spending API budget")
     ap.add_argument("--notify-slack", action="store_true",
                     help="Post cascade summary to SLACK_WEBHOOK_URL when done")
+    # ── Operator policy filters (2026-08-31) ──────────────────────────
+    # These three flags together enforce the standard-cascade scope:
+    # non-probate + Tier 1/2 + DataSift-and-Trestle-only. Probate records
+    # + off-tier records + Enformion are all handled by probate_cascade.py.
+    ap.add_argument("--target-zips-only", action="store_true",
+                    help="Only process records whose situs zip5 is in the "
+                         "Jefferson/Madison/Marshall Tier 1 ∪ Tier 2 set.")
+    ap.add_argument("--exclude-probate-lists", action="store_true",
+                    help="Skip records in probate-universe lists (Probate, "
+                         "Pre-Probate, Obituary, Inherited, Estate and Heirs, "
+                         "Estate Sales, Pre-Probate/Deceased, Probate Properties). "
+                         "Those flow through scripts/probate_cascade.py instead.")
+    ap.add_argument("--skip-enformion", action="store_true",
+                    help="Bypass the Enformion household-search step. Under "
+                         "operator policy Enformion runs only inside "
+                         "probate_cascade.py's --and-standard-cascade path.")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -791,11 +899,16 @@ def _main(argv: list[str] | None = None) -> int:
     else:
         logger.info("List filter: %s", args.list_name or "(all)")
         logger.info("Tag filter:  %s", args.tag_filter or "(not-traced-yet — default)")
+        logger.info("Target-ZIPs only:      %s", args.target_zips_only)
+        logger.info("Exclude probate lists: %s", args.exclude_probate_lists)
+        logger.info("Skip Enformion:        %s", args.skip_enformion)
         records = _fetch_records(
             list_name=args.list_name,
             since_dt=since_dt,
             max_records=args.max_records,
             tag_filter=args.tag_filter,
+            target_zips_only=args.target_zips_only,
+            exclude_probate_lists=args.exclude_probate_lists,
         )
     logger.info("Records to process: %d", len(records))
 
@@ -805,7 +918,10 @@ def _main(argv: list[str] | None = None) -> int:
                     i, len(records), rec["uuid"][:8],
                     ((rec.get("address") or {}).get("street") or "?")[:40])
         try:
-            r = _process_record(rec, dry_run=args.dry_run)
+            r = _process_record(
+                rec, dry_run=args.dry_run,
+                skip_enformion=args.skip_enformion,
+            )
         except Exception as e:
             r = RecordResult(
                 property_uuid=rec["uuid"],

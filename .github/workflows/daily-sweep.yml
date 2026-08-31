@@ -589,24 +589,33 @@ jobs:
       # If we ever add cross-run session persistence (e.g. GHA secret with
       # encrypted cookies restored before each run), un-comment the local
       # invocation below. For now: local-only.
-      - name: Thorough skip-trace cascade (DataSift native + Enformion + Trestle tier)
+      - name: Standard cascade (Tier 1/2 non-probate — DataSift native + Trestle only)
         continue-on-error: true
         env:
           DATASIFT_API_KEY: ${{ secrets.DATASIFT_API_KEY }}
           TRESTLE_API_KEY: ${{ secrets.TRESTLE_API_KEY }}
-          ENFORMION_AP_NAME: ${{ secrets.ENFORMION_AP_NAME }}
-          ENFORMION_AP_PASSWORD: ${{ secrets.ENFORMION_AP_PASSWORD }}
-          # Cascade-step Enformion cap. Fires for records with an owner
-          # last-name + address (Code Violation records are excluded per
-          # operator policy 2026-07-28). At $0.10/skip, 100/run comfortably
-          # handles the observed peak day (Sun 2026-07-19 = 107 records
-          # with Code Violation excluded → ~64 Enformion calls needed) with
-          # 36-call headroom. Median week (~254 records) runs ~$15 in
-          # cascade Enformion spend. Independent process → independent
-          # budget counter from the scraper-stage cap above.
-          ENFORMION_BUDGET: "100"
+          # ENFORMION_* + ENFORMION_BUDGET intentionally omitted: --skip-enformion
+          # bypasses this step. Enformion runs ONLY inside probate_cascade.py's
+          # --and-standard-cascade path (operator policy 2026-08-31).
         run: |
-          python scripts/thorough_skip_trace.py --max-records 200 -v \
+          # Operator policy 2026-08-31: standard cascade is scoped to
+          # non-probate records in Tier 1/2 ZIPs (Jefferson/Madison/Marshall),
+          # and runs DataSift native skip + Trestle scoring ONLY. Probate
+          # universe (Probate/Pre-Probate/Obituary/Inherited/Estate and Heirs/
+          # Estate Sales/Pre-Probate/Deceased/Probate Properties) is handled
+          # exclusively by the probate_cascade.py step below (SmartSkip →
+          # Tracerfy → DataSift → Enformion → Trestle).
+          #
+          # Expected daily volume with these filters: 40-80 records/run
+          # (down from the 200 seen when unfiltered). Trestle spend drops
+          # from ~$91/day to ~$25-35/day at the observed 9 phones/record
+          # average from DataSift household search.
+          python scripts/thorough_skip_trace.py \
+            --max-records 200 \
+            --target-zips-only \
+            --exclude-probate-lists \
+            --skip-enformion \
+            -v \
             2>&1 | tee logs/thorough_skip_trace_${{ steps.run_start.outputs.ts }}.log
 
       # ── SmartSkip probate cascade ──
