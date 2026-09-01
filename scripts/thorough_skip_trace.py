@@ -260,6 +260,7 @@ def _fetch_records(
     tag_filter: str | None = None,
     target_zips_only: bool = False,
     exclude_probate_lists: bool = False,
+    skip_enformion: bool = False,
 ) -> list[dict]:
     """Pull records from DataSift that need cascade processing.
 
@@ -303,12 +304,26 @@ def _fetch_records(
             logger.warning("List %r not found in DataSift — nothing to process", list_name)
             return []
 
-    # Tag TITLES (DataSift returns titles in list response, not UUIDs)
-    _CASCADE_COMPLETE_TAGS_LC = frozenset({
-        RECORD_TAG_TRACED_TRACERFY.lower(),
-        RECORD_TAG_TRACED_DATASIFT.lower(),
-        RECORD_TAG_TRACED_ENFORMION.lower(),
-    })
+    # Tag TITLES (DataSift returns titles in list response, not UUIDs).
+    #
+    # Completeness set is DYNAMIC based on skip_enformion (fixed 2026-09-01
+    # bug where records were re-processed every day under the new policy):
+    # under --skip-enformion, Enformion never fires so traced_enformion never
+    # gets set — if this set requires it, the subset check ALWAYS fails and
+    # every record gets re-cascaded daily, defeating the dedup + double-
+    # charging Trestle. Under skip_enformion mode, completeness = tracerfy +
+    # datasift only (which is what the standard cascade actually attempts).
+    if skip_enformion:
+        _CASCADE_COMPLETE_TAGS_LC = frozenset({
+            RECORD_TAG_TRACED_TRACERFY.lower(),
+            RECORD_TAG_TRACED_DATASIFT.lower(),
+        })
+    else:
+        _CASCADE_COMPLETE_TAGS_LC = frozenset({
+            RECORD_TAG_TRACED_TRACERFY.lower(),
+            RECORD_TAG_TRACED_DATASIFT.lower(),
+            RECORD_TAG_TRACED_ENFORMION.lower(),
+        })
     _QUEUE_CASCADE_LC = RECORD_TAG_QUEUE_CASCADE.lower()
 
     def _record_tag_titles_lc(rec: dict) -> set[str]:
@@ -354,6 +369,8 @@ def _fetch_records(
     results: list[dict] = []
     dropped_off_tier = 0
     dropped_probate_universe = 0
+    dropped_already_complete = 0
+    detail_fetch_fails = 0
     limit = 100
     offset = 0
     # Safety buffer — page up to 10x max_records looking for survivors
@@ -367,33 +384,62 @@ def _fetch_records(
             break
 
         for row in page:
-            row_tags_lc = _record_tag_titles_lc(row)
+            # ── Cheap pre-filters (data from list endpoint) ──
+            # ZIP tier gate — situs zip5 IS in the list response. Free filter,
+            # apply first to avoid detail fetch on obviously off-tier records.
+            if target_zips_only:
+                zip5 = _record_situs_zip5(row)
+                if zip5 not in _TIER_1_2_ZIPS:
+                    dropped_off_tier += 1
+                    continue
+
+            # ── Detail fetch for tag/list-based filters ──
+            # CRITICAL (fixed 2026-09-01): the /property/ LIST endpoint
+            # returns tags=None + lists=None for every record — only tag_count
+            # and list_count are populated. The tag/list titles required by
+            # completeness and probate-exclusion filters live on the DETAIL
+            # endpoint (/property/{uuid}). Without this fetch, the filters
+            # silently no-op and every record gets re-processed daily, wasting
+            # ~$60/day on Trestle re-scoring the same phones.
+            #
+            # Cost: ~1 API call per surviving candidate. Cheap vs the Trestle
+            # spend the dedup prevents. Uses tag_count/list_count from the
+            # list response as a fast-path when both are zero (record has no
+            # tags/lists yet → definitely needs cascade → skip detail fetch).
+            needs_detail = (
+                (row.get("tag_count") or 0) > 0
+                or (row.get("list_count") or 0) > 0
+            )
+            row_tags_lc: set[str] = set()
+            row_lists_lc: set[str] = set()
+            if needs_detail:
+                try:
+                    detail = ds.get_property(row["uuid"])
+                    row_tags_lc = _record_tag_titles_lc(detail)
+                    row_lists_lc = _record_list_titles_lc(detail)
+                except Exception as e:
+                    detail_fetch_fails += 1
+                    logger.debug("Detail fetch failed for %s: %s",
+                                 row["uuid"][:8], e)
+                    # On failure default to "process it" — safer to over-
+                    # process than to skip a record needing cascade.
+
             if tag_filter == RECORD_TAG_QUEUE_CASCADE:
                 # Operator-driven queue mode
                 if _QUEUE_CASCADE_LC not in row_tags_lc:
                     continue
             else:
-                # Default: skip only if ALL 3 vendor tags are present.
-                # Records with partial tagging (e.g. only traced_tracerfy from
-                # the pre-fix buggy period) get re-processed so cascade
-                # backfills the missing datasift/enformion tags.
+                # Default: skip if the completeness set is satisfied. Under
+                # --skip-enformion the set is {tracerfy, datasift}; otherwise
+                # {tracerfy, datasift, enformion}. See _CASCADE_COMPLETE_TAGS_LC
+                # definition above for the dynamic split.
                 if _CASCADE_COMPLETE_TAGS_LC.issubset(row_tags_lc):
+                    dropped_already_complete += 1
                     continue
 
-            # Policy filters (2026-08-31): scope standard cascade to
-            # non-probate Tier 1/2 records only. Probate lists are handled
-            # by probate_cascade.py; off-tier records aren't worth the
-            # per-record vendor spend.
             if exclude_probate_lists:
-                row_lists_lc = _record_list_titles_lc(row)
                 if row_lists_lc & _PROBATE_UNIVERSE_LIST_TITLES_LC:
                     dropped_probate_universe += 1
-                    continue
-
-            if target_zips_only:
-                zip5 = _record_situs_zip5(row)
-                if zip5 not in _TIER_1_2_ZIPS:
-                    dropped_off_tier += 1
                     continue
 
             results.append(row)
@@ -406,9 +452,11 @@ def _fetch_records(
 
     logger.info(
         "Fetched %d records after all filters (tag_filter=%r, pages walked=%d, "
-        "dropped_off_tier=%d, dropped_probate_universe=%d)",
+        "dropped_off_tier=%d, dropped_probate_universe=%d, "
+        "dropped_already_complete=%d, detail_fetch_fails=%d)",
         len(results), tag_filter or "not-traced-yet", offset // limit,
         dropped_off_tier, dropped_probate_universe,
+        dropped_already_complete, detail_fetch_fails,
     )
     return _apply_list_filter(results, list_filter_uuid)
 
@@ -909,6 +957,7 @@ def _main(argv: list[str] | None = None) -> int:
             tag_filter=args.tag_filter,
             target_zips_only=args.target_zips_only,
             exclude_probate_lists=args.exclude_probate_lists,
+            skip_enformion=args.skip_enformion,
         )
     logger.info("Records to process: %d", len(records))
 

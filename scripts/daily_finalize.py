@@ -1034,17 +1034,32 @@ def _format_enrichment_contribution() -> list[str]:
             f"${cascade_metrics['enf_cost']:.2f}"
         )
 
-    # SmartSkip — probate universe only
-    if smartskip_today and smartskip_today.get("submitted", 0) > 0:
-        submitted = smartskip_today["submitted"]
+    # SmartSkip — probate universe only. ALWAYS render this line when we
+    # have smartskip_last_run.json for today (fixed 2026-09-01 bug where
+    # silently omitting the line on submitted=0 days made it look like
+    # probate_cascade was broken — actually just "nothing new to submit").
+    if smartskip_today:
+        submitted = smartskip_today.get("submitted", 0)
         matched = smartskip_today.get("matched", 0)
         heirs = smartskip_today.get("heirs_created", 0)
         cost = smartskip_today.get("cost_usd", 0.0)
-        match_pct = f"({100 * matched / submitted:.0f}%)" if submitted else ""
-        lines.append(
-            f"  SmartSkip (probate): {matched}/{submitted} matched {match_pct} · "
-            f"{heirs} heirs created · ${cost:.2f}"
-        )
+        if submitted > 0:
+            match_pct = f"({100 * matched / submitted:.0f}%)"
+            lines.append(
+                f"  SmartSkip (probate): {matched}/{submitted} matched {match_pct} · "
+                f"{heirs} heirs created · ${cost:.2f}"
+            )
+        else:
+            # Nothing new to submit means all in-scope probate records already
+            # carry traced_smartskip — the queue is empty, not the step broken.
+            candidates = smartskip_today.get("scope_candidates")
+            confirmed = smartskip_today.get("confirmed_probate")
+            scope_note = ""
+            if candidates is not None and confirmed is not None:
+                scope_note = f" ({confirmed} confirmed probate, all already SmartSkip'd)"
+            lines.append(
+                f"  SmartSkip (probate): 0 records queued today{scope_note}"
+            )
 
     # Trestle — tier distribution
     if cascade_metrics.get("phones_tiered") is not None:
@@ -1239,13 +1254,20 @@ def _build_slack_message(
         # any single distressor's CSV. Skip files whose share link
         # couldn't be created (rare — usually a Dropbox permissions
         # blip); the count in the header still reflects the sync result.
+        #
+        # Label is ALWAYS the basename via os.path.basename() (fixed
+        # 2026-09-01 bug where --slack-only rehydrated `path` from JSON
+        # as a plain string — getattr(str, "name") returns None and the
+        # fallback str(p) rendered the full runner path
+        # /home/runner/work/SiftStack/SiftStack/output/leads/...csv in
+        # Slack instead of just the filename).
         link_lines: list[str] = []
         for r in dropbox_results:
             link = r.get("shared_link")
             if not link:
                 continue
             p = r.get("path")
-            name = getattr(p, "name", None) or str(p) if p else "(unknown)"
+            name = os.path.basename(str(p)) if p else "(unknown)"
             link_lines.append(f"  • <{link}|{name}>")
         if link_lines:
             lines.extend(link_lines)
