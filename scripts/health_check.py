@@ -29,10 +29,11 @@ import logging
 import os
 import re
 import sys
-import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+
+import requests
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -595,17 +596,24 @@ def post_slack(msg: str) -> bool:
     using_dedicated = bool(os.environ.get("HEALTH_SLACK_WEBHOOK_URL"))
     logger.info("Posting to %s webhook",
                 "dedicated health-check" if using_dedicated else "fallback (daily-sweep)")
-    body = json.dumps({
-        "text": msg,
-        "username": "SiftStack Health Bot",
-        "icon_emoji": ":stethoscope:",
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}
-    )
+    # Uses `requests` (not stdlib urllib) — stdlib depends on the OS SSL
+    # cert bundle which is unreliable on macOS (raises CERTIFICATE_VERIFY_FAILED
+    # when the system Python doesn't have certifi's CA bundle wired up).
+    # `requests` bundles certifi internally, so it works consistently on Mac
+    # AND on the GHA Ubuntu runner. Same library src/slack_notifier.py uses
+    # for the daily-sweep webhook post.
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return 200 <= resp.status < 300
+        resp = requests.post(
+            url,
+            json={
+                "text": msg,
+                "username": "SiftStack Health Bot",
+                "icon_emoji": ":stethoscope:",
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=15,
+        )
+        return 200 <= resp.status_code < 300
     except Exception as e:
         logger.warning("Slack post failed: %s", e)
         return False
