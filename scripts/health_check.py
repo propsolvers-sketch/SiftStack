@@ -545,8 +545,12 @@ def format_slack_message(groups: list[GroupResult]) -> str:
     total = total_fail + total_warn + total_ok
     overall_emoji = "🚨" if total_fail else ("⚠️" if total_warn else "🩺")
 
+    # Header intentionally omits "SiftStack" — the webhook payload sets
+    # username="SiftStack Health Bot" + icon_emoji=":stethoscope:" so the
+    # sender identity already carries the branding. Repeating it in the
+    # header wastes vertical space.
     lines = [
-        f"*{overall_emoji} SiftStack Weekly Health Check — {today}*",
+        f"*{overall_emoji} Weekly Health Check — {today}*",
         f"_Passed: {total_ok}/{total}  ·  Warnings: {total_warn}  ·  Failures: {total_fail}_",
         "",
     ]
@@ -564,11 +568,26 @@ def format_slack_message(groups: list[GroupResult]) -> str:
 
 
 def post_slack(msg: str) -> bool:
+    """Post to Slack under a DISTINCT sender identity from the daily sweep.
+
+    Adds `username` + `icon_emoji` to the webhook payload so weekly health
+    checks appear as a different bot in the channel feed — makes it easy
+    to scroll back through history and separate "the daily leads post"
+    from "the weekly health check" at a glance. Same webhook URL, same
+    channel, different visual identity.
+
+    Slack honors both fields natively. Discord (via the /slack shim)
+    honors `username` but ignores `icon_emoji` — degrades gracefully.
+    """
     url = os.environ.get("SLACK_WEBHOOK_URL", "")
     if not url:
         logger.warning("SLACK_WEBHOOK_URL not set — printing only")
         return False
-    body = json.dumps({"text": msg}).encode("utf-8")
+    body = json.dumps({
+        "text": msg,
+        "username": "SiftStack Health Bot",
+        "icon_emoji": ":stethoscope:",
+    }).encode("utf-8")
     req = urllib.request.Request(
         url, data=body, headers={"Content-Type": "application/json"}
     )
