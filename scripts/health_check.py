@@ -568,21 +568,33 @@ def format_slack_message(groups: list[GroupResult]) -> str:
 
 
 def post_slack(msg: str) -> bool:
-    """Post to Slack under a DISTINCT sender identity from the daily sweep.
+    """Post to Slack via a DEDICATED webhook so this appears as its own
+    integration in the workspace's Activity view.
 
-    Adds `username` + `icon_emoji` to the webhook payload so weekly health
-    checks appear as a different bot in the channel feed — makes it easy
-    to scroll back through history and separate "the daily leads post"
-    from "the weekly health check" at a glance. Same webhook URL, same
-    channel, different visual identity.
+    Env var priority:
+      1. HEALTH_SLACK_WEBHOOK_URL  ← preferred; separate Slack app named
+                                     "SiftStack Health Bot" so Activity
+                                     view groups it separately from
+                                     "DataSift" (the daily-sweep webhook)
+      2. SLACK_WEBHOOK_URL         ← fallback for local dev / when the
+                                     dedicated webhook isn't configured
 
-    Slack honors both fields natively. Discord (via the /slack shim)
-    honors `username` but ignores `icon_emoji` — degrades gracefully.
+    Payload also sets username + icon_emoji as a safety net — Slack's
+    per-message override wins over the webhook's configured name, so
+    even if a future setup change repoints HEALTH_SLACK_WEBHOOK_URL at
+    a differently-named app, the branding stays consistent.
+
+    Discord (via /slack shim) honors username; ignores icon_emoji.
     """
-    url = os.environ.get("SLACK_WEBHOOK_URL", "")
+    url = os.environ.get("HEALTH_SLACK_WEBHOOK_URL") or os.environ.get("SLACK_WEBHOOK_URL", "")
     if not url:
-        logger.warning("SLACK_WEBHOOK_URL not set — printing only")
+        logger.warning(
+            "Neither HEALTH_SLACK_WEBHOOK_URL nor SLACK_WEBHOOK_URL set — printing only"
+        )
         return False
+    using_dedicated = bool(os.environ.get("HEALTH_SLACK_WEBHOOK_URL"))
+    logger.info("Posting to %s webhook",
+                "dedicated health-check" if using_dedicated else "fallback (daily-sweep)")
     body = json.dumps({
         "text": msg,
         "username": "SiftStack Health Bot",

@@ -738,6 +738,11 @@ jobs:
           DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
           DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
           DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+          # Dedicated health-check webhook — appears as "SiftStack Health Bot"
+          # in Slack's Activity view (separate row from "DataSift" daily sweep).
+          # If unset, falls back to SLACK_WEBHOOK_URL (which posts under the
+          # daily-sweep identity — still works, just less visual separation).
+          HEALTH_SLACK_WEBHOOK_URL: ${{ secrets.HEALTH_SLACK_WEBHOOK_URL }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           if [ "$(date +%u)" != "7" ]; then
