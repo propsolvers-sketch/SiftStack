@@ -40,6 +40,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import time
@@ -894,6 +895,15 @@ def _main(argv: list[str] | None = None) -> int:
                     help="Process a single record by UUID (for testing)")
     ap.add_argument("--property-uuids",
                     help="Process multiple records — comma-separated UUIDs")
+    ap.add_argument("--property-uuids-file", metavar="PATH", type=Path,
+                    help="Path A: load UUIDs from JSON file "
+                         "{uuids: [...], records: [...]} and PREPEND them "
+                         "to the normal cascade fetch. Used to guarantee "
+                         "today's uploaded records get processed even when "
+                         "they're list-adds on existing properties (which "
+                         "keep their OLD created timestamp and get buried "
+                         "past the -created fetch cap). Mirrors probate_cascade's "
+                         "--property-uuids-file flag.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Log decisions without spending API budget")
     ap.add_argument("--notify-slack", action="store_true",
@@ -950,15 +960,58 @@ def _main(argv: list[str] | None = None) -> int:
         logger.info("Target-ZIPs only:      %s", args.target_zips_only)
         logger.info("Exclude probate lists: %s", args.exclude_probate_lists)
         logger.info("Skip Enformion:        %s", args.skip_enformion)
-        records = _fetch_records(
+
+        # ── Path A: prepend today's uploaded UUIDs (2026-09-01) ──
+        # daily_finalize writes output/observability/today_standard_uuids.json
+        # AFTER upload completes. Reading it here guarantees today's
+        # uploads get processed even if they were list-adds on existing
+        # properties (which keep OLD -created timestamps and get buried
+        # past the fetch cap). Same reliability pattern probate_cascade
+        # uses for its today_probate_uuids.json.
+        path_a_records: list[dict] = []
+        seen_uuids: set[str] = set()
+        if args.property_uuids_file:
+            f = args.property_uuids_file
+            if not f.exists():
+                logger.warning(
+                    "--property-uuids-file %s does not exist. Skipping Path A.", f,
+                )
+            else:
+                try:
+                    payload = json.loads(f.read_text())
+                    path_a_uuids = payload.get("uuids") or []
+                    logger.info(
+                        "Path A: loaded %d UUIDs from %s — processing THOSE first",
+                        len(path_a_uuids), f.name,
+                    )
+                    for u in path_a_uuids:
+                        try:
+                            path_a_records.append(ds.get_property(u))
+                            seen_uuids.add(u)
+                        except Exception as e:
+                            logger.warning("Path A fetch failed for %s: %s",
+                                           u[:8], e)
+                except Exception as e:
+                    logger.error("Failed to load %s: %s. Skipping Path A.",
+                                 f, e)
+
+        # Normal cascade fetch. Filter out UUIDs Path A already loaded so
+        # we don't double-process the same record.
+        fetched = _fetch_records(
             list_name=args.list_name,
             since_dt=since_dt,
-            max_records=args.max_records,
+            max_records=max(0, args.max_records - len(path_a_records)),
             tag_filter=args.tag_filter,
             target_zips_only=args.target_zips_only,
             exclude_probate_lists=args.exclude_probate_lists,
             skip_enformion=args.skip_enformion,
         )
+        fetched = [r for r in fetched if r.get("uuid") not in seen_uuids]
+
+        records = path_a_records + fetched
+        if path_a_records:
+            logger.info("Total records: %d (Path A: %d + normal fetch: %d)",
+                        len(records), len(path_a_records), len(fetched))
     logger.info("Records to process: %d", len(records))
 
     all_results: list[RecordResult] = []

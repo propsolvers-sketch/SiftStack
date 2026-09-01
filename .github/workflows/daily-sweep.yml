@@ -610,11 +610,19 @@ jobs:
           # (down from the 200 seen when unfiltered). Trestle spend drops
           # from ~$91/day to ~$25-35/day at the observed 9 phones/record
           # average from DataSift household search.
+          # --property-uuids-file (Path A, added 2026-09-01): prepends
+          # today's uploaded UUIDs to the normal cascade fetch so records
+          # that landed as list-adds on existing properties (keeping their
+          # OLD created timestamp) still get processed. daily_finalize
+          # wrote this file after the DataSift uploads completed. If the
+          # file is missing, the flag is a no-op — normal -created fetch
+          # continues as before.
           python scripts/thorough_skip_trace.py \
             --max-records 200 \
             --target-zips-only \
             --exclude-probate-lists \
             --skip-enformion \
+            --property-uuids-file output/observability/today_standard_uuids.json \
             -v \
             2>&1 | tee logs/thorough_skip_trace_${{ steps.run_start.outputs.ts }}.log
 

@@ -1556,6 +1556,48 @@ async def main() -> int:
     except Exception as e:
         print(f"Path A UUID capture skipped: {e}", flush=True)
 
+    # ── Path A (STANDARD LANE): capture today's standard-lane UUIDs ──
+    # Same reliability pattern as the probate capture above — solves the
+    # bug where today's Foreclosure/Code Violation/Tax/Eviction/Divorce
+    # uploads landed as list-adds on existing DataSift properties (keeping
+    # their OLD created timestamps) and got buried past the standard-cascade
+    # -created fetch cap. Standard cascade step reads this file via
+    # --property-uuids-file and prepends the UUIDs to its normal fetch.
+    # Shipped 2026-09-01 after health check surfaced the coverage gap.
+    try:
+        import capture_today_standard_uuids
+        std_records = []
+        std_csvs = [
+            p for p in csvs if capture_today_standard_uuids._is_standard_lane_csv(p)
+        ]
+        for csv_path in std_csvs:
+            recs = capture_today_standard_uuids.capture_uuids_from_csv(csv_path)
+            std_records.extend(recs)
+        # Dedup
+        std_seen = set()
+        std_unique = []
+        for r in std_records:
+            if r["uuid"] not in std_seen:
+                std_seen.add(r["uuid"])
+                std_unique.append(r)
+        capture_today_standard_uuids.OUTPUT_PATH.parent.mkdir(
+            parents=True, exist_ok=True
+        )
+        capture_today_standard_uuids.OUTPUT_PATH.write_text(json.dumps({
+            "captured_at": date.today().isoformat(),
+            "count": len(std_unique),
+            "uuids": [r["uuid"] for r in std_unique],
+            "records": std_unique,
+        }, indent=2))
+        if std_unique:
+            print(f"🎯 Path A (standard): captured {len(std_unique)} UUIDs "
+                  f"for standard cascade (bypasses -created)", flush=True)
+        else:
+            print(f"Path A (standard): no standard-lane uploads today "
+                  f"(from {len(std_csvs)} CSVs)", flush=True)
+    except Exception as e:
+        print(f"Path A (standard) UUID capture skipped: {e}", flush=True)
+
     # ── Enformion AddressID owner recovery for Bucket D records ──
     # Some probate universe records land in DataSift without owner names
     # (obituary lists survivors only, no decedent full name; or older
