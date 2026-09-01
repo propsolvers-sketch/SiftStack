@@ -196,29 +196,53 @@ def check_datasift_lists_exist() -> CheckResult:
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _sample_records_in_list(list_title: str, n: int = 5) -> list[dict]:
-    """Fetch N most recent records that are in the given list. Uses list
-    endpoint + client-side filter (list endpoint doesn't support server-
-    side list filter — no cross-list URL param)."""
-    resp = ds._get("/property/", {"limit": 100, "ordering": "-created"})
-    page = resp.get("data") or resp.get("results") or []
+def _sample_records_in_lists(list_titles: set[str], n: int = 5,
+                              max_pages: int = 5) -> list[dict]:
+    """Fetch N most recent records that appear in ANY of the given lists.
+
+    Two important design choices (both learned the hard way 2026-09-01):
+
+    1. Uses ``ordering=-updated`` (not -created) — DataSift address-dedups
+       new uploads against existing properties, so today's list-adds keep
+       the record's OLD created timestamp. -created buries them past the
+       fetch cap; -updated surfaces them (their updated_at bumps when the
+       list membership changes).
+
+    2. Accepts a SET of list titles (union) — a "standard lane" or "probate
+       lane" spans multiple DataSift lists, so sampling a single list
+       misses records that landed in a sibling list. Union covers all of
+       them in one pass.
+
+    Walks up to ``max_pages`` × 100 records to find N samples. Client-side
+    filter because DataSift's /property/ endpoint doesn't accept a list
+    membership URL param (verified 2026-08-31 diagnostic)."""
     matches = []
-    # list_count>0 pre-filter, then detail fetch to confirm membership
-    for row in page:
-        if not row.get("list_count"):
-            continue
-        try:
-            detail = ds.get_property(row["uuid"])
-        except Exception:
-            continue
-        list_titles = [
-            (entry if isinstance(entry, str) else entry.get("title", ""))
-            for entry in (detail.get("lists") or [])
-        ]
-        if list_title in list_titles:
-            matches.append(detail)
-            if len(matches) >= n:
-                break
+    offset = 0
+    limit = 100
+    for _ in range(max_pages):
+        resp = ds._get("/property/",
+                       {"limit": limit, "offset": offset, "ordering": "-updated"})
+        page = resp.get("data") or resp.get("results") or []
+        if not page:
+            break
+        for row in page:
+            if not row.get("list_count"):
+                continue
+            try:
+                detail = ds.get_property(row["uuid"])
+            except Exception:
+                continue
+            rec_lists = {
+                (entry if isinstance(entry, str) else entry.get("title", ""))
+                for entry in (detail.get("lists") or [])
+            }
+            if rec_lists & list_titles:
+                matches.append(detail)
+                if len(matches) >= n:
+                    return matches
+        if len(page) < limit:
+            break
+        offset += limit
     return matches
 
 
@@ -231,15 +255,33 @@ def _tag_titles_lc(rec: dict) -> set[str]:
     return titles
 
 
+# Full DataSift list-title sets per cascade lane. Union sampling covers
+# every list in the lane in one pass so a check doesn't miss a lane's
+# records just because they landed in a sibling list. Sourced from
+# datasift_formatter.NOTICE_TYPE_TO_LIST + the probate-universe list
+# canonicalized in the two-lane cascade policy (2026-08-31).
+_STANDARD_LANE_LISTS = {
+    "Foreclosure", "Code Violation", "Tax Delinquent", "Eviction", "Divorce",
+}
+_PROBATE_LANE_LISTS = {
+    "Probate", "Pre-Probate", "Obituary", "Inherited",
+    "Estate and Heirs", "Estate Sales", "Pre-Probate/Deceased",
+    "Probate Properties",
+}
+
+
 @_safe
 def check_standard_lane_tags() -> CheckResult:
-    """Sample 5 recent Foreclosure records. Under new policy (2026-08-31)
-    they should have traced_tracerfy + traced_datasift. traced_enformion
-    is optional (skipped in standard cascade)."""
-    samples = _sample_records_in_list("Foreclosure", n=5)
+    """Sample 5 recent standard-lane records (from ANY of Foreclosure /
+    Code Violation / Tax Delinquent / Eviction / Divorce). Under new
+    policy (2026-08-31) they should have traced_tracerfy +
+    traced_datasift. traced_enformion is optional (skipped in standard
+    cascade)."""
+    samples = _sample_records_in_lists(_STANDARD_LANE_LISTS, n=5)
     if not samples:
         return _warn("standard_lane_tags",
-                     "no Foreclosure records found in recent 100 — nothing to check")
+                     "no standard-lane records found in recent 500 — "
+                     f"expected any of {sorted(_STANDARD_LANE_LISTS)}")
     required = {"traced_tracerfy", "traced_datasift"}
     missing_by_uuid = []
     for rec in samples:
@@ -250,24 +292,27 @@ def check_standard_lane_tags() -> CheckResult:
     if missing_by_uuid:
         return _warn(
             "standard_lane_tags",
-            f"{len(missing_by_uuid)}/{len(samples)} Foreclosure records missing "
-            f"expected vendor tags — cascade may not be reaching them",
+            f"{len(missing_by_uuid)}/{len(samples)} standard-lane records "
+            f"missing expected vendor tags — cascade may not be reaching them",
             details=missing_by_uuid,
         )
     return _ok("standard_lane_tags",
-               f"{len(samples)}/{len(samples)} Foreclosure records fully tagged "
+               f"{len(samples)}/{len(samples)} standard-lane records fully tagged "
                f"(tracerfy + datasift)")
 
 
 @_safe
 def check_probate_lane_tags() -> CheckResult:
-    """Sample 5 recent Probate records. Under policy they should have
-    ALL 4: traced_tracerfy + traced_datasift + traced_enformion +
-    (traced_smartskip OR smartskip_no_match)."""
-    samples = _sample_records_in_list("Probate", n=5)
+    """Sample 5 recent probate-universe records (from ANY of Probate /
+    Pre-Probate / Obituary / Inherited / Estate and Heirs / Estate Sales
+    / Pre-Probate/Deceased / Probate Properties). Under policy they
+    should have ALL 4: traced_tracerfy + traced_datasift +
+    traced_enformion + (traced_smartskip OR smartskip_no_match)."""
+    samples = _sample_records_in_lists(_PROBATE_LANE_LISTS, n=5)
     if not samples:
         return _warn("probate_lane_tags",
-                     "no Probate records found in recent 100 — nothing to check")
+                     "no probate-lane records found in recent 500 — "
+                     f"expected any of {sorted(_PROBATE_LANE_LISTS)}")
     required_core = {"traced_tracerfy", "traced_datasift", "traced_enformion"}
     smartskip_signals = {"traced_smartskip", "smartskip_no_match"}
     issues = []
@@ -282,11 +327,11 @@ def check_probate_lane_tags() -> CheckResult:
     if issues:
         return _warn(
             "probate_lane_tags",
-            f"{len(issues)} issues across {len(samples)} Probate records",
+            f"{len(issues)} issues across {len(samples)} probate-lane records",
             details=issues,
         )
     return _ok("probate_lane_tags",
-               f"{len(samples)}/{len(samples)} Probate records fully tagged "
+               f"{len(samples)}/{len(samples)} probate-lane records fully tagged "
                f"(4-vendor stack + SmartSkip signal)")
 
 
