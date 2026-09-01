@@ -714,6 +714,40 @@ jobs:
         continue-on-error: true
         run: python scripts/daily_finalize.py --slack-only
 
+      # ── Sunday-only: weekly health check (2026-09-01) ──
+      # Catches silent-failure classes we've hit (DataSift endpoint shape
+      # changes, vendor tag write regressions, cascade re-processing,
+      # expired vendor credentials, cost spikes). Runs LAST so it can
+      # analyze today's fresh cascade logs + include today's numbers in
+      # its cost-trend anomaly check. Posts one Slack message with a
+      # per-group ✅/⚠️/❌ status board.
+      #
+      # Non-fatal — health check failures don't break the daily cron.
+      # Operator sees warnings in Slack, decides whether to investigate.
+      - name: Sunday weekly health check
+        if: always()
+        continue-on-error: true
+        env:
+          DATASIFT_API_KEY: ${{ secrets.DATASIFT_API_KEY }}
+          TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
+          TRESTLE_API_KEY: ${{ secrets.TRESTLE_API_KEY }}
+          ENFORMION_AP_NAME: ${{ secrets.ENFORMION_AP_NAME }}
+          ENFORMION_AP_PASSWORD: ${{ secrets.ENFORMION_AP_PASSWORD }}
+          SMARTY_AUTH_ID: ${{ secrets.SMARTY_AUTH_ID }}
+          SMARTY_AUTH_TOKEN: ${{ secrets.SMARTY_AUTH_TOKEN }}
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ "$(date +%u)" != "7" ]; then
+            echo "Not Sunday ($(date +%A)) - skipping weekly health check"
+            exit 0
+          fi
+          echo "Sunday - running weekly health check"
+          python scripts/health_check.py \
+            2>&1 | tee logs/health_check_${{ steps.run_start.outputs.ts }}.log
+
       # ── Persistence + observability ──
 
       - name: Archive output CSVs + logs + state + DataSift screenshots
