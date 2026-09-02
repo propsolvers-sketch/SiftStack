@@ -170,6 +170,7 @@ jobs:
             --counties Jefferson,Madison,Marshall,Statewide \
             --types foreclosure,probate \
             --tiers 1,2 \
+            --research-entities \
             --no-raw-csv \
             --notify-slack \
             -v 2>&1 | tee logs/daily_main_${{ steps.run_start.outputs.ts }}.log

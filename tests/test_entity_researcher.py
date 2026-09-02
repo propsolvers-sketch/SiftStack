@@ -7,6 +7,7 @@ Usage:
     python tests/test_entity_researcher.py
 """
 
+import inspect
 import os
 import sys
 
@@ -14,7 +15,12 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from notice_parser import NoticeData
-from entity_researcher import _classify_entity, _try_parse_entity_name
+from entity_researcher import (
+    _classify_entity,
+    _resolve_search_state,
+    _search_entity,
+    _try_parse_entity_name,
+)
 from datasift_formatter import _get_contact_info, _build_tags, _is_entity_name
 
 # ── Test Runner ─────────────────────────────────────────────────────────
@@ -101,6 +107,64 @@ check("LLC - plausible surname", result["person_name"], "Sunshine")
 # Corp parsing (no fast path for corps)
 result = _try_parse_entity_name("ACME CORPORATION", "corp")
 check("Corp - no fast path", result, None)
+
+# ── Search State Resolution Tests ───────────────────────────────────────
+
+print("\n=== Search State Resolution ===")
+
+# The bug fix: AL records must search "Alabama", not the ambiguous bare "AL".
+check(
+    "State - AL record resolves to Alabama",
+    _resolve_search_state(NoticeData(state="AL", county="Jefferson")),
+    "Alabama",
+)
+
+# Regression guard: this is a generalization, not an AL-only swap.
+check(
+    "State - TN record still resolves to Tennessee",
+    _resolve_search_state(NoticeData(state="TN", county="Knox")),
+    "Tennessee",
+)
+
+# Empty state falls through to the county, not a blind Tennessee default.
+check(
+    "State - empty state + TN county resolves via county",
+    _resolve_search_state(NoticeData(state="", county="Knox")),
+    "Tennessee",
+)
+check(
+    "State - empty state + AL county resolves via county",
+    _resolve_search_state(NoticeData(state="", county="Jefferson")),
+    "Alabama",
+)
+check(
+    "State - empty state + empty county uses DEFAULT_PROPERTY_STATE",
+    _resolve_search_state(NoticeData(state="", county="")),
+    "Alabama",
+)
+
+# Messy casing / whitespace is normalized by state_resolver.
+check(
+    "State - messy casing and whitespace",
+    _resolve_search_state(NoticeData(state=" al ", county="")),
+    "Alabama",
+)
+
+# Landmine guard: state_full_name("Tennessee") returns "Alabama" because
+# _STATE_LITERALS is keyed by 2-letter abbrev only. An already-full name
+# must pass through untouched.
+check(
+    "State - already-full name passes through (landmine guard)",
+    _resolve_search_state(NoticeData(state="Tennessee", county="Knox")),
+    "Tennessee",
+)
+
+# The "Tennessee" literal default on _search_entity must be gone.
+check(
+    "State - _search_entity has no Tennessee default",
+    inspect.signature(_search_entity).parameters["state"].default,
+    "",
+)
 
 # ── Entity Filter Exemption Tests ────────────────────────────────────────
 

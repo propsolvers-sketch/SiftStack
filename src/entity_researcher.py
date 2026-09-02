@@ -21,6 +21,7 @@ from ddgs import DDGS
 
 import config
 from notice_parser import NoticeData
+from state_resolver import state_for_county, state_full_name
 
 logger = logging.getLogger(__name__)
 
@@ -155,12 +156,39 @@ def _try_parse_entity_name(name: str, entity_type: str) -> dict | None:
 # ── Web Search ──────────────────────────────────────────────────────────
 
 
-def _search_entity(entity_name: str, state: str = "Tennessee") -> list[dict]:
+def _resolve_search_state(notice: NoticeData) -> str:
+    """Full state name to use in the entity web-search query.
+
+    Returns the full name ('Alabama', not 'AL'). DuckDuckGo recall degrades
+    badly on the bare 2-letter token — 'AL' collides with ordinary words and
+    other abbreviations, which is exactly the population this feature targets.
+
+    Resolution order:
+      1. ``notice.state`` when set.
+      2. Otherwise the property state implied by ``notice.county``.
+      3. ``state_resolver.state_full_name`` expands the 2-letter abbreviation,
+         falling back to DEFAULT_PROPERTY_STATE when the abbrev is unknown.
+
+    A value longer than 2 characters is treated as an already-expanded state
+    name and returned unchanged. That guard is load-bearing: ``state_full_name``
+    is keyed on 2-letter abbreviations only, so feeding it a full name like
+    'Tennessee' misses the key and silently returns 'Alabama'.
+    """
+    value = (notice.state or "").strip()
+    if not value:
+        value = state_for_county(notice.county)
+    if len(value) > 2:
+        return value
+    return state_full_name(value)
+
+
+def _search_entity(entity_name: str, state: str = "") -> list[dict]:
     """Search DuckDuckGo for entity registration info.
 
     Returns list of {url, title, snippet} results.
     """
-    query = f'"{entity_name}" {state} registered agent OR member OR officer'
+    state_token = (state or "").strip() or state_full_name(None)
+    query = f'"{entity_name}" {state_token} registered agent OR member OR officer'
 
     try:
         results = DDGS().text(query, max_results=8, backend="google,duckduckgo,brave")
@@ -322,11 +350,7 @@ def _research_single_entity(
     # Phase 2: Web search + LLM
     time.sleep(random.uniform(SEARCH_DELAY_MIN, SEARCH_DELAY_MAX))
 
-    state = notice.state or "Tennessee"
-    if state == "TN":
-        state = "Tennessee"
-
-    search_results = _search_entity(name, state)
+    search_results = _search_entity(name, _resolve_search_state(notice))
     if not search_results:
         with cache_lock:
             search_cache[cache_key] = None
