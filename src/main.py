@@ -1092,16 +1092,23 @@ def _run_manage_sold(args) -> None:
     """Run the SiftMap sold properties management workflow."""
     from datasift_uploader import run_manage_sold_workflow
 
-    # Parse counties if provided, otherwise use default (Knox, Blount)
+    # Parse counties if provided, otherwise use default
+    # (Jefferson, Madison, Marshall — the AL scope; migrated from TN 2026-09-02).
     counties = None
     if args.counties and args.counties.lower() != "all":
         counties = [c.strip().title() for c in args.counties.split(",")]
+
+    # Auto-headless in CI (GHA sets GITHUB_ACTIONS=true). Local runs keep the
+    # browser visible for debugging — matches the ergonomics of the other
+    # Playwright workflows in the codebase.
+    headless = bool(os.environ.get("GITHUB_ACTIONS"))
 
     result = asyncio.run(run_manage_sold_workflow(
         counties=counties,
         months_back=getattr(args, "months_back", 1),
         min_sale_price=getattr(args, "min_sale_price", 1000),
         sold_tag_date=getattr(args, "sold_tag_date", None),
+        headless=headless,
     ))
 
     if result.get("success"):

@@ -723,6 +723,46 @@ jobs:
         continue-on-error: true
         run: python scripts/daily_finalize.py --slack-only
 
+      # ── Sunday-only: SiftMap Sold Tagger (2026-09-02) ──
+      # Pulls last month's sold-in-AL properties from SiftMap and tags them
+      # "Sold" + "Sold YYYY-MM" in DataSift so the existing Sold-Property-
+      # Cleanup sequence fires and auto-removes them from marketing lists +
+      # clears assigned tasks. Runs weekly on Sundays because SiftMap's
+      # underlying MLS ingest lags 1-3 days on any given sale — a daily run
+      # would over-fetch the same records with less signal.
+      #
+      # Uses Playwright (SiftMap has no REST equivalent for this workflow)
+      # so DataSift session cookies are needed (restored from cache above).
+      # Default counties = Jefferson/Madison/Marshall (AL scope). Was
+      # hardcoded to Knox/Blount TN before commit 2026-09-02 — one of the
+      # last TN-only artifacts in the codebase.
+      #
+      # continue-on-error: true — SiftMap Playwright is flaky vs. the rest
+      # of the daily flow; a single failed sold-tag run shouldn't fail the
+      # cron. Operator can re-run manually via
+      # `python src/main.py manage-sold --months-back 1`.
+      - name: Sunday SiftMap Sold Tagger (weekly)
+        if: always()
+        continue-on-error: true
+        env:
+          DATASIFT_EMAIL: ${{ secrets.DATASIFT_EMAIL }}
+          DATASIFT_PASSWORD: ${{ secrets.DATASIFT_PASSWORD }}
+        run: |
+          if [ "$(date +%u)" != "7" ]; then
+            echo "Not Sunday ($(date +%A)) - skipping SiftMap sold tagger"
+            exit 0
+          fi
+          echo "Sunday - tagging AL properties sold last month in DataSift"
+          # Headless mode is auto-detected via GITHUB_ACTIONS env var in
+          # _run_manage_sold (src/main.py). min-sale-price 1000 filters out
+          # $0-$999 deed transfers (family gifts, quitclaims); anything ≥ $1K
+          # is a real sale.
+          python src/main.py manage-sold \
+            --counties "Jefferson,Madison,Marshall" \
+            --months-back 1 \
+            --min-sale-price 1000 \
+            2>&1 | tee logs/siftmap_sold_${{ steps.run_start.outputs.ts }}.log
+
       # ── Sunday-only: weekly health check (2026-09-01) ──
       # Catches silent-failure classes we've hit (DataSift endpoint shape
       # changes, vendor tag write regressions, cascade re-processing,

@@ -3290,7 +3290,7 @@ async def manage_sold_properties(
     the property actually sold (not the current date).
 
     Steps per county per month:
-    1. Search SiftMap by "Knox County, TN" (county-level search)
+    1. Search SiftMap by "Jefferson County, AL" (county-level search)
     2. Set Last Sold Date filter: first day → last day of that month
     3. Use select-all checkbox + pagination to capture all results
     4. Add to account with "Sold" + "Sold YYYY-MM" tags
@@ -3298,7 +3298,7 @@ async def manage_sold_properties(
 
     Args:
         page: Logged-in Playwright page.
-        counties: Counties to search (default: ["Knox", "Blount"]).
+        counties: Counties to search (default: ["Jefferson", "Madison", "Marshall"]).
         months_back: How many months back to search for sales (default: 1).
         min_sale_price: Minimum sale price filter to exclude deed transfers.
         sold_tag_date: If set, overrides per-month tag (use for single-month runs).
@@ -3317,7 +3317,9 @@ async def manage_sold_properties(
         "month_details": [],
     }
 
-    counties = counties or ["Knox", "Blount"]
+    # 2026-09-02: migrated from TN (Knox/Blount) to AL (Jefferson/Madison/
+    # Marshall) — full AL business focus per operator directive.
+    counties = counties or ["Jefferson", "Madison", "Marshall"]
 
     # Build list of (year, month) tuples to process — oldest first
     now = datetime.now()
@@ -3745,7 +3747,7 @@ async def _siftmap_search_sold(
 
     Args:
         page: Page already on SiftMap.
-        county: County name (e.g., "Knox").
+        county: County name (e.g., "Jefferson").
         start_date: Start date MM/DD/YYYY (first day of month).
         end_date: End date MM/DD/YYYY (last day of month).
         min_sale_price: Minimum sale price filter.
@@ -3758,10 +3760,16 @@ async def _siftmap_search_sold(
     import json as _json
     from urllib.parse import quote as _quote
 
-    # County FIPS codes for TN counties
+    # County FIPS codes for AL counties (migrated from TN 2026-09-02).
+    # AL FIPS: state prefix 01 + 3-digit county code (Census format).
+    # Kept TN entries as commented reference for anyone doing archaeology.
     COUNTY_FIPS = {
-        "Knox": "47093",
-        "Blount": "47009",
+        "Jefferson": "01073",  # Birmingham metro
+        "Madison":   "01089",  # Huntsville metro
+        "Marshall":  "01095",  # Albertville / Guntersville
+        # Legacy TN (no longer used):
+        # "Knox":   "47093",
+        # "Blount": "47009",
     }
 
     result = {"success": False, "records_added": 0, "message": ""}
@@ -3770,7 +3778,9 @@ async def _siftmap_search_sold(
         # ── Step 1: Navigate directly via URL with all filters ──
         # This is far more reliable than interacting with the calendar UI.
         # URL params: location (county JSON), date range, min sale price.
-        fips = COUNTY_FIPS.get(county, "47093")
+        # Default fallback FIPS is Jefferson (Birmingham) — the highest-
+        # volume AL county in our scope.
+        fips = COUNTY_FIPS.get(county, "01073")
 
         # Convert dates from MM/DD/YYYY to YYYY-MM-DD for URL params
         from datetime import datetime as _dt
@@ -3781,9 +3791,9 @@ async def _siftmap_search_sold(
 
         location = _json.dumps({
             "searchType": "county",
-            "title": f"{county} County, TN",
+            "title": f"{county} County, AL",
             "county": county,
-            "state": "TN",
+            "state": "AL",
             "counties": [{"fips": fips, "county_name": county}],
         })
 
@@ -3862,7 +3872,7 @@ async def run_manage_sold_workflow(
     Top-level orchestrator for the manage-sold CLI command.
 
     Args:
-        counties: Counties to search (default: Knox, Blount).
+        counties: Counties to search (default: Jefferson, Madison, Marshall).
         months_back: Months of sales to pull (default: 1).
         min_sale_price: Min sale price to exclude deed transfers (default: $1,000).
         sold_tag_date: Tag date YYYY-MM (default: current month).
