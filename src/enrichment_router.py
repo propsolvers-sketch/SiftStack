@@ -49,10 +49,25 @@ OBITUARY_UNIVERSE_LIST_UUIDS = frozenset({
 # DataSift's /property/{uuid} response returns `lists` as a list of TITLE
 # strings, not UUIDs (diagnostic 2026-08-21). So client-side list membership
 # checks must compare against titles, not UUIDs.
+#
+# 2026-09-02: expanded to the canonical 8-name probate universe (matches
+# _PROBATE_UNIVERSE_LIST_TITLES_LC in scripts/thorough_skip_trace.py and
+# the health_check tag-integrity sampler). Previous 3-name set silently
+# excluded records in the "Pre-Probate" list (distinct DataSift list from
+# "Pre-Probate/Deceased"), and datasift_formatter routes notice_type=
+# pre_probate → the "Pre-Probate" list per NOTICE_TYPE_TO_LIST. Result:
+# today's 14 pre-probate uploads never reached probate_cascade for
+# SmartSkip processing. This set now matches the operator-declared
+# probate universe end-to-end.
 OBITUARY_UNIVERSE_LIST_TITLES = frozenset({
-    "Obituary",
     "Probate",
+    "Pre-Probate",
+    "Obituary",
+    "Inherited",
+    "Estate and Heirs",
+    "Estate Sales",
     "Pre-Probate/Deceased",
+    "Probate Properties",
 })
 
 PROBATE_NOTICE_TYPES = frozenset({"probate", "pre_probate"})
