@@ -930,6 +930,57 @@ def _format_smartskip_summary() -> list[str]:
     return lines
 
 
+def _count_enformion_calls_across_logs(logs_dir: Path, today: str) -> dict:
+    """Count today's Enformion API calls across ALL pipeline logs.
+
+    Enformion fires from three distinct code paths (see comment in
+    _format_enrichment_contribution). The cascade log ONLY reflects path 1.
+    To surface the true daily spend, grep every log file dated today for
+    successful POST responses to Enformion endpoints.
+
+    Returned dict keys:
+      household     — POST /PersonSearch calls from thorough_skip_trace's
+                      household_search (billed same rate as PersonSearch)
+      person_search — POST /PersonSearch calls total (includes household +
+                      heir_resolver + any other PersonSearch caller)
+      business      — POST /Business* calls (entity research)
+      address_id    — POST /AddressID calls (owner recovery)
+      total_calls   — sum of the four above; each billed at $0.10 in the
+                      paid tier
+
+    All counters are 0 when logs_dir doesn't exist yet.
+    """
+    totals = {
+        "household": 0,
+        "person_search": 0,
+        "business": 0,
+        "address_id": 0,
+        "total_calls": 0,
+    }
+    if not logs_dir.exists():
+        return totals
+    person_re = re.compile(r'POST /PersonSearch HTTP/1\.\d" 2\d\d')
+    business_re = re.compile(r'POST /Business\w* HTTP/1\.\d" 2\d\d')
+    address_id_re = re.compile(r'POST /AddressID HTTP/1\.\d" 2\d\d')
+    for log_path in logs_dir.glob(f"*_{today}*.log"):
+        try:
+            text = log_path.read_text(errors="ignore")
+        except Exception:
+            continue
+        totals["person_search"] += len(person_re.findall(text))
+        totals["business"] += len(business_re.findall(text))
+        totals["address_id"] += len(address_id_re.findall(text))
+    # Household is a subset of person_search (thorough_skip_trace's
+    # household_search uses PersonSearch endpoint too), but we can't reliably
+    # split from raw HTTP logs alone. Leave household=0 unless we later add
+    # per-caller tagging; the cascade log's `enf_records_called` gives us
+    # that number separately for the cascade section.
+    totals["total_calls"] = (
+        totals["person_search"] + totals["business"] + totals["address_id"]
+    )
+    return totals
+
+
 def _format_enrichment_contribution() -> list[str]:
     """Build a consolidated 📊 Enrichment Contribution section for the Slack post.
 
@@ -1006,7 +1057,17 @@ def _format_enrichment_contribution() -> list[str]:
     if not cascade_metrics and not tracerfy_today and not smartskip_today:
         return []
 
-    lines = ["*📊 Enrichment Contribution*"]
+    # Header + one-line legend clarifying the two enrichment phases.
+    # Added 2026-09-02 after operator asked whether DataSift skip ran on
+    # per-pipeline Tracerfy records — the per-pipeline Tracerfy figures
+    # above are the ADAPTER stage (pre-upload). This section rolls up the
+    # POST-UPLOAD CASCADE stage (DataSift native + Enformion + Trestle
+    # scoring) that ran across all today's uploaded + backlog records.
+    lines = [
+        "*📊 Enrichment Contribution — post-upload cascade*",
+        "_Per-pipeline Tracerfy above is pre-upload adapter stage. Numbers below "
+        "are the cascade that ran AFTER those records landed in DataSift._",
+    ]
 
     # Tracerfy — attempts, matches, cost (~$0.30/match)
     if tracerfy_today:
@@ -1026,13 +1087,59 @@ def _format_enrichment_contribution() -> list[str]:
             f"across {recs} records · FREE"
         )
 
-    # Enformion — cost + records called
-    if cascade_metrics.get("enf_records_called") is not None:
+    # Enformion — cost across ALL paths (fixed 2026-09-02).
+    # Enformion fires from THREE code paths, not just the cascade:
+    #   1. thorough_skip_trace.py  — household_search (cascade lane; skipped
+    #                                under --skip-enformion policy)
+    #   2. probate_cascade.py      — via --and-standard-cascade → thorough_skip_trace
+    #                                (household_search + Business calls)
+    #   3. enformion_heir_resolver — PersonSearch calls during pre-probate +
+    #                                APN-probate pipelines, BEFORE upload
+    # The earlier version only parsed the cascade log → path 3's spend was
+    # invisible, making the operator think Enformion was dormant when in
+    # reality ~$3/day was flowing. Now we grep ALL today's logs for
+    # Enformion API calls and sum by endpoint.
+    enf_totals = _count_enformion_calls_across_logs(logs_dir, today)
+    cascade_enf = cascade_metrics.get("enf_new_phones", 0)
+    cascade_recs = cascade_metrics.get("enf_records_called", 0)
+    cascade_cost = cascade_metrics.get("enf_cost", 0.0)
+    total_enf_calls = enf_totals["total_calls"]
+    total_enf_cost = total_enf_calls * 0.10
+    if total_enf_calls > 0 or cascade_recs > 0:
+        # Header line: total across all paths
         lines.append(
-            f"  Enformion: {cascade_metrics['enf_new_phones']} household phones "
-            f"across {cascade_metrics['enf_records_called']} records · "
-            f"${cascade_metrics['enf_cost']:.2f}"
+            f"  Enformion: {total_enf_calls} API calls total · "
+            f"${total_enf_cost:.2f}"
         )
+        # Cascade breakdown (household_search)
+        if cascade_recs > 0:
+            lines.append(
+                f"    · Cascade (household): {cascade_enf} phones across "
+                f"{cascade_recs} records · ${cascade_cost:.2f}"
+            )
+        elif enf_totals["household"] > 0:
+            lines.append(
+                f"    · Cascade (household): {enf_totals['household']} calls · "
+                f"${enf_totals['household'] * 0.10:.2f}"
+            )
+        # Heir resolver (PersonSearch)
+        if enf_totals["person_search"] > 0:
+            lines.append(
+                f"    · Heir resolver (PersonSearch): {enf_totals['person_search']} calls · "
+                f"${enf_totals['person_search'] * 0.10:.2f}"
+            )
+        # Business search (entity research + probate cascade Business calls)
+        if enf_totals["business"] > 0:
+            lines.append(
+                f"    · Business search: {enf_totals['business']} calls · "
+                f"${enf_totals['business'] * 0.10:.2f}"
+            )
+        # AddressID (owner recovery)
+        if enf_totals["address_id"] > 0:
+            lines.append(
+                f"    · AddressID recovery: {enf_totals['address_id']} calls · "
+                f"${enf_totals['address_id'] * 0.10:.2f}"
+            )
 
     # SmartSkip — probate universe only. ALWAYS render this line when we
     # have smartskip_last_run.json for today (fixed 2026-09-01 bug where
@@ -1079,11 +1186,13 @@ def _format_enrichment_contribution() -> list[str]:
             if parts:
                 lines.append(f"    Distribution: {' · '.join(parts)}")
 
-    # Total spend (Tracerfy + Enformion + SmartSkip + Trestle)
+    # Total spend (Tracerfy + Enformion ALL PATHS + SmartSkip + Trestle).
+    # Fixed 2026-09-02 to include Enformion heir-resolver + business search
+    # calls, not just cascade-lane household_search.
     total = 0.0
     if tracerfy_today:
         total += tracerfy_today.get("success", 0) * 0.30
-    total += cascade_metrics.get("enf_cost", 0.0)
+    total += total_enf_cost  # ALL Enformion paths, not just cascade
     if smartskip_today:
         total += smartskip_today.get("cost_usd", 0.0)
     total += cascade_metrics.get("phones_tiered", 0) * 0.05
