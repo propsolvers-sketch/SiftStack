@@ -38,6 +38,8 @@ from typing import Any
 
 import requests
 
+from street_suffixes import canonical_street
+
 logger = logging.getLogger(__name__)
 
 
@@ -410,12 +412,72 @@ def get_property(uuid: str) -> dict:
 # Slow first call (~5-15 min for 141K records) but subsequent lookups
 # are O(1) dict access. Cache is per-process.
 
+# Second index, same pagination pass: suffix-normalized keys. Our source
+# portals and DataSift disagree on street-suffix spelling (T&B publishes
+# "807 Briarwood Drive", DataSift stores "807 Briarwood Dr"), so the exact
+# key misses. The normalized index collapses both to "807 briarwood dr".
+# _property_index_ambiguous holds normalized keys that two DISTINCT UUIDs
+# collapsed onto — those return None rather than guessing, because tagging
+# the wrong property writes durable state to the CRM.
 _property_index: dict[str, str] | None = None
+_property_index_normalized: dict[str, str] | None = None
+_property_index_ambiguous: set[str] | None = None
 
 
 def _property_index_key(street: str, zip5: str) -> str:
     """Canonical index key: lowercased-street + | + zip5."""
     return f"{(street or '').strip().lower()}|{(zip5 or '').strip()[:5]}"
+
+
+def _property_index_key_normalized(street: str, zip5: str) -> str:
+    """Fallback index key: suffix-normalized street + | + zip5.
+
+    zip5 handling is byte-identical to _property_index_key, so a ZIP
+    mismatch can never match through the fallback either.
+    """
+    return f"{canonical_street(street)}|{(zip5 or '').strip()[:5]}"
+
+
+def _ingest_property_records(
+    records: list[dict],
+    exact: dict[str, str],
+    normalized: dict[str, str],
+    ambiguous: set[str],
+) -> None:
+    """Fold one page of /property/ records into the three index containers.
+
+    Mutates ``exact``, ``normalized`` and ``ambiguous`` in place. Pure and
+    network-free — this is the seam the offline tests drive.
+    """
+    for rec in records:
+        addr = rec.get("address") or {}
+        street = (addr.get("street") or "").strip()
+        zip5 = (addr.get("zip5") or addr.get("postal_code") or "").strip()[:5]
+        uuid = rec.get("uuid")
+        if not (street and zip5 and uuid):
+            continue
+
+        key = _property_index_key(street, zip5)
+        # Prefer earliest occurrence (older records — more stable UUIDs)
+        if key not in exact:
+            exact[key] = uuid
+
+        norm_key = _property_index_key_normalized(street, zip5)
+        if norm_key in ambiguous:
+            continue
+        prior = normalized.get(norm_key)
+        if prior is None:
+            normalized[norm_key] = uuid
+        elif prior != uuid:
+            # Two different properties collapse onto one normalized key —
+            # refuse to guess. Logged once, on the transition only.
+            del normalized[norm_key]
+            ambiguous.add(norm_key)
+            logger.warning(
+                "Ambiguous normalized address key %r — %s vs %s; "
+                "fallback disabled for this key",
+                norm_key, prior, uuid,
+            )
 
 
 def build_property_index(*, page_size: int = 500, hard_cap: int = 20000) -> dict[str, str]:
@@ -429,8 +491,10 @@ def build_property_index(*, page_size: int = 500, hard_cap: int = 20000) -> dict
     _property_index so subsequent calls to find_property_uuid_by_address
     reuse it for the same process.
     """
-    global _property_index
+    global _property_index, _property_index_normalized, _property_index_ambiguous
     index: dict[str, str] = {}
+    normalized: dict[str, str] = {}
+    ambiguous: set[str] = set()
     offset = 0
     while offset < hard_cap:
         resp = _get("/property/", {
@@ -439,22 +503,18 @@ def build_property_index(*, page_size: int = 500, hard_cap: int = 20000) -> dict
         page = resp.get("data") or resp.get("results") or []
         if not page:
             break
-        for rec in page:
-            addr = rec.get("address") or {}
-            street = (addr.get("street") or "").strip()
-            zip5 = (addr.get("zip5") or addr.get("postal_code") or "").strip()[:5]
-            uuid = rec.get("uuid")
-            if street and zip5 and uuid:
-                key = _property_index_key(street, zip5)
-                # Prefer earliest occurrence (older records — more stable UUIDs)
-                if key not in index:
-                    index[key] = uuid
+        # Both indexes are built in this SINGLE pass — no second pagination.
+        _ingest_property_records(page, index, normalized, ambiguous)
         if len(page) < page_size:
             break
         offset += page_size
     _property_index = index
+    _property_index_normalized = normalized
+    _property_index_ambiguous = ambiguous
     logger.info("Built property address→UUID index: %d entries from %d records scanned",
                 len(index), offset)
+    logger.info("Normalized address fallback index: %d entries, %d ambiguous keys skipped",
+                len(normalized), len(ambiguous))
     return index
 
 
@@ -463,6 +523,11 @@ def find_property_uuid_by_address(street: str, zip5: str, *, rebuild: bool = Fal
 
     On first call (or if rebuild=True), paginates all DataSift records to
     build an in-memory index. Subsequent calls are O(1) dict lookups.
+
+    Exact street+zip5 is tried first and returns immediately. Only on a
+    miss does it fall back to the suffix-normalized key, which bridges
+    "Briarwood Drive" (portal) vs "Briarwood Dr" (DataSift). A normalized
+    key that two distinct UUIDs collapsed onto returns None — never a guess.
 
     Returns UUID or None if not found in DataSift.
 
@@ -474,7 +539,20 @@ def find_property_uuid_by_address(street: str, zip5: str, *, rebuild: bool = Fal
     global _property_index
     if _property_index is None or rebuild:
         build_property_index()
-    return (_property_index or {}).get(_property_index_key(street, zip5))
+
+    # Fast path — unchanged behavior for every lookup that succeeds today.
+    hit = (_property_index or {}).get(_property_index_key(street, zip5))
+    if hit:
+        return hit
+
+    norm_key = _property_index_key_normalized(street, zip5)
+    if norm_key in (_property_index_ambiguous or set()):
+        return None
+    hit = (_property_index_normalized or {}).get(norm_key)
+    if hit:
+        logger.info("DS_ADDR_FALLBACK matched %r (%s) via normalized key %r → %s",
+                    street, zip5, norm_key, hit)
+    return hit
 
 
 def update_owner_name(owner_uuid: str, *, first_name: str, last_name: str) -> dict:
