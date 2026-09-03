@@ -19,18 +19,16 @@ from __future__ import annotations
 import logging
 
 from notice_parser import NoticeData
+from street_suffixes import SUFFIX_ABBR
 
 logger = logging.getLogger(__name__)
 
 
-# Common AL street-suffix abbreviations (full → assessor-format)
-_SUFFIX_ABBR = {
-    "COVE": "CV", "DRIVE": "DR", "ROAD": "RD", "STREET": "ST",
-    "AVENUE": "AVE", "COURT": "CT", "CIRCLE": "CIR", "LANE": "LN",
-    "PLACE": "PL", "BOULEVARD": "BLVD", "HIGHWAY": "HWY", "PARKWAY": "PKWY",
-    "TERRACE": "TER", "TRAIL": "TRL", "TRACE": "TRCE", "POINT": "PT",
-    "RIDGE": "RDG", "CROSSING": "XING", "LANDING": "LNDG", "HOLLOW": "HOLW",
-}
+# Common AL street-suffix abbreviations (full → assessor-format).
+# Single source of truth lives in street_suffixes.py — DataSift's address
+# index (datasift_api) shares the same table. Private alias kept so the
+# existing references below stay untouched.
+_SUFFIX_ABBR = SUFFIX_ABBR
 
 
 def _address_search_variants(address: str) -> list[str]:
