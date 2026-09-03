@@ -25,7 +25,7 @@
   },
   "101 HAZELWOOD DR|HAZEL GREEN|35750": {
     "first_seen": "2026-08-20",
-    "last_seen": "2026-08-27",
+    "last_seen": "2026-09-03",
     "owner_name": "Quamae, Jackson",
     "source": "apn"
   },
@@ -49,7 +49,7 @@
   },
   "110 SUFFOLK DR|MADISON|35757": {
     "first_seen": "2026-08-27",
-    "last_seen": "2026-08-27",
+    "last_seen": "2026-09-03",
     "owner_name": "STEPHANIE, AVERILL",
     "source": "apn"
   },
@@ -97,7 +97,7 @@
   },
   "117 SAN LEONARDO WAY|HUNTSVILLE|35811": {
     "first_seen": "2026-08-20",
-    "last_seen": "2026-08-27",
+    "last_seen": "2026-09-03",
     "owner_name": "REGINALD, FORTSON",
     "source": "apn"
   },
@@ -141,6 +141,12 @@
     "first_seen": "2026-07-16",
     "last_seen": "2026-07-29",
     "owner_name": "Patrice, Struggs",
+    "source": "apn"
+  },
+  "1440 EDEN RIDGE DR|HOOVER|35244": {
+    "first_seen": "2026-09-03",
+    "last_seen": "2026-09-03",
+    "owner_name": "Jonathan, Smith",
     "source": "apn"
   },
   "145 BAKER AVE|HUEYTOWN|35023": {
@@ -187,7 +193,7 @@
   },
   "159 RED FOX WAY|MERIDIANVILLE|35759": {
     "first_seen": "2026-08-20",
-    "last_seen": "2026-08-27",
+    "last_seen": "2026-09-03",
     "owner_name": "TROY, ORLANDUS RAGLAND",
     "source": "apn"
   },
@@ -205,7 +211,7 @@
   },
   "1616 FARMINGTON RD|BIRMINGHAM|35235": {
     "first_seen": "2026-07-25",
-    "last_seen": "2026-07-25",
+    "last_seen": "2026-09-03",
     "owner_name": "LANIA, KEYON COLE",
     "source": "apn"
   },
@@ -239,15 +245,33 @@
     "owner_name": "ROBERT, LEE EVERSON JR",
     "source": "apn"
   },
+  "1840 MARGUERITE ST|BIRMINGHAM|35235": {
+    "first_seen": "2026-09-03",
+    "last_seen": "2026-09-03",
+    "owner_name": "Maxine, Collins",
+    "source": "apn"
+  },
+  "2017 WEDGEWOOD DR NE|ARAB|35016": {
+    "first_seen": "2026-09-03",
+    "last_seen": "2026-09-03",
+    "owner_name": "JASON, BENNEFIELD",
+    "source": "apn"
+  },
   "2024 8TH ST NW|BIRMINGHAM|35215": {
     "first_seen": "2026-08-29",
     "last_seen": "2026-08-29",
     "owner_name": "MYRTICE, WIGFALL",
     "source": "apn"
   },
+  "205 EASTWOOD DR|OWENS CROSS ROADS|35763": {
+    "first_seen": "2026-09-03",
+    "last_seen": "2026-09-03",
+    "owner_name": "Kiersten, Lewis",
+    "source": "apn"
+  },
   "208 COZY CREEK RD|MERIDIANVILLE|35759": {
     "first_seen": "2026-08-20",
-    "last_seen": "2026-08-27",
+    "last_seen": "2026-09-03",
     "owner_name": "DERRICK, BYRD",
     "source": "apn"
   },
@@ -311,6 +335,12 @@
     "owner_name": "Justin, Diliberto",
     "source": "apn"
   },
+  "2672 MONTAUK RD|HOOVER|35226": {
+    "first_seen": "2026-09-03",
+    "last_seen": "2026-09-03",
+    "owner_name": "Casey, Miller",
+    "source": "apn"
+  },
   "27 HOUSTON RD NW|BIRMINGHAM|35215": {
     "first_seen": "2026-07-25",
     "last_seen": "2026-07-25",
@@ -321,6 +351,12 @@
     "first_seen": "2026-07-15",
     "last_seen": "2026-07-22",
     "owner_name": "Franklin, Patrick",
+    "source": "apn"
+  },
+  "2805 CIR DR|HUEYTOWN|35023": {
+    "first_seen": "2026-09-03",
+    "last_seen": "2026-09-03",
+    "owner_name": "Phillip, Headley",
     "source": "apn"
   },
   "284 MCDONALD LN|GUNTERSVILLE|35976": {
@@ -337,7 +373,7 @@
   },
   "298 MERIDIANVILLE RD|MERIDIANVILLE|35759": {
     "first_seen": "2026-08-27",
-    "last_seen": "2026-08-27",
+    "last_seen": "2026-09-03",
     "owner_name": "SANDRA, SAUNDERS",
     "source": "apn"
   },
@@ -363,6 +399,12 @@
     "first_seen": "2026-07-15",
     "last_seen": "2026-07-22",
     "owner_name": "Taneko, Murphy",
+    "source": "apn"
+  },
+  "322 AUTUMN LN|MADISON|35758": {
+    "first_seen": "2026-09-03",
+    "last_seen": "2026-09-03",
+    "owner_name": "Vde",
     "source": "apn"
   },
   "3458 JEANNE LN|BESSEMER|35023": {
@@ -407,6 +449,12 @@
     "owner_name": "DOUGLAS, KEEL",
     "source": "apn"
   },
+  "3920 CARISBROOKE LN|HOOVER|35226": {
+    "first_seen": "2026-09-03",
+    "last_seen": "2026-09-03",
+    "owner_name": "Brian, Kornowicz",
+    "source": "apn"
+  },
   "4030 MCCLANAHAN RD|BESSEMER|35022": {
     "first_seen": "2026-07-23",
     "last_seen": "2026-07-23",
@@ -449,6 +497,12 @@
     "owner_name": "Brazie, Brown",
     "source": "apn"
   },
+  "4805 BLUE HAVEN DR NW|HUNTSVILLE|35810": {
+    "first_seen": "2026-09-03",
+    "last_seen": "2026-09-03",
+    "owner_name": "Mittie, Jones",
+    "source": "apn"
+  },
   "481 HERITAGE PL|PINSON|35126": {
     "first_seen": "2026-08-13",
     "last_seen": "2026-08-26",
@@ -473,6 +527,12 @@
     "owner_name": "Christopher, Demoss Sr.",
     "source": "apn"
   },
+  "5006 SUMMER CREST DR|PINSON|35126": {
+    "first_seen": "2026-09-03",
+    "last_seen": "2026-09-03",
+    "owner_name": "Terry, Moore",
+    "source": "apn"
+  },
   "5075 BUD HOLMES RD|PINSON|35126": {
     "first_seen": "2026-07-15",
     "last_seen": "2026-07-22",
@@ -489,6 +549,12 @@
     "first_seen": "2026-08-06",
     "last_seen": "2026-08-06",
     "owner_name": "MICHAEL, MADISON",
+    "source": "apn"
+  },
+  "5135 RUSTIC TRL|HUNTSVILLE|35811": {
+    "first_seen": "2026-09-03",
+    "last_seen": "2026-09-03",
+    "owner_name": "Joseph, Lebeau Aka Joseph Bruce Lebeau",
     "source": "apn"
   },
   "5258 DUG HOLLOW RD|PINSON|35126": {
@@ -511,7 +577,7 @@
   },
   "555 CLOUDS COVE RD SE|HUNTSVILLE|35803": {
     "first_seen": "2026-08-20",
-    "last_seen": "2026-08-27",
+    "last_seen": "2026-09-03",
     "owner_name": "PATRICIA, CARPENTER",
     "source": "apn"
   },
@@ -537,6 +603,12 @@
     "first_seen": "2026-08-08",
     "last_seen": "2026-08-15",
     "owner_name": "Stacy, Powell",
+    "source": "apn"
+  },
+  "5775 SHADOW LAKE DR|PINSON|35126": {
+    "first_seen": "2026-09-03",
+    "last_seen": "2026-09-03",
+    "owner_name": "WILLIAM, HATHCOCK BRANDY HATHCOCK",
     "source": "apn"
   },
   "582 BRISTOL LN|BIRMINGHAM|35226": {
