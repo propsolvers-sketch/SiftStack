@@ -55,7 +55,16 @@ SCF_PORTAL_URL = "https://seeclickfix.com/web_portal/cfK8xFcB5G2XrMX9VzD1cLSc"
 # proper (50 sq mi) plus spillover into Vestavia/Pelham which we post-filter.
 HOOVER_CENTER_LAT = 33.4054
 HOOVER_CENTER_LNG = -86.8114
-HOOVER_ZOOM = 11
+# 2026-09-05: was 11. At zoom=11 SeeClickFix's geo query resolves to
+# BIRMINGHAM's 311 feed (garbage/potholes, 352xx Birmingham ZIPs) and the
+# "hoover" address anchor rejects 100% of it — 0 rows/day since 2026-06-13.
+# zoom=14 returns Hoover-addressed issues (35216/35226) with the
+# "CODE ENFORCEMENT - Zoning, Building, Property Maintenance…" category
+# our prefix filter matches. NOTE: as of 2026-09-05 the newest Hoover
+# issue on SeeClickFix is ~110 days old — the feed itself appears dry
+# (Hoover likely moved 311 platforms ~May 2026). See the dry-source
+# warning in fetch_code_violations().
+HOOVER_ZOOM = 14
 
 # Default request_type prefix — dedicated code-enforcement category.
 # Other related types ("Report a Problem...", "Limbs/Debris...") tend to be
@@ -262,6 +271,9 @@ def fetch_code_violations(
     seen_ids: set[int] = set()
     out: list[HooverSeeClickFixRecord] = []
     cutoff_age = days_back
+    # Track the youngest issue seen so a 0-kept run can distinguish "no
+    # violations in the window" from "the whole feed is stale" (2026-09-05).
+    newest_age: int | None = None
 
     for page in range(1, max_pages + 1):
         params = {
@@ -301,6 +313,8 @@ def fetch_code_violations(
             rec = _to_record(issue)
             if rec is None:
                 continue
+            if newest_age is None or rec.age_days < newest_age:
+                newest_age = rec.age_days
 
             # Age check — stop pagination if we've drifted past the window
             if rec.age_days > cutoff_age:
@@ -332,6 +346,17 @@ def fetch_code_violations(
         # Throttle — be polite to SeeClickFix
         time.sleep(0.5)
 
+    if not out and newest_age is not None and newest_age > days_back:
+        # Silent-zero guard (2026-09-05): from 2026-06-13 through 2026-09-05
+        # this adapter returned 0 rows/day and nobody noticed. Surface the
+        # difference between "quiet month" and "dead feed" in the daily log.
+        logger.warning(
+            "Hoover SeeClickFix appears DRY: 0 issues kept and the NEWEST "
+            "issue on the feed is %d days old (window=%dd). Hoover may have "
+            "moved 311 platforms — verify at seeclickfix.com before assuming "
+            "there are no Hoover code violations.",
+            newest_age, days_back,
+        )
     logger.info("Hoover SeeClickFix: %d code-enforcement issues kept (last %dd)",
                 len(out), days_back)
     return out

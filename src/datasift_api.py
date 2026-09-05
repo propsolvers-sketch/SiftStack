@@ -480,12 +480,21 @@ def _ingest_property_records(
             )
 
 
-def build_property_index(*, page_size: int = 500, hard_cap: int = 20000) -> dict[str, str]:
+def build_property_index(*, page_size: int = 500, hard_cap: int = 20000,
+                         ordering: str = "-created") -> dict[str, str]:
     """Paginate /property/ and build {street|zip5: uuid} index.
 
     hard_cap protects against runaway pagination. DataSift's total record
     count is ~141K but only ~20K should be in Tier 1+2 ZIPs anyway (our
     calling scope). Adjust if needed.
+
+    ``ordering`` (added 2026-09-05): DataSift hard-caps any single query at
+    10,000 rows, so one pass by ``-created`` only reaches the newest ~10K.
+    Callers doing historical backfills can build a SECOND index with
+    ``ordering="-updated"`` to reach older records that were recently
+    touched (list-adds, cascade tags) — a different 10K window. Note the
+    module-level cache is REPLACED on each build; a two-pass caller should
+    collect misses from pass 1, rebuild with the other ordering, and retry.
 
     Returns the built index. Also caches it in the module-level
     _property_index so subsequent calls to find_property_uuid_by_address
@@ -498,7 +507,7 @@ def build_property_index(*, page_size: int = 500, hard_cap: int = 20000) -> dict
     offset = 0
     while offset < hard_cap:
         resp = _get("/property/", {
-            "limit": page_size, "offset": offset, "ordering": "-created",
+            "limit": page_size, "offset": offset, "ordering": ordering,
         })
         page = resp.get("data") or resp.get("results") or []
         if not page:
@@ -518,7 +527,8 @@ def build_property_index(*, page_size: int = 500, hard_cap: int = 20000) -> dict
     return index
 
 
-def find_property_uuid_by_address(street: str, zip5: str, *, rebuild: bool = False) -> str | None:
+def find_property_uuid_by_address(street: str, zip5: str, *, rebuild: bool = False,
+                                  ordering: str = "-created") -> str | None:
     """Look up a property UUID by street + zip5.
 
     On first call (or if rebuild=True), paginates all DataSift records to
@@ -538,7 +548,7 @@ def find_property_uuid_by_address(street: str, zip5: str, *, rebuild: bool = Fal
     """
     global _property_index
     if _property_index is None or rebuild:
-        build_property_index()
+        build_property_index(ordering=ordering)
 
     # Fast path — unchanged behavior for every lookup that succeeds today.
     hit = (_property_index or {}).get(_property_index_key(street, zip5))

@@ -398,6 +398,40 @@ def check_cascade_dedup_firing() -> CheckResult:
     )
 
 
+@_safe
+def check_code_violation_sources() -> CheckResult:
+    """Catch code-violation adapters that silently produce zero.
+
+    Discovered 2026-09-05: Hoover SeeClickFix returned 0 rows every day
+    from 2026-06-13 (feed went dry / geo query drifted to Birmingham) and
+    the Huntsville Unsafe-Buildings PDF parser extracted 0 records after
+    a format change — both for MONTHS, with only Birmingham Accela still
+    flowing. Nothing alerted. This reads the most recent daily_code_*.log
+    and flags each source's dry signature."""
+    if not LOGS_DIR.exists():
+        return _warn("code_violation_sources", "logs/ directory not found")
+    logs = sorted(LOGS_DIR.glob("daily_code_*.log"))
+    if not logs:
+        return _warn("code_violation_sources", "no daily_code_*.log found")
+    text = logs[-1].read_text(errors="ignore")
+    issues: list[str] = []
+    if "Hoover SeeClickFix appears DRY" in text:
+        issues.append("Hoover: SeeClickFix feed dry (newest issue older than window)")
+    m = re.search(r"Hoover SeeClickFix: (\d+) code-enforcement issues kept", text)
+    if m and int(m.group(1)) == 0 and "appears DRY" not in text:
+        issues.append("Hoover: 0 issues kept (not flagged dry — check zoom/filters)")
+    if re.search(r"Parsed 0 unsafe-building records", text):
+        issues.append("Huntsville: PDF parser extracted 0 records (format change?)")
+    m = re.search(r"Funnel \(code_violation\): .*'bulk_fetched': (\d+)", text)
+    if m and int(m.group(1)) == 0:
+        issues.append("All sources: bulk_fetched=0")
+    if issues:
+        return _warn("code_violation_sources",
+                     f"{len(issues)} source(s) producing nothing ({logs[-1].name})",
+                     details=issues)
+    return _ok("code_violation_sources", f"all sources flowing ({logs[-1].name})")
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Group 4 — External vendor APIs
 # ─────────────────────────────────────────────────────────────────────
@@ -556,6 +590,7 @@ GROUPS = {
     "api": [check_datasift_list_endpoint, check_datasift_detail_endpoint, check_datasift_lists_exist],
     "tags": [check_standard_lane_tags, check_probate_lane_tags],
     "cascade": [check_cascade_dedup_firing],
+    "sources": [check_code_violation_sources],
     "vendors": [check_tracerfy_creds, check_enformion_ping, check_trestle_ping,
                 check_smarty_creds, check_dropbox_ping, check_slack_webhook],
     "infra": [check_daily_run_recency],
@@ -567,6 +602,7 @@ GROUP_LABELS = {
     "api": "DataSift API Contracts",
     "tags": "Vendor Tag Integrity",
     "cascade": "Cascade Behavior",
+    "sources": "Code-Violation Sources",
     "vendors": "External Vendor APIs",
     "infra": "Infrastructure / Cron",
     "cost": "Cost Trend",

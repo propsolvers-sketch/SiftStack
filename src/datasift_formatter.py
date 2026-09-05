@@ -639,21 +639,16 @@ def _build_tags(notice: NoticeData, phone_tiers: dict | None = None) -> str:
     """
     tags = ["Courthouse Data"]
 
-    # Notice type
+    # Notice type. NOTE (2026-09-05): this lowercase notice_type tag
+    # (foreclosure / probate / pre_probate / ...) is what
+    # scripts/apply_subtype_tags.py promotes to a real DataSift tag
+    # post-upload — it's the cross-list marker presets should key on.
+    # An uppercase "FORECLOSURE" duplicate lived here 2026-09-02→09-05;
+    # removed because its ?lists=-driven backfill (DataSift ignores that
+    # param) mis-tagged ~5K non-foreclosure records. Treat any lingering
+    # "FORECLOSURE" tag in DataSift as dead — never filter on it.
     if notice.notice_type:
         tags.append(notice.notice_type)
-
-    # Cross-list intersection tag for foreclosure records (added 2026-09-02
-    # per operator directive). DataSift's list filter is fundamentally OR,
-    # not AND — so filtering "in Foreclosure AND in Probate" isn't natively
-    # supported. Adding an uppercase FORECLOSURE tag on every foreclosure
-    # record lets presets filter for records in probate-universe lists that
-    # ALSO carry FORECLOSURE — surfacing the cross-listed distress overlap
-    # (e.g., an inherited property in foreclosure = strong compound signal).
-    # See scripts/backfill_foreclosure_tag.py for the one-time backfill of
-    # pre-existing records.
-    if notice.notice_type == "foreclosure":
-        tags.append("FORECLOSURE")
 
     # County
     if notice.county:
