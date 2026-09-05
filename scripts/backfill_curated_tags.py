@@ -186,6 +186,11 @@ def main() -> int:
     logger.info("Archive files processed:      %d / %d", files_done, len(entries))
     logger.info("Rows scanned:                 %d", p1["rows"])
     logger.info("Rows with promotable tags:    %d", p1["with_tags"])
+    resolved = p1["with_tags"] - len(still_unresolved)
+    logger.info("Resolved to a UUID (both passes): %d / %d rows", resolved, p1["with_tags"])
+    if args.dry_run:
+        logger.info("  (dry-run: 'tagged' counters stay 0 by design — "
+                    "resolution count above is the signal)")
     logger.info("Pass 1 tagged (-created):     %d rows, %d tags", p1["tagged"], p1["tags"])
     logger.info("Pass 2 tagged (-updated):     %d rows, %d tags", p2["tagged"], p2["tags"])
     logger.info("Still unresolved (both idx):  %d rows", len(still_unresolved))
