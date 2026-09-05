@@ -63,8 +63,15 @@ def _file_date(name: str) -> str:
 
 
 def _list_archives(dbx, since: str) -> list:
+    # Dropbox paginates folder listings; the Archives folder has hundreds
+    # of files, so page 1 alone stops around late-August. Walk has_more.
+    res = dbx.files_list_folder(ARCHIVE_ROOT)
+    raw = list(res.entries)
+    while res.has_more:
+        res = dbx.files_list_folder_continue(res.cursor)
+        raw.extend(res.entries)
     entries = [
-        e for e in dbx.files_list_folder(ARCHIVE_ROOT).entries
+        e for e in raw
         if e.name.startswith("datasift_upload_") and e.name.endswith(".csv")
     ]
     if since:

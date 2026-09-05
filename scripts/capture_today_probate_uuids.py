@@ -58,7 +58,10 @@ def _find_property_uuid(street: str, zip5: str) -> str | None:
     try:
         return ds.find_property_uuid_by_address(street, zip5.strip()[:5])
     except Exception as e:
-        logger.debug("Property index lookup failed for %r: %s", street, e)
+        # WARNING, not debug (2026-09-05): a failed index build was swallowed
+        # silently -> "Path A: loaded 0 UUIDs" every day with no clue why.
+        logger.warning("Property index lookup FAILED for %r (%s) — Path A will "
+                       "capture 0 UUIDs until the index builds", street, e)
         return None
 
 

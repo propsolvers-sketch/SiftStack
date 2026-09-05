@@ -154,7 +154,10 @@ def _find_property_uuid(street: str, zip5: str, *, ordering: str = "-created") -
     try:
         return ds.find_property_uuid_by_address(street, zip5.strip()[:5], ordering=ordering)
     except Exception as e:
-        logger.debug("Property index lookup failed for %r: %s", street, e)
+        # WARNING, not debug (2026-09-05): a failed index build here was
+        # swallowed silently for days while every lookup returned None.
+        logger.warning("Property index lookup FAILED for %r (%s) — every match "
+                       "will be None until the index builds", street, e)
         return None
 
 

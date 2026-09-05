@@ -106,7 +106,10 @@ def _find_property_uuid(notice: NoticeData) -> str | None:
     try:
         return ds.find_property_uuid_by_address(street, zip5)
     except Exception as e:
-        logger.debug("Property index lookup failed for %r: %s", street, e)
+        # WARNING, not debug (2026-09-05): a failed index build was swallowed
+        # silently -> 0 snapshots written every day with no clue why.
+        logger.warning("Property index lookup FAILED for %r (%s) — no snapshots "
+                       "will match until the index builds", street, e)
         return None
 
 

@@ -167,6 +167,27 @@ def check_datasift_detail_endpoint() -> CheckResult:
 
 
 @_safe
+def check_address_index_builds() -> CheckResult:
+    """The street|zip5 address index is the ONLY sound row->UUID mapping
+    (DataSift ignores ?search= and ?lists=). Path A capture, courthouse
+    snapshots, subtype/curated tag promotion, and the backfills all depend
+    on it. On 2026-09-05 we found it had been silently EMPTY for days:
+    DataSift 400s at offset>=10K and that exception escaped before the
+    index was assigned, so every lookup returned None. Build it and assert
+    it's populated."""
+    idx = ds.build_property_index(ordering="-created")
+    n = len(idx)
+    if n == 0:
+        return _fail("address_index_builds",
+                     "address index built with 0 entries — every UUID lookup "
+                     "will return None (Path A / snapshots / tag promotion dead)")
+    if n < 1000:
+        return _warn("address_index_builds",
+                     f"address index only {n} entries — expected several thousand")
+    return _ok("address_index_builds", f"index built: {n} street|zip5 entries")
+
+
+@_safe
 def check_datasift_lists_exist() -> CheckResult:
     """Every pipeline expects certain DataSift lists to exist. If any of
     the canonical list titles have been renamed / deleted, the
@@ -587,7 +608,8 @@ def check_trestle_cost_trend() -> CheckResult:
 
 
 GROUPS = {
-    "api": [check_datasift_list_endpoint, check_datasift_detail_endpoint, check_datasift_lists_exist],
+    "api": [check_datasift_list_endpoint, check_datasift_detail_endpoint,
+            check_datasift_lists_exist, check_address_index_builds],
     "tags": [check_standard_lane_tags, check_probate_lane_tags],
     "cascade": [check_cascade_dedup_firing],
     "sources": [check_code_violation_sources],

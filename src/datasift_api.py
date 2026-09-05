@@ -505,10 +505,22 @@ def build_property_index(*, page_size: int = 500, hard_cap: int = 20000,
     normalized: dict[str, str] = {}
     ambiguous: set[str] = set()
     offset = 0
+    # DataSift rejects offset+limit > 10,000 with HTTP 400 "Can't fetch more
+    # than 10000 items!". Before 2026-09-05 that exception escaped this loop
+    # BEFORE _property_index was assigned, so every caller silently got an
+    # empty index (each lookup re-ran a 20-page build that died at page 21
+    # and returned None). Treat the cap as end-of-data.
+    hard_cap = min(hard_cap, 10000)
     while offset < hard_cap:
-        resp = _get("/property/", {
-            "limit": page_size, "offset": offset, "ordering": ordering,
-        })
+        try:
+            resp = _get("/property/", {
+                "limit": page_size, "offset": offset, "ordering": ordering,
+            })
+        except DataSiftAPIError as e:
+            if e.status_code == 400 and "10000" in (e.body or ""):
+                logger.info("Property index: hit DataSift 10K query cap at offset %d", offset)
+                break
+            raise
         page = resp.get("data") or resp.get("results") or []
         if not page:
             break
