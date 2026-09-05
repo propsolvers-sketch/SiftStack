@@ -51,12 +51,18 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 import datasift_api as ds
+from target_zips import ALL_TARGET as _TIER_1_2_ZIPS
 
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_SINCE_DATE = "2026-06-26"
-TAGS_TO_ADD = ["traced_tracerfy", "traced_datasift"]
+# Two-tier tagging per operator directive 2026-09-04:
+# - traced_datasift: applied to ALL records with phones (DataSift's $97/mo
+#   unlimited plan auto-skip-traces every record; 145K/day per activity log)
+# - traced_tracerfy: applied ONLY to Tier 1/2 records with phones (Tracerfy
+#   is a TARGETED vendor that runs in the adapter for high-priority ZIPs only)
+TAG_DATASIFT = "traced_datasift"
+TAG_TRACERFY = "traced_tracerfy"
 
 
 def _parse_ts(raw: str | None) -> datetime | None:
@@ -100,17 +106,18 @@ def main() -> int:
         return 1
 
     logger.info("═" * 72)
-    logger.info("Cascade tag backfill: traced_tracerfy + traced_datasift")
+    logger.info("Cascade tag backfill (two-tier scoping)")
     logger.info("═" * 72)
-    logger.info("Signal:     has_phones=true (some vendor added phones)")
-    logger.info("Dry run:    %s", args.dry_run)
-    logger.info("Rate cap:   %.1f records/sec", args.rate_per_sec)
-    logger.info("Tags added: %s", TAGS_TO_ADD)
+    logger.info("traced_datasift: all records with has_phones=true (DataSift bulk unlimited)")
+    logger.info("traced_tracerfy: only records with has_phones + Tier 1/2 ZIP (targeted vendor)")
+    logger.info("Dry run:         %s", args.dry_run)
+    logger.info("Rate cap:        %.1f records/sec", args.rate_per_sec)
+    logger.info("Tier 1/2 ZIPs:   %d codes", len(_TIER_1_2_ZIPS))
 
     # Resolve tag UUIDs (create if missing — they should already exist from cascade runs)
     if not args.dry_run:
         tag_uuids = {}
-        for tag_title in TAGS_TO_ADD:
+        for tag_title in (TAG_DATASIFT, TAG_TRACERFY):
             uuid = ds.tag_uuid(tag_title, create_if_missing=True)
             if not uuid:
                 logger.error("Could not resolve/create tag %r", tag_title)
@@ -118,12 +125,11 @@ def main() -> int:
             tag_uuids[tag_title] = uuid
             logger.info("  %s UUID: %s", tag_title, uuid[:8])
 
-    # Paginate — newest records first (higher chance of last_skip_traced being recent)
+    # Paginate — newest records first
     logger.info("Paginating /property/ records...")
-    tagged = 0
+    tagged_ds_only = 0
+    tagged_both = 0
     skipped_no_phones = 0
-    skipped_no_skip_trace = 0
-    skipped_old = 0
     errors = 0
     processed = 0
     offset = 0
@@ -151,56 +157,77 @@ def main() -> int:
             if not uuid:
                 continue
 
-            # Sole signal: record has phones. Any vendor (DataSift bulk,
-            # Tracerfy adapter-stage, SmartSkip, Enformion) that added phones
-            # is truthful evidence skip-trace occurred. Since ALL SiftStack
-            # records go through Tracerfy in the adapter, and records with
-            # phones went through some skip step, tagging both traced_tracerfy
-            # and traced_datasift is safe. Idempotent tag adds mean
-            # already-tagged records no-op.
+            # Two-tier tagging (per operator scoping directive 2026-09-04):
+            # - has_phones=true → traced_datasift (DataSift's bulk auto-skip
+            #   covers 100% of the account per activity log)
+            # - has_phones=true AND situs zip in Tier 1/2 → also traced_tracerfy
+            #   (Tracerfy is targeted to high-priority ZIPs only, runs upstream
+            #    in adapter code before upload)
             has_phones = bool(row.get("has_phones"))
             if not has_phones:
                 skipped_no_phones += 1
                 continue
 
+            # Situs zip from list-endpoint address field
+            addr = row.get("address") or {}
+            zip5 = (addr.get("zip5") or addr.get("postal_code") or "").strip()[:5]
+            in_tier = zip5 in _TIER_1_2_ZIPS
+
+            tags_to_apply = [TAG_DATASIFT]
+            if in_tier:
+                tags_to_apply.append(TAG_TRACERFY)
+
             if args.dry_run:
-                logger.info("  [DRY] would tag %s (has_phones=True)", uuid[:8])
-                tagged += 1
+                logger.info("  [DRY] %s zip=%s in_tier=%s → tags=%s",
+                            uuid[:8], zip5 or "?", in_tier, tags_to_apply)
+                if in_tier:
+                    tagged_both += 1
+                else:
+                    tagged_ds_only += 1
             else:
                 try:
-                    # add_tags is a single API call that accepts multiple tag UUIDs
-                    ds.add_tags(uuid, list(tag_uuids.values()))
-                    tagged += 1
-                    if tagged % 25 == 0:
-                        logger.info("  ...tagged %d records so far", tagged)
+                    uuids_to_add = [tag_uuids[t] for t in tags_to_apply]
+                    ds.add_tags(uuid, uuids_to_add)
+                    if in_tier:
+                        tagged_both += 1
+                    else:
+                        tagged_ds_only += 1
+                    total = tagged_both + tagged_ds_only
+                    if total % 50 == 0:
+                        logger.info("  ...tagged %d records so far (%d in-tier, %d off-tier)",
+                                    total, tagged_both, tagged_ds_only)
                 except Exception as e:
                     errors += 1
                     logger.warning("  add-tags failed for %s: %s", uuid[:8], e)
                 time.sleep(min_delay)
 
-            if args.limit and (tagged + errors) >= args.limit:
+            if args.limit and (tagged_both + tagged_ds_only + errors) >= args.limit:
                 logger.info("Hit --limit %d, stopping", args.limit)
-                _print_summary(processed, tagged, skipped_no_phones,
-                               errors, args.dry_run)
+                _print_summary(processed, tagged_both, tagged_ds_only,
+                               skipped_no_phones, errors, args.dry_run)
                 return 0
 
         if len(data) < args.page_size:
             break
         offset += args.page_size
 
-    _print_summary(processed, tagged, skipped_no_phones, errors, args.dry_run)
+    _print_summary(processed, tagged_both, tagged_ds_only,
+                   skipped_no_phones, errors, args.dry_run)
     return 0 if errors == 0 else 1
 
 
-def _print_summary(processed, tagged, skipped_no_phones, errors, dry_run):
+def _print_summary(processed, tagged_both, tagged_ds_only, skipped_no_phones, errors, dry_run):
     logger.info("")
     logger.info("═" * 72)
     logger.info("BACKFILL SUMMARY")
     logger.info("═" * 72)
-    logger.info("Processed:              %d records", processed)
-    logger.info("Tagged:                 %d %s", tagged, "(dry-run)" if dry_run else "")
-    logger.info("Skipped (no phones):    %d", skipped_no_phones)
-    logger.info("Errors:                 %d", errors)
+    logger.info("Processed:                              %d records", processed)
+    logger.info("Tagged (in Tier 1/2, both tags):        %d %s",
+                tagged_both, "(dry-run)" if dry_run else "")
+    logger.info("Tagged (off-tier, datasift only):       %d %s",
+                tagged_ds_only, "(dry-run)" if dry_run else "")
+    logger.info("Skipped (no phones):                    %d", skipped_no_phones)
+    logger.info("Errors:                                 %d", errors)
 
 
 if __name__ == "__main__":

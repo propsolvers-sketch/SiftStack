@@ -700,6 +700,34 @@ jobs:
       #   - Already tagged        → Trestle-only score on new untagged phones
       # Address selection is mailing-first with PO-Box detection + property fallback.
       # No-ops cleanly when inbox/ is empty (typical daily-sweep case).
+      # ── Trestle catch-up (2026-09-04): score late-arriving phones ──────
+      # DataSift's $97/mo unlimited-plan bulk auto-skip-trace runs against
+      # 145K+ account records daily (per activity log). It's async — phones
+      # get added HOURS after our cascade's per-record Trestle scoring has
+      # already run. Result: those late-arriving phones never get Dial
+      # First/Second/etc. tier tags, so filter presets requiring dial-tier
+      # tags miss them entirely.
+      #
+      # This step runs AFTER the standard cascade + SmartSkip probate steps
+      # to catch phones that appeared post-cascade. Scoped to --target-zips-only
+      # so we don't burn Trestle budget on off-tier records. Cost-capped at
+      # $50/day as a safety net.
+      #
+      # continue-on-error: true — Trestle catch-up failing shouldn't block
+      # the daily cron. Operator can re-run manually via
+      # `python scripts/trestle_catchup.py --target-zips-only`.
+      - name: Trestle catch-up (score late-arriving DataSift bulk phones)
+        continue-on-error: true
+        env:
+          DATASIFT_API_KEY: ${{ secrets.DATASIFT_API_KEY }}
+          TRESTLE_API_KEY: ${{ secrets.TRESTLE_API_KEY }}
+        run: |
+          python scripts/trestle_catchup.py \
+            --target-zips-only \
+            --max-cost-usd 50 \
+            -v \
+            2>&1 | tee logs/trestle_catchup_${{ steps.run_start.outputs.ts }}.log
+
       - name: Enrich DataSift exports (inbox → outbox)
         continue-on-error: true
         env:
