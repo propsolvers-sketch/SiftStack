@@ -53,17 +53,21 @@ PDF_URL_TEMPLATE = (
 _DATE_CASE_RE = re.compile(
     r"^(\d{1,2}/\d{1,2}/\d{4})\s+(CE-\d+-\d+)\s*$"
 )
-# Address pattern — line ends in ", Huntsville, AL <zip>"
-# Allow the street-name to start with any alphanumeric (e.g. "9Th", "10Th").
-_ADDRESS_RE = re.compile(
-    r"^\d+\s+\w[\w\s,\'.\-#()&/]+(?:\s*,)?\s*Huntsville,?\s*AL\s+(\d{5})\s*$",
-    re.IGNORECASE,
-)
-# Pull just the street + city + zip out of a matched address
+# Address pattern — a house-number-led line that ends in "AL <zip>".
+# Deliberately city-agnostic: Huntsville code enforcement covers a handful
+# of annexation-edge parcels whose situs city prints as "Madison, AL 35756"
+# / "35758" (observed 2026-08 list, pages 4-5). Requiring "Huntsville" here
+# dropped those lines and mis-zipped every record after them on the page.
+_ADDRESS_RE = re.compile(r"^\d+\s+.+\bAL\s+(\d{5})\s*$", re.IGNORECASE)
+# Pull street + city + zip out of a matched address ("<street>, <City>, AL <zip>").
+# Street is lazy so an embedded ", Unit 4," stays with the street (the city
+# group can't contain digits, forcing the backtrack).
 _ADDR_PARTS_RE = re.compile(
-    r"^(.+?)\s*,\s*Huntsville,?\s*AL\s+(\d{5})\s*$",
+    r"^(.+?)\s*,\s*([A-Za-z][A-Za-z .'\-]*?)\s*,?\s*AL\s+(\d{5})\s*$",
     re.IGNORECASE,
 )
+# Page furniture that pdfminer emits inside the address column block.
+_FOOTER_RE = re.compile(r"^(?:page\s+\d+\s+of\s+\d+|generated:)", re.IGNORECASE)
 
 
 # ── Data model ───────────────────────────────────────────────────────
@@ -76,7 +80,7 @@ class HuntsvilleUnsafeRecord:
     case_created: str            # YYYY-MM-DD; opening date of the case
     case_age_years: int          # whole years between case_created and today
     address: str                 # raw street address: "3042 Boswell Dr Nw"
-    city: str                    # always "Huntsville"
+    city: str                    # "Huntsville" (rarely "Madison" — annexation-edge parcels)
     state: str                   # always "AL"
     zip: str                     # 5-digit ZIP
     address_full: str            # full string as printed in the PDF
@@ -88,9 +92,11 @@ class HuntsvilleUnsafeRecord:
     ) -> "HuntsvilleUnsafeRecord":
         m = _ADDR_PARTS_RE.match(address_full.strip())
         if m:
-            street, zip_code = m.group(1).strip(), m.group(2).strip()
+            street, city, zip_code = (
+                m.group(1).strip(), m.group(2).strip().title(), m.group(3).strip(),
+            )
         else:
-            street, zip_code = address_full.strip(), ""
+            street, city, zip_code = address_full.strip(), "Huntsville", ""
 
         # Normalize date to YYYY-MM-DD
         try:
@@ -108,7 +114,7 @@ class HuntsvilleUnsafeRecord:
             case_created=iso_date,
             case_age_years=age,
             address=street,
-            city="Huntsville",
+            city=city,
             state="AL",
             zip=zip_code,
             address_full=address_full.strip(),
@@ -213,38 +219,127 @@ def _extract_published_date(pdf_text: str) -> str:
     return date.today().strftime("%Y-%m-%d")
 
 
-def _parse_records(pdf_text: str) -> list[HuntsvilleUnsafeRecord]:
-    """Pair date+case lines with address lines from the extracted PDF text.
+_DATE_ONLY_RE = re.compile(r"^\d{1,2}/\d{1,2}/\d{4}$")
+_CASE_ONLY_RE = re.compile(r"^CE-\d+-\d+$")
+_HDR_DATE = "case created"
+_HDR_CASE = "case number"
+_HDR_ADDR = "case address or location"
 
-    Layout per PDF page is: column 1 lists every Case-Created date paired with
-    its Case-Number on a single line, then column 3 lists every Case-Address
-    on a separate line. Within each page, the i-th date+case line corresponds
-    to the i-th address line. Document order is preserved across pages.
+
+def _parse_records(pdf_text: str) -> list[HuntsvilleUnsafeRecord]:
+    """Zip the three PDF columns positionally, page by page.
+
+    Layout change (observed 2026-08 list, broke the parser -> 0 records for
+    weeks): pdfminer now emits each page as three COLUMN BLOCKS, each with
+    its own header line, rather than interleaved rows:
+
+        Case Created            <- header
+        7/29/2004               <- N dates
+        ...
+        Case Number             <- header
+        CE-24-5123              <- N case numbers
+        ...
+        Case Address or Location   <- header
+        3042 Boswell Dr Nw, Huntsville, AL 35811   <- N addresses
+        ...
+        (next page repeats)
+
+    The old regex expected "<date>  <case>" on ONE line and matched nothing.
+    Within a page the i-th date, i-th case and i-th address are the same
+    record, so we collect the three blocks per page and zip them. Doing it
+    per page (not across the whole document) means a wrapped address on
+    page 2 can't misalign every record on pages 3-6.
+
+    Wrapped addresses: a house-number-led line that lacks a trailing
+    "AL <zip>" is treated as a fragment and glued onto the next address
+    line. Any fragment still pending at a header/page boundary is dropped
+    with a debug log. Page footers ("Page N of M", "Generated: ...") inside
+    the address block are skipped. City is NOT assumed to be Huntsville —
+    a few annexation-edge parcels print as "Madison, AL".
     """
     list_published = _extract_published_date(pdf_text)
     lines = [ln.strip() for ln in pdf_text.split("\n") if ln.strip()]
 
-    date_case_pairs: list[tuple[str, str]] = []
-    addresses: list[str] = []
-    for ln in lines:
-        m = _DATE_CASE_RE.match(ln)
-        if m:
-            date_case_pairs.append((m.group(1), m.group(2)))
-            continue
-        if _ADDRESS_RE.match(ln):
-            addresses.append(ln)
-
-    if len(date_case_pairs) != len(addresses):
-        logger.warning(
-            "Date/case count (%d) doesn't match address count (%d) — "
-            "pairing first min() of each, %d records dropped",
-            len(date_case_pairs), len(addresses),
-            abs(len(date_case_pairs) - len(addresses)),
-        )
-
     records: list[HuntsvilleUnsafeRecord] = []
-    for (d, c), addr in zip(date_case_pairs, addresses):
-        records.append(HuntsvilleUnsafeRecord.from_columns(d, c, addr, list_published))
+    pages_seen = 0
+    total_dropped = 0
+
+    dates: list[str] = []
+    cases: list[str] = []
+    addrs: list[str] = []
+    pending: list[str] = []
+    section: str | None = None   # "date" | "case" | "addr" | None
+
+    def _flush_page() -> None:
+        nonlocal dates, cases, addrs, pending, pages_seen, total_dropped
+        if not (dates or cases or addrs):
+            return
+        pages_seen += 1
+        if pending:
+            logger.debug("Huntsville page %d: dropping dangling address fragment %r",
+                         pages_seen, " ".join(pending)[:80])
+        n = min(len(dates), len(cases), len(addrs))
+        if not (len(dates) == len(cases) == len(addrs)):
+            logger.warning(
+                "Huntsville page %d: column lengths differ (dates=%d cases=%d "
+                "addrs=%d) — zipping first %d, dropping %d",
+                pages_seen, len(dates), len(cases), len(addrs), n,
+                max(len(dates), len(cases), len(addrs)) - n,
+            )
+            total_dropped += max(len(dates), len(cases), len(addrs)) - n
+        for d, c, a in zip(dates[:n], cases[:n], addrs[:n]):
+            records.append(HuntsvilleUnsafeRecord.from_columns(d, c, a, list_published))
+        dates, cases, addrs, pending = [], [], [], []
+
+    for ln in lines:
+        low = ln.lower()
+        if low.startswith(_HDR_DATE):
+            _flush_page()            # a new "Case Created" header = new page
+            section = "date"
+            continue
+        if low.startswith(_HDR_CASE):
+            section = "case"
+            continue
+        if low.startswith(_HDR_ADDR):
+            section = "addr"
+            continue
+
+        if section == "date":
+            if _DATE_ONLY_RE.match(ln):
+                dates.append(ln)
+        elif section == "case":
+            if _CASE_ONLY_RE.match(ln):
+                cases.append(ln)
+        elif section == "addr":
+            if _FOOTER_RE.match(ln):
+                continue                 # "Page 4 of 6" / "Generated: ..." furniture
+            if _ADDRESS_RE.match(ln):
+                addrs.append(" ".join(pending + [ln]) if pending else ln)
+                pending = []
+            elif ln[:1].isdigit() or pending:
+                # A house-number-led line that does NOT end in "AL <zip>" is
+                # the start (or middle) of a wrapped address — hold it and
+                # glue onto the next complete line. A line that ends in a ZIP
+                # always matches _ADDRESS_RE above, so a complete address can
+                # never be mistaken for a fragment (the 2026-08 Madison-city
+                # bug: complete lines were held and merged into the next one,
+                # shifting every later row on the page to the wrong case#).
+                pending.append(ln)
+        # Anything before the first header (title / published-date line) is
+        # ignored: section is None.
+
+    _flush_page()
+
+    if not records:
+        logger.warning(
+            "Huntsville: parsed 0 records from %d text lines across %d page(s) — "
+            "PDF layout may have changed again (expected 'Case Created' / "
+            "'Case Number' / 'Case Address or Location' column headers)",
+            len(lines), pages_seen,
+        )
+    elif total_dropped:
+        logger.warning("Huntsville: %d record(s) dropped to column-length mismatches",
+                       total_dropped)
     return records
 
 

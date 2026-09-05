@@ -957,14 +957,14 @@ Code-enforcement data is shaped completely differently from tax / probate / fore
 
 | County / city | Primary source | Format | Coverage |
 |---|---|---|---|
-| **Huntsville (Madison)** | Monthly **Unsafe Building List** PDF on huntsvilleal.gov | 6-page PDF, 3-column layout (Case Created / Case Number / Address) | Highest-distress signal — every record is a property the city has formally declared uninhabitable. ~220 active cases at a time. |
+| **Huntsville (Madison)** | Monthly **Unsafe Building List** PDF on huntsvilleal.gov | ~6-page PDF; pdfminer emits 3 per-page column blocks (Case Created / Case Number / Address), zipped positionally per page | Highest-distress signal — every record is a property the city has formally declared uninhabitable. ~220 active cases at a time. |
 | **Birmingham (Jefferson)** | 311 Portal (complaint-only, **not searchable**) + condemnation hearings on alabamapublicnotices.com | APN newspaper notices | Reuses existing APN scraper with `CONDEMNATION` / `DEMOLITION` / `PUBLIC NUISANCE` keywords (TODO — Phase 2) |
 
 ### Huntsville adapter — [src/huntsville_unsafe_buildings_api.py](src/huntsville_unsafe_buildings_api.py)
 
 The City of Huntsville switched from a real-time HTML page (`apps.huntsvilleal.gov/unsafe/...`) to a monthly-published PDF at `/wp-content/uploads/{YYYY}/{MM}/{MM}-{YYYY}-Unsafe-Building-List.pdf` (e.g. `04-2026-Unsafe-Building-List.pdf` is the April 2026 snapshot).
 
-The adapter auto-discovers the most recent published list by walking back from the current month (up to 6 months) until it finds one. pdfminer extracts the 3-column layout, and a per-line regex pairs date+case lines with address lines in document order.
+The adapter auto-discovers the most recent published list by walking back from the current month (up to 6 months) until it finds one. **Layout (since the 2026-08 list):** pdfminer emits each page as three *column blocks*, each with its own header line (`Case Created` → N dates, `Case Number` → N case#s, `Case Address or Location` → N addresses). `_parse_records` collects the three blocks per page and zips them positionally; it does NOT zip across pages, so one bad line can only misalign its own page. The older interleaved-row regex silently returned 0 records for weeks — the Sunday health check now greps `daily_code_*.log` for "Parsed 0 unsafe-building records". Two traps: (1) the address regex is city-agnostic — a few annexation-edge parcels print as `Madison, AL 35756/35758`, and requiring "Huntsville" dropped them and shifted every later row on the page; (2) `Page N of M` / `Generated:` footers appear inside the address block and are skipped.
 
 **One technical wrinkle**: huntsvilleal.gov is behind a WAF that fingerprints httpx and rejects it with `403 Forbidden`. The adapter uses the `requests` library instead (urllib3 under the hood doesn't trigger the same fingerprint detection).
 
@@ -972,7 +972,7 @@ The adapter auto-discovers the most recent published list by walking back from t
 - `case_number` (e.g. `CE-24-5123`)
 - `case_created` — case-opening date (YYYY-MM-DD)
 - `case_age_years` — derived; the highest-distress cases are multi-year
-- `address` / `city` / `state` / `zip` — parsed from `<street>, Huntsville, AL <zip>`
+- `address` / `city` / `state` / `zip` — parsed from `<street>, <City>, AL <zip>` (city is usually Huntsville; a few annexation-edge parcels are Madison)
 - `address_full` — raw string as printed in the PDF (preserves unit notation)
 - `list_published` — date stamp of the source PDF
 
