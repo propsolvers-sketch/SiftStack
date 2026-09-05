@@ -36,6 +36,7 @@ import logging
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -144,13 +145,23 @@ def main() -> int:
                            "Resume tomorrow with --since %s",
                            ds.budget_remaining(), e.name, _file_date(e.name))
             break
-        try:
-            _, resp = dbx.files_download(e.path_lower)
-        except Exception as ex:
-            logger.warning("  download failed %s: %s", e.name, ex)
-            continue
+        # Dropbox content downloads flake (read timeouts, mid-stream resets —
+        # 7 of 521 files on 2026-09-05). resp.content streams the body, so it
+        # must be INSIDE the guard; retry a few times before giving up.
         local = tmp / e.name
-        local.write_bytes(resp.content)
+        payload = None
+        for attempt in range(1, 4):
+            try:
+                _, resp = dbx.files_download(e.path_lower)
+                payload = resp.content
+                break
+            except Exception as ex:
+                logger.warning("  download failed %s (attempt %d/3): %s",
+                               e.name, attempt, str(ex)[:120])
+                time.sleep(3 * attempt)
+        if payload is None:
+            continue
+        local.write_bytes(payload)
         stats = apply_subtypes_from_csv(local, dry_run=args.dry_run,
                                         ordering="-created", unresolved=unresolved)
         files_done += 1
