@@ -874,6 +874,7 @@ def _build_tags(notice: NoticeData, phone_tiers: dict | None = None) -> str:
         "inoperable_vehicle",
         "environmental_enforcement",
         "zoning_enforcement",
+        "nuisance_abatement",      # Hoover council weed/debris abatement orders
     ):
         tags.append("early_distress")
 

@@ -160,19 +160,22 @@ def _fetch_hoover(
     enrich_owner: bool,
     target_zips_only: bool,
 ) -> list[NoticeData]:
-    """Run the Hoover SeeClickFix code-enforcement adapter and convert to NoticeData.
+    """Run the Hoover City Council nuisance-resolutions adapter → NoticeData.
 
-    Hoover is in Jefferson County but has its own platform (SeeClickFix 311
-    citizen-complaint feed) — separate from Birmingham Accela. Citizen-reported
-    violations land here within hours; we filter to the dedicated
-    "CODE ENFORCEMENT" request_type and (optionally) our Tier 1/Tier 2 ZIPs.
+    Source switched 2026-09-05. Hoover's SeeClickFix categories were flipped
+    to private_visibility ~2026-05-17, so `hoover_code_enforcement_api`
+    (still on disk for history) returns 0 rows forever. The council's public
+    resolutions page lists formal weed/nuisance-abatement and unsafe-
+    structure orders with the address in the title — lower volume, higher
+    intent. Tier gate runs on a Smarty-recovered ZIP (titles carry street
+    only); ``days_back`` bounds by council approval date.
     """
-    from hoover_code_enforcement_api import fetch_code_violations, to_notice_data
+    from hoover_council_resolutions_api import fetch_nuisance_resolutions, to_notice_data
     target_zips = None
     if target_zips_only:
         from target_zips import ALL_TARGET
         target_zips = set(ALL_TARGET)
-    records = fetch_code_violations(
+    records = fetch_nuisance_resolutions(
         days_back=days_back,
         target_zips=target_zips,
     )

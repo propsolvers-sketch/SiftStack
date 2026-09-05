@@ -253,7 +253,8 @@ jobs:
 
       # ── Pipeline 4: code_violation (cross-city unified pipeline) ──
       # Pulls Huntsville Unsafe Buildings PDF + Birmingham Accela + Hoover
-      # SeeClickFix in one pass. --enrich-owner runs the tax-roll address
+      # City Council nuisance resolutions (SeeClickFix retired 2026-09-05 —
+      # feed went private) in one pass. --enrich-owner runs the tax-roll address
       # lookup (~80% hit rate for owner_name). CSV filename matches the
       # datasift_upload*.csv glob in daily_finalize.py so the consolidated
       # finalizer picks it up; _categorize() recognizes code_violation in

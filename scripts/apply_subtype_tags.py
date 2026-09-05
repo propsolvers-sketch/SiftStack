@@ -78,7 +78,8 @@ CURATED_PROMOTABLE_TAGS = frozenset({
     "probate_sale", "probate_final_settlement", "probate_heirs_notice",
     "unsafe_building", "housing_enforcement", "inoperable_vehicle",
     "environmental_enforcement", "zoning_enforcement",
-    "code_enforcement_complaint",
+    "code_enforcement_complaint",      # retired SeeClickFix subtype (historical records)
+    "nuisance_abatement",             # Hoover council weed/debris orders (2026-09-05+)
     "tier_distress_proxy", "tier_distress_proxy_absentee",
     # action / timing signals
     "hearing_upcoming", "creditor_window_open", "has_auction",

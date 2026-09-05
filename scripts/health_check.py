@@ -436,11 +436,18 @@ def check_code_violation_sources() -> CheckResult:
         return _warn("code_violation_sources", "no daily_code_*.log found")
     text = logs[-1].read_text(errors="ignore")
     issues: list[str] = []
-    if "Hoover SeeClickFix appears DRY" in text:
-        issues.append("Hoover: SeeClickFix feed dry (newest issue older than window)")
-    m = re.search(r"Hoover SeeClickFix: (\d+) code-enforcement issues kept", text)
-    if m and int(m.group(1)) == 0 and "appears DRY" not in text:
-        issues.append("Hoover: 0 issues kept (not flagged dry — check zoom/filters)")
+    # Hoover source is the council resolutions page since 2026-09-05 (the
+    # SeeClickFix feed went private). Zero nuisance rows can be legitimate
+    # for a week or two between council meetings — only flag a parse/page
+    # failure, or a full month of nothing.
+    if "Hoover council resolutions page appears EMPTY or CHANGED" in text:
+        issues.append("Hoover: resolutions page parsed <3 rows (layout change / WAF?)")
+    m = re.search(r"Hoover council resolutions: (\d+) nuisance resolutions kept "
+                  r"\(page rows=(\d+), nuisance=(\d+)", text)
+    if m and int(m.group(3)) == 0 and int(m.group(2)) >= 3:
+        issues.append("Hoover: page parsed but 0 nuisance rows classified (title wording change?)")
+    if "Hoover SeeClickFix" in text:
+        issues.append("Hoover: retired SeeClickFix adapter still being invoked")
     if re.search(r"Parsed 0 unsafe-building records", text):
         issues.append("Huntsville: PDF parser extracted 0 records (format change?)")
     m = re.search(r"Funnel \(code_violation\): .*'bulk_fetched': (\d+)", text)
